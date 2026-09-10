@@ -1,0 +1,23 @@
+/target/
+**/target/
+Cargo.lock
+!/Cargo.lock
+
+# Captured frames: the bulk corpora are not committed, curated evidence is.
+#
+# fixtures/frames/ holds the 120-frame decode-benchmark corpus (~32 MB) of an idle
+# desktop. It is reproducible by re-running the capture spike and is excluded.
+#
+# fixtures/frames/absrange/ is different and is deliberately KEPT: fifteen curated
+# frames that are the visual proof for the absolute-coordinate finding (§3.4), showing
+# where the cursor actually lands at full scale and past the wrap. Small, and not
+# reproducible if the target's screen changes. Do not "tidy" these away.
+/fixtures/frames/*.jpg
+/fixtures/frames/*.jpeg
+/fixtures/frames/*.raw
+/fixtures/frames/*.yuv
+/fixtures/traffic/*.pcap
+/fixtures/traffic/*.bin
+
+# Read-only upstream reference checkout, not part of this project.
+/reference/
