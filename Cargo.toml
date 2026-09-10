@@ -1,0 +1,68 @@
+[package]
+name = "nanokvm-usb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Native Linux client for the Sipeed NanoKVM-USB (CH9329 serial + UVC MJPEG)"
+
+# One crate, lib + bin, no workspace. See docs/NATIVE_CLIENT_PLAN.md §4 and §7.
+[lib]
+name = "nanokvm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nanokvm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+
+# default-features = false drops the libudev enumeration dependency (§7.2).
+serialport = { version = "4", default-features = false }
+
+# Pure-v4l2 backend: bindgen over <linux/videodev2.h>, links nothing. The `libv4l`
+# feature would pull libv4l2.so.0 -- never enable it (§7.2, A10).
+v4l = { version = "0.14.0", default-features = false, features = ["v4l2"] }
+
+# Decoder of record (§1.3, A19): RGBA output, strict mode, one thread.
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
+
+winit = "0.30.13"
+wgpu = "26.0"
+raw-window-handle = "0.6.2"
+pollster = "1.0"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Second wl_event_queue on winit's display for shortcut inhibit (§1.5).
+wayland-client = "0.31.15"
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
+
+[dev-dependencies]
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+# openpty for the fake CH9329 (§9.3).
+nix = { version = "0.31", features = ["term", "fs", "poll"] }
+
+[features]
+# Tests that need the dongle and the target. Always #[ignore] as well; never gate CI (§9.3).
+hardware = []
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -8,6 +8,8 @@ niri on Wayland.
 1. `docs/NATIVE_CLIENT_PLAN.md` — the design of record, currently **rev 4**. Start at §0.2, which
    lists what Stage 0 measurement changed.
 2. `docs/STAGE0_FINDINGS.md` — the evidence index and the 19 amendments.
+3. `docs/STAGE1_FINDINGS.md` — what building Stage 1 changed: the amendments B1–B7 the plan still
+   needs, the module/test inventory, and the hardware numbers (taken on a USB 2.0 link).
 
 Raw per-spike evidence runs to roughly 3500 lines and **lives on the `stage-0` branch**, under
 `docs/stage0/`, alongside the throwaway spike crates in `spikes/`. **Do not read it up front.**
@@ -54,7 +56,15 @@ are the evidence and the plan is the bug.
 - **No Cargo workspace.** On the `stage-0` branch each spike is a standalone crate so it can
   be deleted without touching anything else. Keep it that way if you add one.
 - `spikes/` is **throwaway Stage 0 code** and is not on `main`. Do not build on it, do not tidy
-  it, do not test it. Stage 1 code goes in `src/`, which does not exist yet.
+  it, do not test it.
+- `src/` is the Stage 1 crate, laid out per plan §4: `proto/` (pure), `link.rs` (the one seam
+  between the input writer and a transport), `input/`, `serial/`, `capture/`, `viewer/`. `proto`
+  and `input` do no I/O; keep it that way.
+- `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must all be clean
+  before anything is called done. Hardware tests are behind `--features hardware` and `#[ignore]`;
+  run them with `cargo test --features hardware --test serial_hardware --test capture_hardware --
+  --ignored --nocapture`. They toggle the target's CapsLock twice and stream from the video node;
+  they never click.
 - `fixtures/packets/ch9329.toml` is the **authority** for protocol tests (§9.1). Tests must
   read it, never retype the bytes — retyping is how a transcription bug silently blesses a
   wrong encoder.
