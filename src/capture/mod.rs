@@ -32,7 +32,7 @@ pub use handoff::Slot;
 pub use jpeg::JpegHeaderError;
 pub use pipeline::{Pipeline, PipelineConfig, PipelineHandle, PipelineState, PipelineStats};
 pub use synthetic::SyntheticSource;
-pub use v4l2::{BytesUsedStats, V4l2Source};
+pub use v4l2::{BytesUsedStats, V4l2Opener, V4l2Source};
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
@@ -194,6 +194,66 @@ pub trait FrameSource: Send {
 
     /// A one-line description for logs and error messages, e.g. the node and negotiated mode.
     fn describe(&self) -> String;
+
+    /// Stop and restart streaming on the same device, without reopening it (§6.1: a capture
+    /// stall gets "attempt restart", as distinct from a disconnection's "attempt rediscovery").
+    ///
+    /// This is the cheap half of recovery: the node is still there and the fd is still valid,
+    /// but no buffer has come back for a while. `V4l2Source` answers with the B2 rebuild —
+    /// `STREAMOFF`, re-prime, `STREAMON` — which is also the only thing that clears vb2's
+    /// sticky queue-error state. Every other source has nothing to restart, so the default is
+    /// to do nothing and succeed: a source that cannot stall cannot need this.
+    ///
+    /// # Errors
+    ///
+    /// [`CaptureError::Disconnected`] if the node turned out to be gone, which the pipeline
+    /// takes as a disconnection rather than a failed restart. Anything else is counted and the
+    /// pipeline keeps polling.
+    fn restart(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    /// The dimensions this source *negotiated* with the device, if it negotiated any.
+    ///
+    /// This is **not** a source of frame dimensions — A6 keeps the JPEG start-of-frame header of
+    /// each frame as the only authority on that size, and that is unchanged. It is the other
+    /// half of a comparison: what `S_FMT` committed to, so the pipeline can notice that the
+    /// device is streaming something else. Measured on 2026-09-11, a USB reset can leave the
+    /// dongle's *stream* in its power-on 640x480 mode with the reopen's UVC commit lost (the
+    /// V4L2 `ERROR` flag on the first buffer is the tell) while `G_FMT` still reports the
+    /// 1920x1080 that was asked for; a fresh `STREAMON` re-commits and fixes it. See
+    /// [`super::pipeline::PipelineConfig::format_mismatch_grace`].
+    ///
+    /// **Read once per device open, not per frame or per restart.** The pipeline calls this when
+    /// it arms the format watchdog on a freshly opened source, and it is entitled to assume the
+    /// answer does not move under it while that source lives: `restart()` is documented above as
+    /// *not* reopening the device, so an implementation whose `restart()` renegotiated the format
+    /// would be changing something the pipeline reads exactly once.
+    ///
+    /// The default is `None` — "this source negotiated nothing", which is the truth for
+    /// [`super::SyntheticSource`] and for every test double — and a `None` here leaves the
+    /// pipeline's format watchdog inert, since there is nothing to compare against.
+    fn negotiated_dimensions(&self) -> Option<(u32, u32)> {
+        None
+    }
+}
+
+/// Produces a fresh [`FrameSource`] after the previous one disconnected (§6.1: "attempt
+/// rediscovery"). The pipeline owns one for its whole life, so recovery needs no help from the
+/// caller and no reference to a device the caller has already lost.
+///
+/// The pipeline calls [`SourceOpener::open`] once at startup and then once per reopen attempt,
+/// spacing the attempts with an exponential backoff. **Failure is the normal case while a
+/// device is coming back**: `ENOENT` (the node is not there yet), `ENODEV` (it is there but the
+/// driver has not bound), and `EBUSY` (the driver is mid-probe) all mean "not yet", so an
+/// implementation reports them and is called again rather than being expected to block.
+pub trait SourceOpener: Send {
+    /// Open the device and start streaming, or say why not.
+    fn open(&mut self) -> Result<Box<dyn FrameSource>, CaptureError>;
+
+    /// A one-line description of *what would be opened*, for logs and the window title. Unlike
+    /// [`FrameSource::describe`] this must work with no device present.
+    fn describe(&self) -> String;
 }
 
 /// Lock-poisoning policy for this module.
@@ -204,6 +264,29 @@ pub trait FrameSource: Send {
 /// failure must never tear down the rest of the client).
 pub(crate) fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source with nothing to restart must succeed rather than fail, or every synthetic source
+    /// would count a failed restart the moment the pipeline's stall timer fired.
+    #[test]
+    fn the_default_restart_succeeds_and_does_nothing() {
+        struct Inert;
+        impl FrameSource for Inert {
+            fn next_frame(&mut self) -> Result<CompressedFrame, CaptureError> {
+                Err(CaptureError::Timeout(Duration::ZERO))
+            }
+            fn describe(&self) -> String {
+                "inert".to_string()
+            }
+        }
+        let mut s = Inert;
+        assert!(s.restart().is_ok());
+        assert!(s.restart().is_ok(), "restart must be repeatable");
+    }
 }
 
 #[cfg(test)]

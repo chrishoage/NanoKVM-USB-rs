@@ -266,10 +266,17 @@ impl FakeCh9329 {
         self.state.knobs().drop_next_reply = true;
     }
 
-    /// Close the master side, so the host's slave fd sees a hang-up — `POLLHUP`, then `EIO`.
-    /// This is what an unplug looks like from the host's point of view. Takes effect within
-    /// [`POLL_INTERVAL`]; the fake's thread does the closing, so no fd is closed under a blocked
-    /// read.
+    /// Close the master side, so the host's slave fd sees a hang-up — `POLLHUP`, and then a
+    /// `read` that returns **0**, not `EIO`. Closing a pty master vhangups the slave exactly as
+    /// `acm_disconnect` vhangups the dongle's tty, and a hung-up tty answers `read` with EOF
+    /// (`hung_up_tty_read`); measured on this kernel, `poll` returns `POLLIN|POLLERR|POLLHUP` and
+    /// the following `read(2)` returns 0. So this is a faithful unplug and not an approximation of
+    /// one — which matters, because it is what lets the idle-loss case be reproduced without
+    /// hardware. (`serialport` checks `revents` before it reads, so what the *host* sees through
+    /// it is `BrokenPipe` either way.)
+    ///
+    /// Takes effect within [`POLL_INTERVAL`]; the fake's thread does the closing, so no fd is
+    /// closed under a blocked read.
     pub fn hang_up(&self) {
         self.state.hang_up.store(true, Ordering::SeqCst);
     }

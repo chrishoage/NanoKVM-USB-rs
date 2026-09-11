@@ -41,15 +41,16 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::input::held::HeldState;
 use crate::input::queue::{Entry, EntryKind, MotionRun};
 use crate::input::shared::{lock, Shared};
 use crate::input::stats::{Counters, ReleaseOutcome, ReleaseRecord};
-use crate::input::ReleaseReason;
-use crate::link::{Link, LinkError};
+use crate::input::{ReconnectConfig, ReleaseReason};
+use crate::link::{Link, LinkError, LinkSource};
 use crate::proto::cmd;
+use crate::proto::frame::DeviceInfo;
 use crate::proto::report::{KeyboardReport, MouseAbsReport, MouseRelReport, MOUSE_RELEASE_ALL};
 
 /// The transport failed on this frame. Nothing further may be written (§2.6.1).
@@ -62,6 +63,28 @@ struct Down;
 /// span of the coordinate range, so it is the largest displacement that could still mean anything.
 /// At ±127 a report this is at most 33 reports per axis. See the module documentation.
 const REL_RUN_MAX: i32 = crate::proto::report::ABS_MAX as i32;
+
+/// The failsafe interval at which the writer re-checks `shutting_down` while an open is in flight
+/// on the helper thread ([`Writer::open_bounded`]).
+///
+/// It is a failsafe and not the mechanism: a shutdown notifies the same condvar, so the ordinary
+/// case wakes at once. It exists because "a shutdown is bounded by this constant" is a property
+/// that should not depend on every future trigger remembering to notify.
+const OPEN_POLL: Duration = Duration::from_millis(5);
+
+/// How long the writer parks in [`Writer::next_entry`] before asking the transport whether it is
+/// still there ([`Link::is_down`], §2.7).
+///
+/// It bounds the one wait that used to be unbounded, and with it the time an *idle* writer takes
+/// to notice a link that hung up with nothing queued — measured on the dongle as never, because
+/// only a failed write set `link_down`. 100 ms is a tenth of the second §2.8 wants that fact
+/// visible within, and costs an idle thread ten mutex acquisitions a second; a submission or a
+/// trigger still wakes it immediately, so this is a floor on *discovery*, never on latency.
+///
+/// It is emphatically not a keepalive: nothing is written. The device acknowledges anything
+/// (§3.4, A17), so traffic would prove nothing that the transport's own read side does not
+/// already know.
+const LINK_HEALTH_POLL: Duration = Duration::from_millis(100);
 
 /// Which mouse device the writer last addressed, tracked from the last motion flushed.
 ///
@@ -78,20 +101,69 @@ enum PointerMode {
 
 pub(crate) struct Writer {
     shared: Arc<Shared>,
-    /// Boxed rather than generic so Stage 2's reconnect (§2.7) can swap the transport under the
-    /// running writer without changing this type.
-    link: Box<dyn Link>,
+    /// Where a replacement transport comes from (§2.7). Consulted once at startup and again after
+    /// every transport failure — or, when `reconnect` is false, only once ever.
+    ///
+    /// `None` only while an open is in flight on the helper thread, and permanently after a
+    /// shutdown abandoned one there — see [`Writer::open_bounded`].
+    source: Option<Box<dyn LinkSource>>,
+    /// [`LinkSource::describe`], taken once at construction.
+    ///
+    /// It is a constant — the path, or the discovery rule — and the writer must still be able to
+    /// name its source in a log line while the source itself is away on the helper thread that is
+    /// opening a port.
+    source_desc: String,
+    /// The transport in service, or `None` between a failure and the link that replaces it.
+    /// Boxed rather than generic so the transport can be swapped under the running writer.
+    link: Option<Box<dyn Link>>,
+    /// Whether a transport failure is repaired (§2.7) or terminal.
+    ///
+    /// False for [`crate::input::spawn`], which is Stage 1's entry point: its source holds exactly
+    /// one link and can never produce another, so entering a retry loop against it would spin a
+    /// thread for ever and would not be the Stage 1 behaviour its callers and tests pin.
+    reconnect: bool,
     timeout: Duration,
+    reconnect_cfg: ReconnectConfig,
     held: HeldState,
     mode: PointerMode,
 }
 
+/// Why one attempt at commissioning a link was rejected (§2.7 step 3). Every variant means the
+/// same thing to the caller — drop this link and open another — and differs only in the log line.
+#[derive(Debug)]
+enum Rejected {
+    Resync(LinkError),
+    ReleaseAll,
+    GetInfo(LinkError),
+    Parse(crate::proto::frame::ParseError),
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rejected::Resync(e) => write!(f, "the resynchronisation preamble failed: {e}"),
+            Rejected::ReleaseAll => write!(f, "the release-all could not be written"),
+            Rejected::GetInfo(e) => write!(f, "GET_INFO did not answer: {e}"),
+            Rejected::Parse(e) => write!(f, "the GET_INFO reply was unusable: {e}"),
+        }
+    }
+}
+
 impl Writer {
-    pub(crate) fn new(shared: Arc<Shared>, link: Box<dyn Link>, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        source: Box<dyn LinkSource>,
+        reconnect: bool,
+        config: crate::input::Config,
+    ) -> Self {
         Self {
             shared,
-            link,
-            timeout,
+            source_desc: source.describe(),
+            source: Some(source),
+            link: None,
+            reconnect,
+            timeout: config.transact_timeout,
+            reconnect_cfg: config.reconnect,
             held: HeldState::new(),
             mode: PointerMode::Rel,
         }
@@ -99,6 +171,7 @@ impl Writer {
 
     /// The writer's loop, in the order §2.6 specifies for every iteration.
     pub(crate) fn run(mut self) {
+        self.acquire_first_link();
         loop {
             // (1) Check the cancellation flag before dequeuing or writing anything.
             if self.shared.cancel.load(Ordering::SeqCst) {
@@ -108,6 +181,13 @@ impl Writer {
             }
             if self.should_exit() {
                 return;
+            }
+            // §2.7. Placed *after* the cancellation check so the `LinkDown` release that a failure
+            // triggers is completed first — §2.6.1's "a failed transport must still advance the
+            // ack" — and only then is a replacement sought.
+            if self.reconnect && self.shared.link_down.load(Ordering::SeqCst) {
+                self.acquire(false);
+                continue;
             }
             // (3) Dequeue one entry.
             let Some(entry) = self.next_entry() else {
@@ -157,25 +237,83 @@ impl Writer {
             || self.shared.shutting_down.load(Ordering::SeqCst)
     }
 
-    /// Block until there is an entry, a cancellation, or shutdown. Returns `None` when the caller
-    /// should re-run the checks at the top of the loop.
+    /// Block until there is an entry, a cancellation, a shutdown — or the transport reports itself
+    /// gone. Returns `None` when the caller should re-run the checks at the top of the loop.
+    ///
+    /// **The wait is bounded** ([`LINK_HEALTH_POLL`]), and every wake asks the link whether it is
+    /// still there. Without that this is where an idle writer sits for ever: nothing is queued, so
+    /// nothing fails, so `link_down` — which only a failed write used to set — stays clear on a
+    /// cable that has been out of its socket for half a minute (§2.7, measured). The check is a
+    /// question, not a write: see [`Link::is_down`].
     fn next_entry(&self) -> Option<Entry> {
-        let mut q = lock(&self.shared.queue);
         loop {
-            if self.shared.cancel.load(Ordering::SeqCst)
-                || self.shared.shutting_down.load(Ordering::SeqCst)
             {
+                let mut q = lock(&self.shared.queue);
+                if self.shared.cancel.load(Ordering::SeqCst)
+                    || self.shared.shutting_down.load(Ordering::SeqCst)
+                {
+                    return None;
+                }
+                if let Some(entry) = q.pop(&self.shared.counters) {
+                    return Some(entry);
+                }
+                let _unused = self
+                    .shared
+                    .wake
+                    .wait_timeout(q, LINK_HEALTH_POLL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            // Off the queue lock, because `mark_link_down` takes the link-state mutex and no path
+            // in this file holds both.
+            if self.note_link_lost() {
                 return None;
             }
-            if let Some(entry) = q.pop(&self.shared.counters) {
-                return Some(entry);
-            }
-            q = self
-                .shared
-                .wake
-                .wait(q)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+    }
+
+    /// Ask the transport whether it has failed, and record it if it has (§2.6.1, §2.7).
+    ///
+    /// `true` only on the transition, so the caller is sent back to the top of the loop — where a
+    /// reconnecting writer drops the stale link and seeks a replacement, and a Stage 1 writer
+    /// parks again with the failure now visible in [`crate::input::Stats`]. Reporting it once is
+    /// what keeps an idle writer that cannot reconnect from spinning on a dead link.
+    ///
+    /// Dropping the fd is the other half of why this matters, and it belongs to
+    /// [`Writer::acquire`]: while the writer holds a hung-up `/dev/ttyACM1`, `acm_port_destruct`
+    /// cannot run, the tty index is not freed, and the dongle re-enumerates as `/dev/ttyACM2` —
+    /// measured. `acquire` clears `self.link` first thing, before any backoff, for exactly that
+    /// reason.
+    ///
+    /// **Which means a Stage 1 (`spawn`) writer never drops it**, because `acquire` is only
+    /// reached when `reconnect` is set, and this is deliberate rather than an oversight. Freeing
+    /// the tty index is a §2.7 concern — it exists so that the *reopen* finds the device — and a
+    /// `spawn`ed writer has no source to reopen from: its link was handed to it and there will
+    /// never be another. Clearing it there would destroy the caller's transport while the writer
+    /// is still running, on a path where nothing can use the space that frees. C1 asks only that
+    /// the outage be recorded and the ack advanced so input is not wedged for good, and that
+    /// happens below whether or not the fd goes. It is one more reason `main.rs` builds its writer
+    /// with `spawn_with_source`.
+    fn note_link_lost(&self) -> bool {
+        if self.shared.link_down.load(Ordering::SeqCst) {
+            // Already known and already reported; the loop is not owed another trip.
+            return false;
+        }
+        if !self.link.as_ref().is_some_and(|link| link.is_down()) {
+            return false;
+        }
+        log::warn!(
+            "the transport reported itself down with nothing queued; no write was needed to \
+             discover it"
+        );
+        self.shared.mark_link_down();
+        // §2.6.1, and the same two steps a failed write takes: the session ended with the cable,
+        // so it is released and the ack advances. The release itself will be recorded `Unsent` —
+        // there is nothing left to send it on — which is precisely the warning the viewer turns
+        // into "the target may still be holding keys". Going through the ordinary trigger is what
+        // keeps this from being a second path: `run` services the cancellation first and only then
+        // looks for a replacement, exactly as it does after a write failure.
+        self.shared.trigger(ReleaseReason::LinkDown);
+        true
     }
 
     // ---------------------------------------------------------------- cancellation
@@ -238,11 +376,20 @@ impl Writer {
     /// belonged to the session being cancelled, and carrying it into the next one turns that
     /// session's first `Button` into a click at a stale coordinate.
     fn write_release_all(&mut self) -> ReleaseOutcome {
-        if self.shared.link_down.load(Ordering::SeqCst) {
+        if self.link.is_none() || self.shared.link_down.load(Ordering::SeqCst) {
             // The transport is already known dead; further transacts would only block. §2.6.1:
             // record it as unsent and advance the ack anyway.
             return ReleaseOutcome::Unsent;
         }
+        self.emit_release_all()
+    }
+
+    /// The release frames themselves, with no health check in front of them.
+    ///
+    /// Split out for §2.7 step 2, which writes a release-all on a link that has just been opened
+    /// while `link_down` is — correctly — still set: the link is not in service until `GET_INFO`
+    /// has proved it (step 3d), and this write is part of that proof.
+    fn emit_release_all(&mut self) -> ReleaseOutcome {
         let kb = KeyboardReport::RELEASE_ALL.payload();
         if self.write_frame(cmd::SEND_KB_GENERAL_DATA, &kb).is_err() {
             return ReleaseOutcome::Unsent;
@@ -264,6 +411,342 @@ impl Writer {
             return ReleaseOutcome::Unsent;
         }
         ReleaseOutcome::Submitted
+    }
+
+    // ---------------------------------------------------------------- reconnect (§2.7)
+
+    /// Get the writer its first transport.
+    ///
+    /// Two shapes, because the two entry points promise different things:
+    ///
+    /// - [`crate::input::spawn`] hands over a link its caller has already opened and proved with
+    ///   its own `GET_INFO`. There is nothing to resynchronise and no queue to discard, so the
+    ///   link is taken from the source and used as it is — Stage 1's behaviour, unchanged.
+    /// - [`crate::input::spawn_with_source`] owns the opening, so the first link goes through the
+    ///   full §2.7 sequence like every later one. A release-all at startup is harmless and §2.7
+    ///   wants the target's HID state resynchronised, so it is not special-cased; and the
+    ///   `GET_INFO` that ends the sequence is what turns a startup failure into a reported
+    ///   condition (`Stats::link_down`, `Producer::wait_for_link`) rather than a panic.
+    fn acquire_first_link(&mut self) {
+        if self.reconnect {
+            self.acquire(true);
+            return;
+        }
+        // Not `open_bounded`: `spawn`'s source hands over a link its caller already opened, so this
+        // call cannot block, and routing it through the helper thread would let a shutdown racing
+        // startup drop a perfectly good link and report its release `Unsent` — a change to Stage 1
+        // behaviour for no gain.
+        match self.source.as_mut().map(|s| s.open()) {
+            Some(Ok(link)) => self.link = Some(link),
+            Some(Err(e)) => {
+                log::error!("no transport at startup: {e}");
+                self.shared.mark_link_down();
+            }
+            None => {
+                log::error!("no transport at startup: no source");
+                self.shared.mark_link_down();
+            }
+        }
+    }
+
+    /// [`LinkSource::open`] on a helper thread, so that the writer's wait for it is bounded by a
+    /// flag check rather than by the transport.
+    ///
+    /// `None` means a shutdown was requested while the open was in flight and the caller must stop
+    /// reconnecting; anything else is what the source answered.
+    ///
+    /// **Why this is not a plain call.** Opening a serial port is `open(2)` plus a `tcsetattr`,
+    /// which on a device that has just re-enumerated is a `SET_LINE_CODING` control transfer whose
+    /// kernel bound is seconds. The writer cannot interrupt that, and it is what
+    /// [`crate::input::WriterHandle::shutdown`] joins on: without this, a shutdown asked for while
+    /// a port is opening waits out the open, on a program that is holding someone else's console.
+    ///
+    /// So the open happens on a thread that owns the source for the duration, and the writer waits
+    /// on the condvar every trigger already notifies — with [`OPEN_POLL`] as a failsafe, so the
+    /// bound holds even if a wake-up is missed. When the writer gives up on it, the channel's
+    /// receiver goes with it: the helper's `send` then fails, and **the link it opened is dropped
+    /// right there, never having been written to**. That is the property shutdown needs — nothing
+    /// is left behind that could put bytes on the port after `shutdown` returns.
+    ///
+    /// The source is not returned in that case, so `self.source` stays `None` and no further open
+    /// is possible. That is correct rather than lossy: the only path here is a shutdown, which is
+    /// a one-way door (`Shared::shutting_down` is never cleared).
+    fn open_bounded(&mut self) -> Option<Result<Box<dyn Link>, LinkError>> {
+        let Some(mut source) = self.source.take() else {
+            // Only reachable after a shutdown abandoned the source, and the caller returns at once.
+            return None;
+        };
+        let shared = Arc::clone(&self.shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // `std::thread::spawn` rather than `Builder::spawn` for the reason `input::start` gives:
+        // the only failure is the OS refusing a thread, and there is nothing useful to do with it
+        // here — a `Builder` error would also drop the source it had already moved into the closure.
+        std::thread::spawn(move || {
+            let opened = source.open();
+            {
+                // Sent under the lock the writer waits on, so the notify below cannot land in the
+                // window between the writer's `try_recv` and its `wait_timeout`.
+                let _q = lock(&shared.queue);
+                // On `Err` the writer has gone and this drops the link, unwritten to.
+                let _ = tx.send((source, opened));
+            }
+            shared.wake.notify_all();
+        });
+
+        loop {
+            let q = lock(&self.shared.queue);
+            match rx.try_recv() {
+                Ok((source, opened)) => {
+                    self.source = Some(source);
+                    return Some(opened);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The helper panicked. Report it as a failed attempt; the source went with it,
+                    // so every later attempt returns `None` and the writer stops reconnecting.
+                    return Some(Err(LinkError::Down(format!(
+                        "the thread opening {} died",
+                        self.source_desc
+                    ))));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if self.shared.shutting_down.load(Ordering::SeqCst) {
+                return None;
+            }
+            let _unused = self
+                .shared
+                .wake
+                .wait_timeout(q, OPEN_POLL)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Loop until a link has been commissioned, or a shutdown asks the writer to stop (§2.7).
+    ///
+    /// `initial` distinguishes the first link from a replacement in two places only: the first
+    /// attempt goes out immediately rather than after a backoff, and success does not count as a
+    /// *re*-connect.
+    fn acquire(&mut self, initial: bool) {
+        // Whatever is left of the old transport goes now, before anything waits: its reader thread
+        // and its port handle have no business outliving the decision to replace it.
+        self.link = None;
+        if !initial {
+            log::warn!(
+                "serial link down; reconnecting via {} (backoff {:?}..{:?})",
+                self.source_desc,
+                self.reconnect_cfg.initial_backoff,
+                self.reconnect_cfg.max_backoff
+            );
+        }
+        // A zero backoff would be a spin, so it is floored rather than trusted; the doubling is
+        // saturating for the same reason.
+        let floor = Duration::from_millis(1);
+        let max = self.reconnect_cfg.max_backoff.max(floor);
+        let mut backoff = self.reconnect_cfg.initial_backoff.max(floor).min(max);
+        let mut attempt = 0u64;
+        let mut wait_first = !initial;
+
+        loop {
+            if wait_first && !self.backoff_wait(backoff) {
+                return;
+            }
+            wait_first = true;
+            if self.shared.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+            attempt += 1;
+            Counters::bump(&self.shared.counters.reconnect_attempts);
+            match self.open_bounded() {
+                // A shutdown landed while the open was in flight. The link it may still produce is
+                // dropped by the helper thread without ever being written to; the ordinary
+                // shutdown path in `run` then records the release it owes as `Unsent`, because
+                // there is no transport to send it on.
+                None => return,
+                Some(Ok(link)) => {
+                    self.link = Some(link);
+                    if self.commission(initial, attempt) {
+                        return;
+                    }
+                    // Not accepted. The link is dropped here rather than kept "just in case": a
+                    // transport that cannot answer `GET_INFO` is not one to send keystrokes down.
+                    self.link = None;
+                }
+                Some(Err(e)) => log::warn!("attempt {attempt} to open {}: {e}", self.source_desc),
+            }
+            backoff = backoff.saturating_mul(2).min(max);
+        }
+    }
+
+    /// Wait up to `backoff` for something to change. `false` means a shutdown was requested and
+    /// the caller must stop reconnecting.
+    ///
+    /// The wait is on the condvar rather than a sleep, so a shutdown is noticed at once instead of
+    /// after up to `max_backoff` — the difference between an exit that feels instant and one that
+    /// hangs for four seconds on a machine driving someone else's console.
+    ///
+    /// A cancellation trigger arriving here is **serviced here** (§2.6.1). Its release is `Unsent`
+    /// on a dead link and that is recorded, but the ack must still advance: otherwise a reconnect
+    /// that never succeeds leaves `requested_epoch` permanently above `acked_epoch`, `engage`
+    /// never succeeds again, and a dead cable has wedged input for good — the exact failure
+    /// §2.6.1 forbids.
+    fn backoff_wait(&mut self, backoff: Duration) -> bool {
+        let deadline = Instant::now() + backoff;
+        loop {
+            if self.shared.shutting_down.load(Ordering::SeqCst) {
+                return false;
+            }
+            if self.shared.cancel.load(Ordering::SeqCst) {
+                self.cancellation_sequence();
+                continue;
+            }
+            let q = lock(&self.shared.queue);
+            // Re-read under the lock, which every trigger also takes: without this the flag could
+            // be set between the checks above and the wait below, and the wake-up lost.
+            if self.shared.shutting_down.load(Ordering::SeqCst)
+                || self.shared.cancel.load(Ordering::SeqCst)
+            {
+                continue;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return true;
+            };
+            let _unused = self
+                .shared
+                .wake
+                .wait_timeout(q, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// The §2.7 sequence on a link that has just been opened, run as a cancellation and as one
+    /// uninterrupted unit on this thread. `true` means the link was accepted.
+    ///
+    /// It is a cancellation because it must be: a producer is allowed to re-engage while the link
+    /// is down (`engage` checks only the ack), so without raising an epoch here its events would
+    /// be written on the new link — a replay of input produced against a session that no longer
+    /// exists, which is exactly what §2.7 step 1 forbids.
+    ///
+    /// The sequence is deliberately the plan's order, with the preamble in front of it:
+    ///
+    /// | | | |
+    /// | --- | --- | --- |
+    /// | a | `resync` | finish any frame the chip is still waiting on, **before** the release-all, so the release-all is not itself eaten as the remainder (§5.1) |
+    /// | b | drain | never replay (§2.7 step 1) |
+    /// | c | release-all | the target's HID state after a link failure is unknown (§2.7 step 2) |
+    /// | d | `GET_INFO` | the proof: a matched reply means the parser is realigned and a CH9329 is there (§2.7 step 3) |
+    ///
+    /// Failure at any step rejects the link. The epoch is still acknowledged, with outcome
+    /// `Unsent`, for the §2.6.1 reason spelled out on [`Writer::backoff_wait`].
+    ///
+    /// The producer stays **disengaged** afterwards: §2.8 requires deliberate recapture, and the
+    /// viewer's next grab is the right moment for input to resume.
+    fn commission(&mut self, initial: bool, attempt: u64) -> bool {
+        let (epoch, pending) = self.shared.begin_reconnect();
+        // A trigger that landed while the link was being opened has no sequence of its own left to
+        // run: this one covers its epoch. Its reason is folded in rather than stranded — kept when
+        // it outranks `Reconnected` (only `Shutdown` does), and otherwise subsumed by it, since a
+        // release that went out because the cable came back is better described by the cable than
+        // by the focus loss that coincided with it. Leaving it in the slot would mislabel the next,
+        // unrelated release.
+        let reason = match pending {
+            Some(r) if r.severity() > ReleaseReason::Reconnected.severity() => r,
+            _ => ReleaseReason::Reconnected,
+        };
+        let result = self.commission_steps(epoch);
+
+        // The tracked state goes whatever happened: the held set and the pointer position belonged
+        // to a session that ended with the previous cable (§2.6).
+        self.held.clear();
+        self.mode = PointerMode::Rel;
+
+        let outcome = match &result {
+            Ok(_) => ReleaseOutcome::Submitted,
+            Err(rejected) => {
+                log::warn!("attempt {attempt} rejected: {rejected}");
+                ReleaseOutcome::Unsent
+            }
+        };
+        *lock(&self.shared.last_release) = Some(ReleaseRecord {
+            epoch,
+            reason,
+            outcome,
+        });
+        Counters::bump(&self.shared.counters.cancellations);
+
+        if let Ok(info) = result {
+            let down_for = self.shared.mark_link_up(info);
+            if !initial {
+                Counters::bump(&self.shared.counters.reconnects);
+            }
+            log::info!(
+                "{} on {}: CH9329 firmware {:.1}, target {}, locks: num={} caps={} scroll={} \
+                 (attempt {attempt}, down for {:?})",
+                if initial { "link up" } else { "reconnected" },
+                self.source_desc,
+                info.version,
+                if info.target_connected {
+                    "connected"
+                } else {
+                    "NOT connected"
+                },
+                info.num_lock,
+                info.caps_lock,
+                info.scroll_lock,
+                down_for.unwrap_or_default()
+            );
+        }
+
+        {
+            let _q = lock(&self.shared.queue);
+            self.shared.acked_epoch.store(epoch, Ordering::SeqCst);
+            // B3, exactly as in `cancellation_sequence`: a trigger that arrived after the latch —
+            // a shutdown between steps a and d, say — is not covered by this sequence and gets its
+            // own, on the link this one just commissioned.
+            if self.shared.requested_epoch.load(Ordering::SeqCst) == epoch {
+                self.shared.cancel.store(false, Ordering::SeqCst);
+            }
+        }
+        self.shared.wake.notify_all();
+        outcome == ReleaseOutcome::Submitted
+    }
+
+    /// Steps a to d of [`Writer::commission`]. Separated so the bookkeeping around them runs on
+    /// every path, including every failure.
+    fn commission_steps(&mut self, epoch: u64) -> Result<DeviceInfo, Rejected> {
+        let Some(link) = self.link.as_mut() else {
+            return Err(Rejected::ReleaseAll);
+        };
+        // (a) §5.1: the chip may still be mid-frame from a torn write on the previous link.
+        link.resync().map_err(Rejected::Resync)?;
+
+        // (b) §2.7 step 1. Everything queued carries an epoch below this one, so the drain is
+        // total; it is done explicitly, and counted, because "never replay" is the requirement and
+        // relying on the epoch check to notice later would leave the entries sitting in the queue.
+        let discarded = {
+            let mut q = lock(&self.shared.queue);
+            q.drain_upto(epoch, &self.shared.counters)
+        };
+        if discarded > 0 {
+            self.shared
+                .counters
+                .queue_discarded_on_reconnect
+                .fetch_add(discarded as u64, Ordering::SeqCst);
+            log::info!("discarded {discarded} queued entries rather than replaying them (§2.7)");
+        }
+
+        // (c) §2.7 step 2.
+        if self.emit_release_all() == ReleaseOutcome::Unsent {
+            return Err(Rejected::ReleaseAll);
+        }
+
+        // (d) §2.7 step 3, and the proof the link is real. A timeout, a transport failure or a
+        // short payload all mean the same thing here: this is not a link to send keystrokes down.
+        let timeout = self.reconnect_cfg.get_info_timeout;
+        let link = self.link.as_mut().ok_or(Rejected::ReleaseAll)?;
+        let reply = link
+            .transact(cmd::GET_INFO, &[], timeout)
+            .map_err(Rejected::GetInfo)?;
+        DeviceInfo::parse(&reply.data).map_err(Rejected::Parse)
     }
 
     // ---------------------------------------------------------------- report emission
@@ -447,14 +930,18 @@ impl Writer {
         Ok(!self.cancelled())
     }
 
-    /// One frame, one transact, wait for the reply (§5.1).    /// One frame, one transact, wait for the reply (§5.1).
+    /// One frame, one transact, wait for the reply (§5.1).
     ///
     /// - `Device` — the frame was rejected but the link is healthy (§3.1): count it and continue.
     /// - `Timeout` — the frame was written and nothing answered: count it, flag degraded, and
     ///   continue. The device may still have acted on it (§2.6.1).
     /// - `Down` / `Io` — the transport is gone: mark the link down and stop writing.
     fn write_frame(&mut self, command: u8, payload: &[u8]) -> Result<(), Down> {
-        match self.link.transact(command, payload, self.timeout) {
+        let Some(link) = self.link.as_mut() else {
+            // Between a failure and its replacement there is nothing to write to (§2.7).
+            return Err(Down);
+        };
+        match link.transact(command, payload, self.timeout) {
             Ok(_) => {
                 self.count_written(command);
                 Ok(())
@@ -471,7 +958,7 @@ impl Writer {
                 Ok(())
             }
             Err(LinkError::Down(_)) | Err(LinkError::Io(_)) => {
-                self.shared.link_down.store(true, Ordering::SeqCst);
+                self.shared.mark_link_down();
                 Err(Down)
             }
         }

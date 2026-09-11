@@ -21,11 +21,19 @@
 //!   anything, which is how a release stays schedulable when the queue is full.
 //! - **Overflow is an explicit failure** (§2.8), never a silent drop of a transition.
 //!
-//! # Not in Stage 1
+//! # Reconnect (§2.7)
 //!
-//! Reconnect (§2.7) is Stage 2. The writer's link is boxed so a transport can be swapped under it
-//! later without changing this API. Blocking, paced admission for scripts (§2.9) is not
-//! implemented either; [`Producer::submit`] is the viewer's non-blocking policy.
+//! A path started with [`spawn_with_source`] replaces its transport after a failure instead of
+//! staying down. The writer owns that: the §2.7 sequence — discard the queue, release-all,
+//! re-query device info — needs the queue and the epoch bookkeeping, so it runs **as a
+//! cancellation** on the writer thread, with the torn-write preamble (§5.1) in front of it. See
+//! [`writer::Writer::commission`]. [`spawn`] keeps Stage 1's behaviour: one link, and a failure is
+//! terminal.
+//!
+//! # Not implemented
+//!
+//! Blocking, paced admission for scripts (§2.9); [`Producer::submit`] is the viewer's
+//! non-blocking policy and [`Producer::wait_until_engageable`] the only blocking primitive.
 
 mod held;
 mod queue;
@@ -46,7 +54,8 @@ use std::time::{Duration, Instant};
 use crate::input::queue::EntryKind;
 use crate::input::shared::{lock, Shared};
 use crate::input::stats::Counters;
-use crate::link::Link;
+use crate::link::{Link, LinkError, LinkSource};
+use crate::proto::frame::DeviceInfo;
 use crate::proto::report::{HidKey, ABS_MAX};
 
 /// One input event as the viewer produces it (§2.2).
@@ -83,6 +92,8 @@ pub struct Config {
     /// How long each [`Link::transact`] waits for its reply. The measured ack round trip is
     /// 17 ms for a mouse report and 4.15 ms for a keyboard report (§5.1).
     pub transact_timeout: Duration,
+    /// Reconnect tuning (§2.7). Ignored by [`spawn`], which has nothing to reconnect to.
+    pub reconnect: ReconnectConfig,
 }
 
 impl Default for Config {
@@ -90,6 +101,51 @@ impl Default for Config {
         Self {
             max_barriers: 256,
             transact_timeout: Duration::from_millis(100),
+            reconnect: ReconnectConfig::default(),
+        }
+    }
+}
+
+/// How hard, and how often, the writer tries to replace a failed transport (§2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectConfig {
+    /// The wait before the first attempt after a failure, doubling on each rejection.
+    ///
+    /// Nothing is gained by trying sooner: a replug takes the kernel some hundreds of
+    /// milliseconds to enumerate, and an attempt made before the node is back is an attempt
+    /// wasted. A value below 1 ms is floored to 1 ms, because a zero backoff is a spin.
+    pub initial_backoff: Duration,
+    /// The ceiling the doubling stops at. It is also the worst case for how long a link that came
+    /// back stays unnoticed, which is why it is seconds rather than minutes.
+    pub max_backoff: Duration,
+    /// How long the `GET_INFO` that proves a new link is real may take (§2.7 step 3).
+    ///
+    /// The measured round trip is 3.98 ms (A11), so this is three orders of magnitude of slack —
+    /// it exists to bound a chip that is enumerated but not answering, not to pace anything.
+    pub get_info_timeout: Duration,
+}
+
+impl Default for ReconnectConfig {
+    /// 250 ms doubling to 4 s, with a 500 ms `GET_INFO` deadline.
+    ///
+    /// **Measured, 2026-09-11** (`docs/STAGE2_FINDINGS.md` §6 item 1): a `USBDEVFS_RESET` of the
+    /// serial device takes the node away for 404–430 ms, and a reset of the dongle's internal hub
+    /// for 1416 ms. The writer attempts immediately on noticing the loss and then waits 250 ms,
+    /// 500 ms, 1 s, 2 s, 4 s, …, so attempts land at t ≈ 0, 0.25, 0.75, 1.75 s: a device reset is
+    /// caught by attempt 3 and a hub reset by attempt 4, each within about a third of a second of
+    /// the node being back. H-A4 measured 781.6 ms end to end for a 414 ms outage over 3 attempts,
+    /// which is that ladder exactly.
+    ///
+    /// So both numbers stay. A smaller initial backoff buys nothing — attempt 1 already fires at
+    /// once and fails, because the node is not there yet — and a larger one would miss the 0.75 s
+    /// slot and turn a 414 ms outage into a 1.75 s one. The 4 s ceiling is never reached by any
+    /// outage this hardware produces; it first binds beyond 3.75 s, where it is the longest a user
+    /// sits looking at "serial DOWN" after the device is back.
+    fn default() -> Self {
+        Self {
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(4),
+            get_info_timeout: Duration::from_millis(500),
         }
     }
 }
@@ -105,9 +161,10 @@ pub enum SubmitError {
     /// has been triggered, and input is disengaged until deliberate recapture (§2.8).
     #[error("input queue overflowed; the session was cancelled and must be re-engaged")]
     Overflow,
-    /// The transport is gone (§2.6.1). Stage 1 has no reconnect (§2.7), so submissions are
-    /// refused rather than queued into a link that will never drain. Reported rather than
-    /// silently accepted, so input cannot wedge invisibly.
+    /// The transport is gone (§2.6.1). Submissions are refused rather than queued into a link
+    /// that may never drain — reported rather than silently accepted, so input cannot wedge
+    /// invisibly. On a path started with [`spawn_with_source`] this clears when a replacement
+    /// link is commissioned (§2.7); on one started with [`spawn`] it is permanent.
     #[error("link is down; input cannot be delivered")]
     LinkDown,
     /// The writer is shutting down (§2.6). The final release-all is the last thing that will be
@@ -151,8 +208,37 @@ pub struct WriterHandle {
 /// The writer is a dedicated `std::thread` because every report is a blocking acknowledged round
 /// trip and nothing else in the program may wait on it (§5.1, §2.9).
 pub fn spawn<L: Link + 'static>(link: L, config: Config) -> (Producer, WriterHandle) {
+    let source = OneLink {
+        link: Some(Box::new(link) as Box<dyn Link>),
+    };
+    start(Box::new(source), false, config)
+}
+
+/// Start the input path with a **source** of transports rather than one transport (§2.7).
+///
+/// The difference from [`spawn`] is entirely in what happens after a transport failure: the writer
+/// completes the `LinkDown` release as before, and then reopens, resynchronises the chip's parser
+/// (§5.1), discards the queue, re-sends release-all and re-queries device info, retrying with an
+/// exponential backoff until it works. The producer stays **disengaged** across all of it (§2.8:
+/// deliberate recapture), so input resumes on the user's next grab and not before.
+///
+/// The **initial** open runs the same sequence on this thread, so a device that is not there at
+/// startup is a reported condition rather than a panic: [`Stats::link_down`],
+/// [`Stats::device_info`] and [`Producer::wait_for_link`] are how a caller that wants to fail fast
+/// finds out.
+pub fn spawn_with_source(source: Box<dyn LinkSource>, config: Config) -> (Producer, WriterHandle) {
+    start(source, true, config)
+}
+
+/// The body both entry points share.
+fn start(source: Box<dyn LinkSource>, reconnect: bool, config: Config) -> (Producer, WriterHandle) {
     let shared = Arc::new(Shared::new(config));
-    let writer = writer::Writer::new(Arc::clone(&shared), Box::new(link), config.transact_timeout);
+    if reconnect {
+        // There is no link yet, and `submit` must say so rather than queue into nothing. The
+        // writer clears this the moment its first `GET_INFO` answers.
+        shared.mark_link_down();
+    }
+    let writer = writer::Writer::new(Arc::clone(&shared), source, reconnect, config);
     // `std::thread::spawn` rather than `Builder::spawn`: the only failure is the OS refusing a
     // thread, which is not a condition this API can meaningfully report, and the signature is
     // fixed as infallible.
@@ -166,6 +252,29 @@ pub fn spawn<L: Link + 'static>(link: L, config: Config) -> (Producer, WriterHan
             join: Some(join),
         },
     )
+}
+
+/// The [`LinkSource`] behind [`spawn`]: it yields the one link it was given, once, and refuses
+/// for ever after.
+///
+/// It exists so both entry points build the same writer over the same seam. The writer is told
+/// separately not to reconnect, because retrying against a source that can never succeed would
+/// spin a thread for the life of the process and would not be the Stage 1 behaviour `spawn`
+/// promises — after a failure the link stays down and entries are discarded, and
+/// `Stats::reconnect_attempts` stays 0.
+struct OneLink {
+    link: Option<Box<dyn Link>>,
+}
+
+impl LinkSource for OneLink {
+    fn open(&mut self) -> Result<Box<dyn Link>, LinkError> {
+        self.link
+            .take()
+            .ok_or_else(|| LinkError::Down("this path was started with one fixed link".into()))
+    }
+    fn describe(&self) -> String {
+        "one fixed link, no reconnect".to_string()
+    }
 }
 
 impl Producer {
@@ -298,13 +407,61 @@ impl Producer {
         }
     }
 
+    /// Block until a link has been commissioned (§2.7), returning what its `GET_INFO` reported.
+    ///
+    /// This is how a caller keeps "fail fast when the device is not there" while the writer owns
+    /// the opening: [`spawn_with_source`] reports a startup failure through [`Stats`] instead of
+    /// returning an error, and this turns that back into one.
+    ///
+    /// [`SubmitError::LinkDown`] means the timeout elapsed with no link, not that reconnecting has
+    /// stopped — the writer keeps trying. [`SubmitError::ShuttingDown`] means it has stopped for
+    /// good. On a path started with [`spawn`] no `GET_INFO` is ever sent, so this always times
+    /// out; it is meaningful only for [`spawn_with_source`].
+    pub fn wait_for_link(&self, timeout: Duration) -> Result<DeviceInfo, SubmitError> {
+        let deadline = Instant::now() + timeout;
+        let mut q = lock(&self.shared.queue);
+        loop {
+            if self.shared.shutting_down.load(Ordering::SeqCst) {
+                return Err(SubmitError::ShuttingDown);
+            }
+            // One read of `link_state`, for the reason `stats` gives: "up" and "this is what it
+            // said" must come from the same critical section or this can answer with the previous
+            // link's `DeviceInfo`.
+            {
+                let state = lock(&self.shared.link_state);
+                if !state.down {
+                    if let Some(info) = state.device_info {
+                        return Ok(info);
+                    }
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(SubmitError::LinkDown);
+            }
+            let (guard, _) = self
+                .shared
+                .wake
+                .wait_timeout(q, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            q = guard;
+        }
+    }
+
     /// A snapshot of the instrumentation §2.8 requires: queue depth, time-in-queue, coalescing
     /// rate, overflow events, and the release-all outcome (§2.6.1). Cheap: atomics plus one small
     /// mutex.
+    ///
+    /// The counters are sampled independently and may be a beat apart from each other, which is
+    /// what an instrumentation snapshot is. The **link** fields are not: `link_down`, `down_since`
+    /// and `device_info` all come out of the one `link_state` critical section the writer updates
+    /// them in, so a snapshot can never show a live link that is still timing an outage, or an
+    /// outage with no start (see `shared::LinkState`).
     pub fn stats(&self) -> Stats {
         let c = &self.shared.counters;
         let load = |a: &AtomicU64| a.load(Ordering::SeqCst);
         let load_usize = |a: &AtomicUsize| a.load(Ordering::SeqCst);
+        let link_state = *lock(&self.shared.link_state);
         Stats {
             queue_depth: load_usize(&c.queue_depth),
             max_queue_depth: load_usize(&c.max_queue_depth),
@@ -323,7 +480,15 @@ impl Producer {
             cancellations: load(&c.cancellations),
             stale_discarded: load(&c.stale_discarded),
             last_release: *lock(&self.shared.last_release),
-            link_down: self.shared.link_down.load(Ordering::SeqCst),
+            // From `link_state`, not from the `link_down` atomic beside it: the atomic is the fast
+            // path `submit` reads, and reading it here would let this snapshot straddle a
+            // transition the writer makes in one critical section.
+            link_down: link_state.down,
+            reconnects: load(&c.reconnects),
+            reconnect_attempts: load(&c.reconnect_attempts),
+            down_since: link_state.down_since,
+            device_info: link_state.device_info,
+            queue_discarded_on_reconnect: load(&c.queue_discarded_on_reconnect),
             degraded: self.shared.degraded.load(Ordering::SeqCst),
             acked_epoch: load(&self.shared.acked_epoch),
             requested_epoch: load(&self.shared.requested_epoch),

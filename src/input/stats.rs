@@ -10,11 +10,11 @@
 //! less thing to get subtly wrong.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Why a release-all (§2.6) was requested.
-///
-/// The trigger list is §2.6's, minus serial reconnect, which is Stage 2 (§2.7).
+use crate::proto::frame::DeviceInfo;
+
+/// Why a release-all (§2.6) was requested. The trigger list is §2.6's, in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReleaseReason {
     /// The viewer window lost focus. niri does not deactivate the shortcut inhibitor on focus
@@ -28,6 +28,11 @@ pub enum ReleaseReason {
     Overflow,
     /// The transport failed under the writer (§2.6.1).
     LinkDown,
+    /// A replacement transport was commissioned (§2.7). The release-all is step 2 of that
+    /// sequence: the target's HID state after a link failure is unknown, so it is resynchronised
+    /// rather than assumed, and the session that was running when the cable went is invalidated
+    /// the same way any other cancellation invalidates one.
+    Reconnected,
     /// Clean shutdown (§2.6).
     Shutdown,
 }
@@ -40,10 +45,18 @@ impl ReleaseReason {
     /// because it is the one that means the release may never have reached the device (§2.6.1);
     /// `Overflow` outranks the ordinary triggers because it is a session failure rather than a
     /// user action (§2.8).
+    ///
+    /// `Reconnected` is never *coalesced* through this comparison — the writer raises the reconnect
+    /// sequence without recording a pending reason, precisely so that a trigger arriving during
+    /// the sequence keeps its own reason for its own sequence (§2.7) — but it is compared here all
+    /// the same: a trigger that landed while the link was being opened has its reason folded into
+    /// the reconnect's record by severity, since that sequence is the one that covers its epoch
+    /// (see `Writer::commission`). It ranks with `LinkDown` because it is the same event seen from
+    /// the other end, so only a `Shutdown` outranks it.
     pub(crate) fn severity(self) -> u8 {
         match self {
             ReleaseReason::Shutdown => 3,
-            ReleaseReason::LinkDown => 2,
+            ReleaseReason::LinkDown | ReleaseReason::Reconnected => 2,
             ReleaseReason::Overflow => 1,
             ReleaseReason::FocusLost
             | ReleaseReason::CaptureReleased
@@ -78,8 +91,10 @@ pub struct ReleaseRecord {
     pub outcome: ReleaseOutcome,
 }
 
-/// A cheap snapshot of the input path's instrumentation (§2.8, §5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A cheap snapshot of the input path's instrumentation (§2.8, §5.1, §2.7).
+///
+/// Not `Eq`: [`Stats::device_info`] carries the device's firmware version as an `f32`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stats {
     /// Entries currently queued: coalesced motion runs plus barriers (§2.3).
     pub queue_depth: usize,
@@ -119,8 +134,32 @@ pub struct Stats {
     pub stale_discarded: u64,
     /// The most recent completed release-all (§2.6.1).
     pub last_release: Option<ReleaseRecord>,
-    /// The transport has failed. No reconnect in Stage 1 (§2.7 is Stage 2).
+    /// The transport has failed and no replacement has been commissioned yet (§2.6.1, §2.7).
+    /// True from startup until the first link is accepted on a path started with
+    /// [`crate::input::spawn_with_source`].
+    ///
+    /// This and [`Stats::down_since`]/[`Stats::device_info`] are read together under one lock, so
+    /// `link_down == true` always comes with a `down_since`, and a link that is up never carries
+    /// one. Rendering "down for {:?}" from the pair needs no defensive `unwrap_or_default`.
     pub link_down: bool,
+    /// Links accepted after a failure (§2.7). The initial one is **not** counted: it did not
+    /// replace anything, so `reconnects == 0` on a healthy run that never lost the cable.
+    pub reconnects: u64,
+    /// Attempts to bring a link into service, successful or not, including the initial one and
+    /// including attempts that opened a port but were rejected at the `GET_INFO` proof (§2.7
+    /// step 3d). One clean start therefore reads `reconnect_attempts == 1, reconnects == 0`.
+    pub reconnect_attempts: u64,
+    /// When the current outage began, or `None` while a link is in service. Render it as an
+    /// elapsed time: `down_since.map(|t| t.elapsed())`.
+    pub down_since: Option<Instant>,
+    /// The last successful `GET_INFO` (§2.7 step 3), including the initial one. It is the proof
+    /// that the reply parser is realigned and a CH9329 is answering, so it is `Some` exactly when
+    /// a link has been accepted at least once — the version and lock bits are a by-product.
+    pub device_info: Option<DeviceInfo>,
+    /// Queue entries discarded by a reconnect's "never replay" drain (§2.7 step 1). A click
+    /// queued three seconds ago may land somewhere destructive, so it is dropped and counted
+    /// rather than delivered late.
+    pub queue_discarded_on_reconnect: u64,
     /// At least one transact timed out. The link may still be usable but is not keeping up.
     pub degraded: bool,
     /// `acked_epoch` — advanced only by the writer (§2.6).
@@ -152,6 +191,9 @@ pub(crate) struct Counters {
     pub(crate) overflows: AtomicU64,
     pub(crate) cancellations: AtomicU64,
     pub(crate) stale_discarded: AtomicU64,
+    pub(crate) reconnects: AtomicU64,
+    pub(crate) reconnect_attempts: AtomicU64,
+    pub(crate) queue_discarded_on_reconnect: AtomicU64,
     pub(crate) max_time_in_queue_ns: AtomicU64,
     pub(crate) last_time_in_queue_ns: AtomicU64,
 }

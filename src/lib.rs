@@ -9,8 +9,10 @@
 //! - [`serial`]  — port open, reader thread matching replies by command byte, `Link` impl.
 //! - [`capture`] — V4L2 streaming, owned frames, JPEG-header dimensions, decode, handoffs (§5, §6).
 //! - [`viewer`]  — winit window, render thread, Wayland shortcut inhibit, input capture.
+//! - [`discovery`] — pairing the two device nodes by USB topology, from sysfs alone (§8).
 
 pub mod capture;
+pub mod discovery;
 pub mod input;
 pub mod link;
 pub mod proto;

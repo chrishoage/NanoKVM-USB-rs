@@ -18,6 +18,24 @@
 //! - [`Behaviour::Timeout`] — `LinkError::Timeout`, returned immediately; no test ever sleeps.
 //! - [`Behaviour::DeviceError`] — `LinkError::Device`, a `cmd | 0xC0` reply with a code.
 //!
+//! `GET_INFO` is answered like the real device, because §2.7's reconnect sequence ends with one
+//! and treats its reply as the proof a link is real: a fake that acknowledged it with an empty
+//! payload would fail every reconnect for the wrong reason. [`FakeControl::set_get_info_payload`]
+//! is how a test makes that proof fail on purpose.
+//!
+//! [`Link::resync`] is recorded rather than ignored, so that the §2.7 sequence can be asserted as
+//! an *ordered* whole — preamble, then the release frames, then `GET_INFO` — through
+//! [`FakeControl::calls`]. A call made to a link that has already hung up
+//! ([`FakeControl::hang_up`]) is recorded too, as [`FakeCall::Refused`] and in
+//! [`FakeControl::refused`]: no byte leaves, but the attempt is evidence, and "the writer
+//! discovered the loss without writing" is a claim that has to be able to fail.
+//!
+//! [`FakeSource`] is the same idea one level up: a scripted supply of links, which can also be
+//! made to **park inside `open`** ([`FakeSourceControl::hold_opens`]). That is not a curiosity —
+//! it is the only way to reproduce a real port that takes seconds to open, which is the window a
+//! shutdown must not be stuck behind and the window in which a trigger can land with no sequence
+//! left to run (§2.7).
+//!
 //! Every wait here is a `Condvar` rendezvous with a generous failsafe deadline. A test that
 //! reaches a deadline fails; nothing uses a sleep for synchronisation.
 
@@ -25,7 +43,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::link::{Link, LinkError, Reply};
+use crate::link::{Link, LinkError, LinkSource, Reply};
 use crate::proto::report::{KeyboardReport, MouseAbsReport, MouseRelReport};
 
 /// How long a rendezvous waits before giving up and failing the test.
@@ -38,6 +56,25 @@ pub struct RecordedFrame {
     pub cmd: u8,
     /// The raw payload, exactly as `report.payload()` produced it.
     pub payload: Vec<u8>,
+}
+
+/// One thing the writer asked of the link, in order: a frame, the §5.1 resynchronisation
+/// preamble, or a call the hung-up transport refused. The unit the §2.7 sequence is asserted in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeCall {
+    /// [`Link::resync`] — the writer asked the transport to finish any torn frame.
+    Resync,
+    /// One [`Link::transact`].
+    Frame(RecordedFrame),
+    /// A call made to a link that had already hung up ([`FakeControl::hang_up`]), refused before
+    /// any byte could have left: `Some(cmd)` for a `transact`, `None` for a `resync`.
+    ///
+    /// It is recorded rather than swallowed because "the writer never wrote to the dead link" is
+    /// the central claim of the idle-loss path, and a claim that cannot fail is not a test: a fake
+    /// that dropped these calls on the floor left `calls().len()` and `frame_count()` unchanged
+    /// whether the writer stayed silent or hammered the corpse. Count them with
+    /// [`FakeControl::refused`].
+    Refused { cmd: Option<u8> },
 }
 
 /// What the fake does with a call.
@@ -58,12 +95,31 @@ pub enum Behaviour {
 #[derive(Debug)]
 struct FakeState {
     frames: Vec<RecordedFrame>,
+    /// Frames and `resync` calls together, in order.
+    calls: Vec<FakeCall>,
     default: Behaviour,
     script: VecDeque<Behaviour>,
     /// Calls that have entered a stall, ever.
     entered: u64,
     /// Stalls the test has released, ever.
     released: u64,
+    /// What `GET_INFO` answers with. The device's own reply payload by default (Appendix), so the
+    /// §2.7 proof succeeds unless a test says otherwise.
+    get_info_payload: Vec<u8>,
+    /// Make [`Link::resync`] fail, as a port that died between `open` and the preamble would.
+    fail_resync: bool,
+    /// The transport has hung up: [`Link::is_down`] says so and every call fails without a byte
+    /// leaving, because nothing reaches a port that is gone. Set by [`FakeControl::hang_up`].
+    hung_up: bool,
+    /// Calls refused because [`FakeState::hung_up`] was set, ever. Also recorded in `calls` as
+    /// [`FakeCall::Refused`]; the counter is what an assertion reads.
+    refused: u64,
+    /// Park [`Link::resync`] the way [`Behaviour::Stall`] parks a transact, so a test can hold the
+    /// writer *inside* the §2.7 sequence at step 3a — before the step-3b drain, which is the only
+    /// window in which the queue can be made non-empty for that drain to find.
+    stall_resync: bool,
+    /// `resync` calls, ever.
+    resyncs: u64,
 }
 
 #[derive(Debug)]
@@ -94,10 +150,17 @@ pub fn fake_link() -> (FakeLink, FakeControl) {
     let shared = Arc::new(FakeShared {
         state: Mutex::new(FakeState {
             frames: Vec::new(),
+            calls: Vec::new(),
             default: Behaviour::Ack,
             script: VecDeque::new(),
             entered: 0,
             released: 0,
+            get_info_payload: crate::serial::fake::DEFAULT_GET_INFO_PAYLOAD.to_vec(),
+            fail_resync: false,
+            hung_up: false,
+            refused: 0,
+            stall_resync: false,
+            resyncs: 0,
         }),
         cv: Condvar::new(),
     });
@@ -118,6 +181,66 @@ impl FakeControl {
     /// How many frames have been handed to the link.
     pub fn frame_count(&self) -> usize {
         lock(&self.shared.state).frames.len()
+    }
+
+    /// Every frame **and** every [`Link::resync`], in the order the writer issued them.
+    pub fn calls(&self) -> Vec<FakeCall> {
+        lock(&self.shared.state).calls.clone()
+    }
+
+    /// How many times the writer asked for the §5.1 preamble.
+    pub fn resyncs(&self) -> u64 {
+        lock(&self.shared.state).resyncs
+    }
+
+    /// How many calls this link refused because it had hung up.
+    ///
+    /// **This is the assertion the idle-loss path rests on.** "The writer discovered the loss
+    /// without writing" is only a claim a test can falsify if a call to a dead link leaves a
+    /// trace: `frame_count()` and `calls().len()` alone cannot tell a writer that stayed silent
+    /// from one whose frames the fake ate. Zero here is the silence; anything else is the writer
+    /// having probed a corpse.
+    pub fn refused(&self) -> u64 {
+        lock(&self.shared.state).refused
+    }
+
+    /// The payload `GET_INFO` answers with. A payload shorter than
+    /// [`crate::proto::frame::DeviceInfo::MIN_PAYLOAD`] makes the §2.7 proof fail the way a
+    /// half-present device does.
+    pub fn set_get_info_payload(&self, payload: &[u8]) {
+        lock(&self.shared.state).get_info_payload = payload.to_vec();
+    }
+
+    /// Make [`Link::resync`] report the transport gone.
+    pub fn fail_resync(&self, fail: bool) {
+        lock(&self.shared.state).fail_resync = fail;
+    }
+
+    /// The far end goes away **without the writer touching it** — the H-A4 shape.
+    ///
+    /// This is the one failure the in-memory fake could not express before: [`Behaviour::Fail`]
+    /// needs a call to fail, so loss was only ever discoverable by writing. A real link has a read
+    /// side that notices on its own, and [`Link::is_down`] is how that verdict reaches the writer;
+    /// this knob is that verdict. Afterwards every call fails too — no byte leaves, because a
+    /// hung-up transport puts no bytes anywhere — but the *attempt* is recorded, as
+    /// [`FakeCall::Refused`] and in [`FakeControl::refused`]. That is what lets a test assert that
+    /// the writer discovered the loss **without writing**: an unrecorded refusal would make that
+    /// assertion hold whether or not the writer wrote.
+    pub fn hang_up(&self) {
+        lock(&self.shared.state).hung_up = true;
+        self.shared.cv.notify_all();
+    }
+
+    /// Park the next [`Link::resync`] until [`FakeControl::release_stalls`], counted by
+    /// [`FakeControl::wait_for_stalled`] like any other stall.
+    ///
+    /// This is the only rendezvous **inside** the §2.7 sequence and before its step-3b drain, so it
+    /// is what lets a test put something in the queue for that drain to discard. Nothing a producer
+    /// can do reaches that window — `submit` refuses while `link_down` is set, and it stays set
+    /// until step 3e — so the drain would otherwise have no test that can fail (see
+    /// [`force_enqueue_key`]).
+    pub fn stall_resync(&self, stall: bool) {
+        lock(&self.shared.state).stall_resync = stall;
     }
 
     /// The behaviour applied to calls the script does not cover.
@@ -176,10 +299,22 @@ impl FakeControl {
 impl Link for FakeLink {
     fn transact(&mut self, cmd: u8, payload: &[u8], timeout: Duration) -> Result<Reply, LinkError> {
         let mut st = lock(&self.shared.state);
-        st.frames.push(RecordedFrame {
+        if st.hung_up {
+            // No frame is recorded — the bytes would not have reached anything, and `SerialLink`
+            // does the same, refusing in `write_raw` before it writes — but the call itself is,
+            // so that "the writer never touched the dead link" is an assertion that can fail.
+            st.refused += 1;
+            st.calls.push(FakeCall::Refused { cmd: Some(cmd) });
+            drop(st);
+            self.shared.cv.notify_all();
+            return Err(LinkError::Down("fake link: hung up".into()));
+        }
+        let frame = RecordedFrame {
             cmd,
             payload: payload.to_vec(),
-        });
+        };
+        st.frames.push(frame.clone());
+        st.calls.push(FakeCall::Frame(frame));
         let mut behaviour = st.script.pop_front().unwrap_or(st.default);
         self.shared.cv.notify_all();
 
@@ -202,17 +337,67 @@ impl Link for FakeLink {
                 behaviour = Behaviour::Ack;
             }
         }
+        // Answered like the device: `GET_INFO` carries a payload, everything else acknowledges
+        // with nothing (Appendix). §2.7 step 3 parses that payload, so an empty one is a rejection.
+        let data = if cmd == crate::proto::cmd::GET_INFO {
+            st.get_info_payload.clone()
+        } else {
+            Vec::new()
+        };
         drop(st);
 
         match behaviour {
             Behaviour::Ack | Behaviour::Stall => Ok(Reply {
                 cmd: cmd | 0x80,
-                data: Vec::new(),
+                data,
             }),
             Behaviour::Fail => Err(LinkError::Down("fake link: transport down".into())),
             Behaviour::Timeout => Err(LinkError::Timeout { cmd, timeout }),
             Behaviour::DeviceError(code) => Err(LinkError::Device { cmd, code }),
         }
+    }
+
+    /// Recorded, never scripted: the preamble is bytes at a chip, not a request with a reply, and
+    /// the only interesting failure is the transport having gone in the meantime.
+    fn resync(&mut self) -> Result<(), LinkError> {
+        let mut st = lock(&self.shared.state);
+        if st.hung_up {
+            st.refused += 1;
+            st.calls.push(FakeCall::Refused { cmd: None });
+            drop(st);
+            self.shared.cv.notify_all();
+            return Err(LinkError::Down("fake link: hung up".into()));
+        }
+        st.resyncs += 1;
+        st.calls.push(FakeCall::Resync);
+        self.shared.cv.notify_all();
+        if st.stall_resync {
+            st.entered += 1;
+            let me = st.entered;
+            self.shared.cv.notify_all();
+            while st.released < me {
+                st = self
+                    .shared
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        let failed = st.fail_resync;
+        drop(st);
+        self.shared.cv.notify_all();
+        if failed {
+            return Err(LinkError::Down(
+                "fake link: transport down before resync".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// What [`FakeControl::hang_up`] set, and nothing else. The default `false` is what every
+    /// other test here relies on: a fake link is healthy until something says otherwise.
+    fn is_down(&self) -> bool {
+        lock(&self.shared.state).hung_up
     }
 }
 
@@ -326,4 +511,290 @@ pub fn wait_for_cancellations(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         q = guard;
     }
+}
+
+/// Push a key-down barrier straight into the queue at `epoch`, bypassing every gate
+/// [`crate::input::Producer::submit`] applies.
+///
+/// **Why this exists.** §2.7 step 1 — "discard the whole pending queue, never replay" — defends
+/// against a queue that is not empty when a link is commissioned. No sequence of public calls can
+/// build that state: `submit` refuses while `link_down` is set, and the writer clears `link_down`
+/// only at step 3e, after the drain. The drain is still required, because "never replay" must not
+/// rest on an argument about interleavings that a later change can invalidate — so the test for it
+/// constructs the state the drain defends against directly, rather than pretending a producer could
+/// reach it. Paired with [`FakeControl::stall_resync`], which holds the writer at step 3a.
+///
+/// `epoch` is the entry's, and the caller chooses it: `Stats::requested_epoch` read while the
+/// writer is parked at step 3a is the epoch the reconnect latched, which is the interesting one —
+/// an entry carrying it survives the writer's `entry.epoch < acked_epoch` staleness check and is
+/// therefore written unless the drain removes it.
+pub fn force_enqueue_key(
+    producer: &crate::input::Producer,
+    key: crate::proto::report::HidKey,
+    epoch: u64,
+) {
+    use crate::input::queue::EntryKind;
+
+    let shared = &producer.shared;
+    let mut q = crate::input::shared::lock(&shared.queue);
+    q.push_barrier(
+        EntryKind::Key { key, down: true },
+        epoch,
+        Instant::now(),
+        &shared.counters,
+    )
+    .expect("the test queue has room");
+    drop(q);
+    shared.wake.notify_all();
+}
+
+// ---------------------------------------------------------------- a scripted `LinkSource`
+
+/// The state behind [`FakeSource`] and [`FakeSourceControl`].
+#[derive(Debug)]
+struct SourceState {
+    /// Answers for the next `open` calls, in order: `Some(link)` yields it, `None` refuses.
+    script: VecDeque<Option<FakeLink>>,
+    /// What happens once the script runs out: refuse for ever, or keep making fresh links.
+    refuse_when_empty: bool,
+    /// When each `open` was called. The backoff assertions are made on the gaps between these.
+    attempts: Vec<Instant>,
+    /// Park inside `open` after recording the attempt, until the test releases it. This is how a
+    /// test lands something in the window between the writer's last cancellation check and the
+    /// link arriving — the window `WriterHandle::shutdown` must not be stuck behind.
+    hold: bool,
+    /// Controls for links the source made itself, once the script ran out.
+    auto: Vec<FakeControl>,
+    /// The [`FakeSource`] itself has been dropped. The rendezvous for "whoever was holding this
+    /// source has finished with it", which is how a test observes that a link opened after a
+    /// shutdown was dropped rather than used.
+    dropped: bool,
+}
+
+#[derive(Debug)]
+struct SourceShared {
+    state: Mutex<SourceState>,
+    cv: Condvar,
+}
+
+/// A [`LinkSource`] whose answers a test writes in advance (§2.7).
+///
+/// Move it into [`crate::input::spawn_with_source`]; steer it through the
+/// [`FakeSourceControl`] returned alongside.
+#[derive(Debug)]
+pub struct FakeSource {
+    shared: Arc<SourceShared>,
+}
+
+/// The test's half of a [`FakeSource`].
+#[derive(Debug, Clone)]
+pub struct FakeSourceControl {
+    shared: Arc<SourceShared>,
+}
+
+/// A scripted source and its control. The script starts empty and refusing, so a source nothing
+/// was queued on is a device that is simply not there.
+pub fn fake_source() -> (FakeSource, FakeSourceControl) {
+    let shared = Arc::new(SourceShared {
+        state: Mutex::new(SourceState {
+            script: VecDeque::new(),
+            refuse_when_empty: true,
+            attempts: Vec::new(),
+            hold: false,
+            auto: Vec::new(),
+            dropped: false,
+        }),
+        cv: Condvar::new(),
+    });
+    (
+        FakeSource {
+            shared: Arc::clone(&shared),
+        },
+        FakeSourceControl { shared },
+    )
+}
+
+impl FakeSourceControl {
+    /// Queue a fresh link, and return the control that inspects it. The link is created now, so a
+    /// test can script its behaviour before the writer ever opens it.
+    pub fn push_link(&self) -> FakeControl {
+        let (link, control) = fake_link();
+        lock(&self.shared.state).script.push_back(Some(link));
+        control
+    }
+
+    /// Queue `n` refusals — the device is not back yet.
+    pub fn push_failures(&self, n: usize) {
+        let mut st = lock(&self.shared.state);
+        for _ in 0..n {
+            st.script.push_back(None);
+        }
+    }
+
+    /// After the script runs out, keep producing fresh links instead of refusing. Their controls
+    /// arrive in [`FakeSourceControl::auto_links`].
+    pub fn yield_links_when_empty(&self) {
+        lock(&self.shared.state).refuse_when_empty = false;
+    }
+
+    /// Controls for the links the source made after its script ran out, oldest first.
+    pub fn auto_links(&self) -> Vec<FakeControl> {
+        lock(&self.shared.state).auto.clone()
+    }
+
+    /// Park every `open` from now on after it has recorded its attempt, until
+    /// [`FakeSourceControl::release_opens`].
+    ///
+    /// A real `open` is `open(2)` plus a `tcsetattr` on a device that may have just re-enumerated,
+    /// and the writer cannot interrupt it; this is how that is reproduced without hardware. Pair it
+    /// with [`FakeSourceControl::wait_for_attempts`], which is satisfied as the open is entered.
+    pub fn hold_opens(&self) {
+        lock(&self.shared.state).hold = true;
+        self.shared.cv.notify_all();
+    }
+
+    /// Let every parked `open` return, and stop parking new ones.
+    pub fn release_opens(&self) {
+        lock(&self.shared.state).hold = false;
+        self.shared.cv.notify_all();
+    }
+
+    /// Block until the [`FakeSource`] has been dropped.
+    ///
+    /// Its holder is the writer, or — while an open is in flight — the thread performing it. So
+    /// this is how a test waits for that thread to have finished with the link it opened, which is
+    /// the moment after which "it was never written to" is final rather than merely not-yet.
+    pub fn wait_for_source_dropped(&self) {
+        let deadline = Instant::now() + FAILSAFE;
+        let mut st = lock(&self.shared.state);
+        while !st.dropped {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "fake source: timed out waiting for the source to be dropped"
+            );
+            let (guard, _) = self
+                .shared
+                .cv
+                .wait_timeout(st, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st = guard;
+        }
+    }
+
+    /// How many times the writer has asked for a link.
+    pub fn attempts(&self) -> usize {
+        lock(&self.shared.state).attempts.len()
+    }
+
+    /// When each of those asks happened.
+    pub fn attempt_times(&self) -> Vec<Instant> {
+        lock(&self.shared.state).attempts.clone()
+    }
+
+    /// Block until the writer has asked for a link at least `n` times.
+    pub fn wait_for_attempts(&self, n: usize) {
+        let deadline = Instant::now() + FAILSAFE;
+        let mut st = lock(&self.shared.state);
+        while st.attempts.len() < n {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "fake source: timed out waiting for {n} open attempts, saw {}",
+                st.attempts.len()
+            );
+            let (guard, _) = self
+                .shared
+                .cv
+                .wait_timeout(st, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st = guard;
+        }
+    }
+}
+
+impl LinkSource for FakeSource {
+    fn open(&mut self) -> Result<Box<dyn Link>, LinkError> {
+        let mut st = lock(&self.shared.state);
+        st.attempts.push(Instant::now());
+        self.shared.cv.notify_all();
+        // Recorded first, then parked: `wait_for_attempts` is what tells a test the writer is
+        // inside this call, and it would be useless if it only fired on the way out.
+        while st.hold {
+            st = self
+                .shared
+                .cv
+                .wait(st)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let scripted = st.script.pop_front();
+        let answer = match scripted {
+            Some(Some(link)) => Some(link),
+            Some(None) => None,
+            None if st.refuse_when_empty => None,
+            None => {
+                let (link, control) = fake_link();
+                st.auto.push(control);
+                Some(link)
+            }
+        };
+        drop(st);
+        self.shared.cv.notify_all();
+        match answer {
+            Some(link) => Ok(Box::new(link)),
+            None => Err(LinkError::Down("fake source: no device".into())),
+        }
+    }
+
+    fn describe(&self) -> String {
+        "a scripted fake source".to_string()
+    }
+}
+
+impl Drop for FakeSource {
+    fn drop(&mut self) {
+        lock(&self.shared.state).dropped = true;
+        self.shared.cv.notify_all();
+    }
+}
+
+// ---------------------------------------------------------------- reconnect rendezvous
+
+/// Block until the writer has commissioned at least `n` **replacement** links (§2.7), i.e. until
+/// `Stats::reconnects >= n`. The initial link is not one of them.
+pub fn wait_for_reconnects(producer: &crate::input::Producer, n: u64) {
+    use std::sync::atomic::Ordering;
+
+    let shared = &producer.shared;
+    let deadline = Instant::now() + FAILSAFE;
+    let mut q = crate::input::shared::lock(&shared.queue);
+    loop {
+        if shared.counters.reconnects.load(Ordering::SeqCst) >= n {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {n} reconnects (attempts so far: {})",
+            shared.counters.reconnect_attempts.load(Ordering::SeqCst)
+        );
+        let (guard, _) = shared
+            .wake
+            .wait_timeout(q, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        q = guard;
+    }
+}
+
+/// The frames one §2.7 sequence puts on a freshly opened link, in order: the preamble, the
+/// release-all pair in `Rel` mode (a new link has no known pointer position), then the `GET_INFO`
+/// that proves the link is real.
+pub fn commission_calls() -> Vec<FakeCall> {
+    let mut calls = vec![FakeCall::Resync];
+    calls.extend(release_frames_rel().into_iter().map(FakeCall::Frame));
+    calls.push(FakeCall::Frame(RecordedFrame {
+        cmd: crate::proto::cmd::GET_INFO,
+        payload: Vec::new(),
+    }));
+    calls
 }

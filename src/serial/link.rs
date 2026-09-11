@@ -20,6 +20,26 @@ const LOCK_STATE: u8 = cmd::GET_INFO | 0x80;
 /// How long [`SerialLink::drop`] waits for the reader thread before giving up on it.
 const JOIN_BOUND: Duration = Duration::from_secs(1);
 
+/// How many zero bytes [`SerialLink::resync`] writes to finish a frame the chip may still be
+/// waiting on (§5.1, §11 "Resynchronisation after a torn write").
+///
+/// **Why sixteen, and why zeros.** A frame is `57 AB ADDR CMD LEN DATA[LEN] SUM` with `LEN <= 8`
+/// on every command this client sends, so the longest remainder any tear can leave outstanding is
+/// the ten bytes after `CMD` — `LEN`, eight payload bytes and the checksum — and every earlier
+/// tear owes fewer. Sixteen covers that with six bytes to spare and still costs only 2.8 ms of
+/// wire time at 57600 baud.
+///
+/// Zeros are chosen because `0x00` is not `0x57`, so every byte the chip does *not* need as a
+/// remainder is discarded by a parser hunting for a header rather than starting a new command.
+/// And a frame completed with zeros is almost always rejected: the checksum of the stale header
+/// plus zeros matches the zero byte that lands in `SUM` with probability 1/256, so 255 times out
+/// of 256 the chip answers `cmd | 0xC0` with `0xE4` and moves on. In the remaining case it applies
+/// an all-zero keyboard report (every key released) or an all-zero mouse report (no motion, no
+/// button) — both of which the release-all that follows in §2.7 step 2 makes moot. That is the
+/// whole safety argument, and H-A1/H-A2 in `tests/serial_reconnect_hardware.rs` check it against
+/// the real chip rather than trusting it.
+pub const RESYNC_PREAMBLE_LEN: usize = 16;
+
 /// A framed link to the CH9329 over a serial port.
 ///
 /// One [`SerialLink`] owns one port, one reader thread and one in-flight request. `transact` takes
@@ -200,6 +220,40 @@ impl SerialLink {
         })
     }
 
+    /// Write bytes straight at the port, outside the framing layer.
+    ///
+    /// The one primitive `transact` and [`SerialLink::resync`] share, so that "a failed write puts
+    /// the link down and stays down" (§5.1, A15) is stated once. `what` names the write for the
+    /// diagnostic the failure records.
+    fn write_raw(&mut self, bytes: &[u8], what: &str) -> Result<(), LinkError> {
+        if let Some(reason) = self.shared.lock().down.clone() {
+            return Err(LinkError::Down(reason));
+        }
+        if let Err(e) = self.port.write_all(bytes).and_then(|()| self.port.flush()) {
+            self.shared.mark_down(format!(
+                "write of the {}-byte {what} failed: {e}",
+                bytes.len()
+            ));
+            return Err(LinkError::Io(e));
+        }
+        self.shared
+            .counters
+            .bytes_tx
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Write arbitrary bytes at the port, for hardware tests that must reproduce a torn write.
+    ///
+    /// Not part of the supported surface: nothing in the client may write anything that is not a
+    /// whole frame (§5.1, A15), and this exists only so `tests/serial_reconnect_hardware.rs` can
+    /// manufacture the damage [`SerialLink::resync`] claims to repair. Tearing a frame on purpose
+    /// through the real transport is the only honest way to test the repair.
+    #[doc(hidden)]
+    pub fn write_raw_for_test(&mut self, bytes: &[u8]) -> Result<(), LinkError> {
+        self.write_raw(bytes, "deliberate raw test write")
+    }
+
     /// Hold the writer back until the link has gone quiet after a [`LinkError::Timeout`] — the
     /// resynchronisation window (§3.1, [`OpenOptions::quiet_after_timeout`]).
     ///
@@ -329,18 +383,10 @@ impl Link for SerialLink {
         // One `write_all` for the whole frame, then a flush. Anything less than the whole frame on
         // the wire costs the *following* command too (§5.1, A15), so a failure here is not a
         // retryable hiccup: the chip's parser may now be mid-frame and the link is not trusted.
-        if let Err(e) = self.port.write_all(&frame).and_then(|()| self.port.flush()) {
+        if let Err(e) = self.write_raw(&frame, &format!("frame for command {cmd:#04x}")) {
             self.shared.lock().inflight = None;
-            self.shared.mark_down(format!(
-                "write of the {}-byte frame for command {cmd:#04x} failed: {e}",
-                frame.len()
-            ));
-            return Err(LinkError::Io(e));
+            return Err(e);
         }
-        self.shared
-            .counters
-            .bytes_tx
-            .fetch_add(frame.len() as u64, Ordering::Relaxed);
 
         let deadline = Instant::now() + timeout;
         let mut inner = self.shared.lock();
@@ -402,6 +448,47 @@ impl Link for SerialLink {
             inner = guard;
         }
     }
+
+    /// Write [`RESYNC_PREAMBLE_LEN`] zero bytes in one `write_all` (§5.1, §2.7 step 3a).
+    ///
+    /// One write, not sixteen: the same A15 rule applies to the preamble as to a frame, since a
+    /// preamble that is itself torn leaves the parser exactly where it was found. The size and
+    /// safety argument is on [`RESYNC_PREAMBLE_LEN`]; the bytes are counted in
+    /// [`SerialStats::bytes_tx`] like any other write, and each call in
+    /// [`SerialStats::resyncs_sent`].
+    fn resync(&mut self) -> Result<(), LinkError> {
+        self.write_raw(&[0u8; RESYNC_PREAMBLE_LEN], "resynchronisation preamble")?;
+        self.shared
+            .counters
+            .resyncs_sent
+            .fetch_add(1, Ordering::Relaxed);
+        log::debug!(
+            "wrote a {RESYNC_PREAMBLE_LEN}-byte zero preamble on {}",
+            self.path.display()
+        );
+        Ok(())
+    }
+
+    /// The reader thread's verdict, handed to the writer without writing anything.
+    ///
+    /// The read half is where a hang-up is noticed first — `serialport` polls before it reads and
+    /// reports `POLLHUP` as `BrokenPipe`, so [`reader::run`] marks the link down within one read
+    /// timeout of the device going away — and until this existed that verdict stopped here.
+    ///
+    /// **A reader thread that has ended is itself link loss**, whether or not it recorded a
+    /// reason. It is the only thing that can route a reply (`reader::route`), so once it has gone
+    /// nothing on this link will ever be answered again: every later `transact` would burn its
+    /// whole timeout and be classified `Timeout` — degraded, not down — so input would stop
+    /// working while the client went on reporting the link up, which is the shape C10 exists to
+    /// forbid. C10 itself is untouched by this: its late-reply slot is a property of a *running*
+    /// reader, and `reader_finished` is false for every moment C10 describes.
+    ///
+    /// The inherent [`SerialLink::is_down`] still answers from the reason alone, because it exists
+    /// to say *why* and a reader that simply stopped has no why to give.
+    fn is_down(&self) -> bool {
+        let inner = self.shared.lock();
+        inner.down.is_some() || inner.reader_finished
+    }
 }
 
 impl Drop for SerialLink {
@@ -416,5 +503,46 @@ impl std::fmt::Debug for SerialLink {
             .field("path", &self.path)
             .field("down", &self.is_down())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serial::fake::{Behaviour, FakeCh9329};
+
+    /// **A reader thread that has gone is link loss, reason or no reason.**
+    ///
+    /// The reader is the only thing that routes a reply (`reader::route`), so once it has left,
+    /// nothing on this link will ever be answered again. If `Link::is_down` answered from the
+    /// `down` reason alone, a reader that ended without recording one — a panic in the parser or
+    /// the matcher — would leave the writer reporting a healthy link on which every later
+    /// `transact` burns its whole timeout and is classified `Timeout`, i.e. *degraded*, never
+    /// *down*: input stops working while the client says the cable is fine. C10's late-reply slot
+    /// is untouched, because that is a property of a reader still in its loop.
+    ///
+    /// The reader is stood down here by setting the flag its `Drop` guard sets, which is what a
+    /// thread that unwound out of the loop leaves behind. No hardware: the far end is a pty.
+    #[test]
+    fn a_finished_reader_thread_is_link_loss_even_with_no_reason_recorded() {
+        let fake = FakeCh9329::spawn(Behaviour::default()).expect("open a pty pair");
+        let link = SerialLink::open(&fake.slave_path()).expect("open the slave end");
+        assert!(!Link::is_down(&link), "a fresh link over a live pty is up");
+
+        // What a reader that ended without a verdict leaves: the guard's flag, and no reason.
+        let mut inner = link.shared.lock();
+        inner.reader_finished = true;
+        drop(inner);
+
+        assert!(
+            link.is_down().is_none(),
+            "the inherent accessor exists to say *why*, and a reader that simply stopped has no \
+             why to give"
+        );
+        assert!(
+            Link::is_down(&link),
+            "but the writer's question is 'can this link still answer me', and it cannot"
+        );
+        fake.stop();
     }
 }

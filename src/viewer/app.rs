@@ -24,16 +24,16 @@ use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use crate::capture::{PipelineHandle, PipelineState};
+use crate::capture::{PipelineHandle, PipelineStats};
 use crate::input::{Producer, ReleaseOutcome, Stats};
 use crate::viewer::input_map::{self, KeyAction, RelAccumulator, WheelAccumulator};
 use crate::viewer::render::{self, Gpu, RenderShared, RenderStats};
-use crate::viewer::state::{reduce, self_release_trigger, Action, CaptureState, Session, Trigger};
+use crate::viewer::state::{
+    reduce, self_release_trigger, Action, CaptureState, ReleaseNotice, Session, Trigger,
+};
+use crate::viewer::title::{self, TitleFacts, APP_TITLE};
 use crate::viewer::wayland::{InhibitEvent, ShortcutInhibit};
-use crate::viewer::RELEASE_KEY;
 
-/// The window title's fixed part.
-const APP_TITLE: &str = "NanoKVM-USB";
 /// Wayland application id, so the compositor can match window rules to this client.
 const APP_ID: &str = "nanokvm-usb";
 
@@ -44,9 +44,6 @@ const TICK: Duration = Duration::from_millis(250);
 const ENGAGING_TICK: Duration = Duration::from_millis(10);
 /// Event-handling latency samples kept for the stats line.
 const LATENCY_SAMPLES: usize = 4096;
-/// How long frames must be absent before the title says so (§6.1 S1-2). Matches the pipeline's
-/// own stall threshold.
-const STALL_NOTICE: Duration = Duration::from_millis(500);
 /// How long teardown waits for the render thread before detaching it. Two `FRAME_WAIT` periods
 /// plus room for one `present()`: enough for a renderer that is merely busy, and far short of the
 /// unbounded wait a surface nobody is compositing produces (§5.4, measured at `present p50 999 ms`
@@ -167,10 +164,12 @@ struct App<'a> {
     last_captured: u64,
     latency_us: VecDeque<u64>,
     unmapped_keys: u64,
-    /// The epoch of the last release whose outcome has already been reported, so an `Unsent`
-    /// notice is raised once per release rather than every tick (§2.6.1).
-    reported_release_epoch: Option<u64>,
-    release_notice: bool,
+    /// The §2.6.1 release-outcome notice, including the bookkeeping that reports each release
+    /// once rather than every tick.
+    release_notice: ReleaseNotice,
+    /// `Stats::reconnects` as of the last tick, so a completed §2.7 reconnect is logged once,
+    /// with the device info the new link reported.
+    last_reconnects: u64,
     title: String,
     fatal: Option<anyhow::Error>,
 }
@@ -209,8 +208,8 @@ impl<'a> App<'a> {
             last_captured: 0,
             latency_us: VecDeque::with_capacity(LATENCY_SAMPLES),
             unmapped_keys: 0,
-            reported_release_epoch: None,
-            release_notice: false,
+            release_notice: ReleaseNotice::default(),
+            last_reconnects: 0,
             title: String::new(),
             fatal: None,
         }
@@ -458,93 +457,131 @@ impl<'a> App<'a> {
                 self.feed(el, trigger);
             }
         }
+        // One pipeline snapshot per tick, shared by the title and the stats line: the two must
+        // not disagree about what the capture path is doing, and sampling twice is how they
+        // would.
+        let capture = self.pipeline.stats();
         self.check_release_outcome(&stats);
-        self.update_title(&stats);
+        self.report_reconnect(&stats);
+        self.update_title(&stats, &capture);
         if let Some(interval) = self.config.stats_interval {
             if self.last_stats.elapsed() >= interval {
-                self.log_stats(&stats);
+                self.log_stats(&stats, &capture);
             }
+        }
+    }
+
+    /// §2.7: say when the link came back, and what answered.
+    ///
+    /// One line per completed reconnect, at `info`, carrying the **new** link's `GET_INFO` —
+    /// which is re-queried on every commissioning precisely so that "the same device came back"
+    /// is a checked claim rather than an assumption. A user watching the log after a replug gets
+    /// the firmware version and the target's connected state from the device now in the socket.
+    fn report_reconnect(&mut self, stats: &Stats) {
+        if stats.reconnects <= self.last_reconnects {
+            return;
+        }
+        self.last_reconnects = stats.reconnects;
+        match stats.device_info {
+            Some(info) => log::info!(
+                "serial link back after {} reconnect(s), {} attempt(s): CH9329 firmware {:.1}, \
+                 target {}, locks: num={} caps={} scroll={}. Input stays released until you \
+                 capture again.",
+                stats.reconnects,
+                stats.reconnect_attempts,
+                info.version,
+                if info.target_connected {
+                    "connected"
+                } else {
+                    "NOT connected"
+                },
+                info.num_lock,
+                info.caps_lock,
+                info.scroll_lock
+            ),
+            // The writer clears `link_down` only once `GET_INFO` has answered, so this is a
+            // race with the snapshot rather than a device that said nothing.
+            None => log::info!(
+                "serial link back after {} reconnect(s), {} attempt(s)",
+                stats.reconnects,
+                stats.reconnect_attempts
+            ),
         }
     }
 
     /// §2.6.1: an `Unsent` release means the target may still be holding keys. Say so rather than
     /// hiding it behind cleared local state.
     fn check_release_outcome(&mut self, stats: &Stats) {
-        let Some(record) = stats.last_release else {
-            return;
-        };
-        if self.reported_release_epoch == Some(record.epoch) {
-            return;
-        }
-        self.reported_release_epoch = Some(record.epoch);
-        match record.outcome {
-            ReleaseOutcome::Unsent => {
-                log::warn!(
+        let was_raised = self.release_notice.raised();
+        if let Some(record) = self.release_notice.observe(stats.last_release) {
+            match record.outcome {
+                ReleaseOutcome::Unsent => log::warn!(
                     "release-all for epoch {} ({:?}) was UNSENT: the target may still be holding \
                      keys",
                     record.epoch,
                     record.reason
-                );
-                self.release_notice = true;
-                self.title.clear();
-            }
-            ReleaseOutcome::Submitted => {
-                log::debug!(
+                ),
+                // Including the one a §2.7 reconnect sends on the replacement link, which is what
+                // retires an earlier `Unsent` — see `ReleaseNotice`.
+                ReleaseOutcome::Submitted => log::debug!(
                     "release-all for epoch {} ({:?}) submitted",
                     record.epoch,
                     record.reason
-                );
-                if self.release_notice {
-                    self.release_notice = false;
-                    self.title.clear();
-                }
+                ),
             }
+        }
+        if self.release_notice.raised() != was_raised {
+            self.title.clear();
         }
     }
 
-    fn update_title(&mut self, stats: &Stats) {
-        let mut title = format!(
-            "{APP_TITLE} — {} — {}",
-            self.present_mode,
-            self.session.capture().title_fragment(RELEASE_KEY)
-        );
-        // §6.1 S1-2: the tool says frames stopped arriving. It does not say the signal is gone —
-        // this hardware cannot report that, and pixel content is never evidence of it (A5).
-        match self.pipeline.state() {
-            PipelineState::Disconnected => title.push_str(" — capture device disconnected"),
-            PipelineState::Stopped => title.push_str(" — capture stopped"),
-            _ => {
-                if let Some(since) = self.pipeline.frames_stalled_for() {
-                    if since >= STALL_NOTICE {
-                        title.push_str(&format!(" — frames stopped {}s ago", since.as_secs()));
-                    }
-                } else {
-                    title.push_str(" — waiting for the first frame");
-                }
-            }
-        }
-        if stats.link_down {
-            title.push_str(" — serial DOWN");
-        }
-        if self.release_notice {
-            title.push_str(" — release UNSENT — target may still hold keys");
-        }
+    /// Measure the facts and hand them to [`title::compose`], which owns the wording.
+    ///
+    /// Setting the title is a Wayland round trip, so it is done only when the text actually
+    /// changed — which is also why the elapsed seconds are rendered at whole-second granularity:
+    /// at 4 Hz ticks that is one call per second while something is wrong, and none at all while
+    /// everything is fine.
+    fn update_title(&mut self, stats: &Stats, capture: &PipelineStats) {
+        let title = title::compose(&TitleFacts {
+            present_mode: self.present_mode,
+            session: self.session,
+            pipeline: capture.state,
+            disconnected_for: capture.disconnected_since.map(|t| t.elapsed()),
+            frames_stalled_for: self.pipeline.frames_stalled_for(),
+            link_down: stats.link_down,
+            link_down_for: stats.down_since.map(|t| t.elapsed()),
+            reconnect_attempts: stats.reconnect_attempts,
+            release_unsent: self.release_notice.raised(),
+            format_mismatch_accepted: capture.format_mismatch_accepted > 0,
+            video_size: capture.last_resolution,
+            negotiated_size: capture.negotiated_dimensions,
+        });
         if title != self.title {
             if let Some(w) = self.window.as_ref() {
                 w.set_title(&title);
             }
+            // The title is the §2.8 surface for outages; logging each change is what lets a
+            // recovery run be checked from the log instead of from someone watching the bar.
+            log::info!("title: {title}");
             self.title = title;
         }
     }
 
-    /// The Stage 1 exit measurement for §5.4.
+    /// The Stage 1 exit measurement for §5.4, and Stage 2's recovery counters beside it.
     ///
     /// "Input latency must not correlate with render timing" is a behavioural claim, and this is
     /// the number that supports it: the event loop's own handling latency printed **next to** the
     /// render thread's present time. The render thread sits inside `present()` for a whole
     /// refresh period; if that were on the event loop, the handling figures would be milliseconds
     /// rather than microseconds.
-    fn log_stats(&mut self, input: &Stats) {
+    ///
+    /// **Two lines, one per subsystem.** Stage 1's single line had grown past 400 characters,
+    /// which is past the point where a terminal wraps it and the eye stops finding anything in
+    /// it; Stage 2 adds the §2.7 and §6.1 recovery counters, which have to be visible without a
+    /// replug to read them by. The split is capture-and-display against input, because that is
+    /// the seam a reader is diagnosing across: "video is bad but input is fine" is one line's
+    /// worth of evidence and not the other's.
+    fn log_stats(&mut self, input: &Stats, p: &PipelineStats) {
         let elapsed = self
             .last_stats
             .elapsed()
@@ -552,7 +589,6 @@ impl<'a> App<'a> {
             .max(f64::MIN_POSITIVE);
         self.last_stats = Instant::now();
 
-        let p = self.pipeline.stats();
         let captured = p.frames_captured;
         let fps = (captured.saturating_sub(self.last_captured)) as f64 / elapsed;
         self.last_captured = captured;
@@ -577,25 +613,45 @@ impl<'a> App<'a> {
         };
         let ms = |us: u64| us as f64 / 1000.0;
 
+        let resolution = match p.last_resolution {
+            Some((w, h)) => format!("{w}x{h}"),
+            None => "none yet".to_string(),
+        };
         log::info!(
-            "stats: capture {fps:.1} fps (dropped pre-decode {} post-decode {}, decode errors {}, \
-             capture errors {}) | capture-to-submit age p50 {:.1} ms max {:.1} ms | present p50 \
-             {:.1} ms max {:.1} ms ({presented} presented, {surface_recoveries} surface \
-             recoveries) | event-loop handling p50 {} µs p99 {} µs max {} µs ({} samples) | input \
-             queue {}/{} max-in-queue {:.1} ms | reports kb {} abs {} rel {} | coalesced abs {} \
-             rel {} wheel {} | cancellations {} overflows {} unmapped keys {}",
+            "stats capture: {fps:.1} fps, dropped pre/post {}/{}, decode errors {}, capture \
+             errors {} | reopens {} in {} attempts, stream restarts {}, format restarts {} \
+             ({} reopens, accepted {}), {} resolution changes (now {resolution}) | \
+             capture-to-submit age \
+             p50 {:.1} max {:.1} ms | present p50 {:.1} max {:.1} ms ({presented} presented, \
+             {surface_recoveries} recoveries)",
             p.dropped_pre_decode,
             p.dropped_post_decode,
             p.decode_errors,
             p.capture_errors,
+            p.reopens,
+            p.reopen_attempts,
+            p.stream_restarts,
+            p.format_mismatch_restarts,
+            p.format_mismatch_reopens,
+            p.format_mismatch_accepted,
+            p.resolution_changes,
             ms(age_p50_us),
             ms(age_max_us),
             ms(present_p50_us),
             ms(present_max_us),
-            pick(&lat, 0.50),
-            pick(&lat, 0.99),
-            lat.last().copied().unwrap_or(0),
-            lat.len(),
+        );
+
+        // "down N ms" only while it means something: on a healthy link there is no outage to
+        // time, and a permanent `down 0 ms` would train the reader to ignore the field.
+        let down = match input.down_since {
+            Some(since) => format!(", down {} ms", since.elapsed().as_millis()),
+            None => String::new(),
+        };
+        log::info!(
+            "stats input: queue {}/{} max-in-queue {:.1} ms | reports kb {} abs {} rel {} | \
+             coalesced abs {} rel {} wheel {} | cancellations {} overflows {} unmapped keys {} | \
+             serial reconnects {} in {} attempts{down} | event-loop handling p50 {} p99 {} max \
+             {} µs ({} samples)",
             input.queue_depth,
             input.max_queue_depth,
             input.max_time_in_queue.as_secs_f64() * 1000.0,
@@ -608,6 +664,12 @@ impl<'a> App<'a> {
             input.cancellations,
             input.overflows,
             self.unmapped_keys,
+            input.reconnects,
+            input.reconnect_attempts,
+            pick(&lat, 0.50),
+            pick(&lat, 0.99),
+            lat.last().copied().unwrap_or(0),
+            lat.len(),
         );
     }
 }

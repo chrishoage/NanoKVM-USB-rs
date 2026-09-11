@@ -37,6 +37,8 @@
 //! - [`input_map`] — pure winit-event to [`crate::input::Event`] translation. No I/O, unit tested.
 //! - [`state`]     — the capture state machine as a pure `reduce`, so §2.6's trigger list is
 //!   testable without a display.
+//! - [`title`]     — the window title as a pure function of what is true, so §6.1's and §2.8's
+//!   wording is asserted rather than eyeballed.
 //! - [`render`]    — the render thread, the wgpu surface, and the letterbox geometry.
 //! - [`wayland`]   — `zwp_keyboard_shortcuts_inhibit_v1` on a second event queue (§1.5).
 //! - [`app`]       — the winit `ApplicationHandler` that wires them together.
@@ -45,6 +47,7 @@ pub mod app;
 pub mod input_map;
 pub mod render;
 pub mod state;
+pub mod title;
 pub mod wayland;
 
 pub use app::{run, PointerMode, ViewerConfig};

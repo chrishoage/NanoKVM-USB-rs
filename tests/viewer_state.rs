@@ -11,13 +11,13 @@
 //! The end-to-end half, where the actions are performed against a real writer thread, is
 //! `viewer_capture_session.rs`.
 
-use nanokvm::input::{Event, ReleaseReason, SubmitError};
+use nanokvm::input::{Event, ReleaseOutcome, ReleaseReason, ReleaseRecord, SubmitError};
 use nanokvm::proto::report::{button, ABS_MAX};
 use nanokvm::proto::HidKey;
 use nanokvm::viewer::input_map::{self, KeyAction};
 use nanokvm::viewer::render::{letterbox, Rect};
 use nanokvm::viewer::state::{
-    reduce, self_release_trigger, Action, CaptureState, Session, Trigger,
+    reduce, self_release_trigger, Action, CaptureState, Notice, ReleaseNotice, Session, Trigger,
 };
 
 fn enter() -> HidKey {
@@ -752,4 +752,189 @@ fn h6_only_keycode_pause_releases() {
             "{c:?} is not forwarded, so it is a second escape nobody documented"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// S2-notices — §2.8 says an overflow must be surfaced, "not a silent counter". Stage 1 released
+// the session, logged a warning and put the title back to `[click or Enter to capture]`, which is
+// what the title says when the *user* pressed Pause: the two failures a user cannot predict were
+// indistinguishable from the one they asked for. The reason now lives in the session, so it is on
+// screen until input is actually flowing again.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn s2_a_refused_submission_leaves_a_notice_saying_why_input_stopped() {
+    for (error, notice, fragment) in [
+        (
+            SubmitError::Overflow,
+            Notice::Overflow,
+            "input interrupted: queue overflowed — click to re-capture",
+        ),
+        (
+            SubmitError::LinkDown,
+            Notice::LinkDown,
+            "input stopped: serial link down",
+        ),
+    ] {
+        let mut t = Target::new();
+        t.feed(left(true));
+        t.engage_succeeds();
+        assert_eq!(
+            t.session.notice(),
+            None,
+            "a healthy session explains nothing"
+        );
+
+        t.feed(Trigger::SubmitFailed(error));
+        assert_eq!(t.session.capture(), CaptureState::Released);
+        assert_eq!(
+            t.session.notice(),
+            Some(notice),
+            "{error:?} must leave a notice"
+        );
+        // The wording is part of the contract: it names the cause *and* the way out.
+        assert_eq!(
+            t.session.notice().expect("just asserted").title_fragment(),
+            fragment
+        );
+    }
+}
+
+#[test]
+fn s2_a_deliberate_release_explains_nothing_because_the_user_asked_for_it() {
+    for trigger in [
+        Trigger::ReleaseKey,
+        Trigger::FocusLost,
+        Trigger::InhibitorInactive,
+        Trigger::SubmitFailed(SubmitError::Disengaged),
+        Trigger::SubmitFailed(SubmitError::ShuttingDown),
+    ] {
+        let mut t = Target::new();
+        t.feed(left(true));
+        t.engage_succeeds();
+        t.feed(trigger);
+        assert_eq!(
+            t.session.notice(),
+            None,
+            "{trigger:?} is not a failure the user needs telling about"
+        );
+    }
+}
+
+#[test]
+fn s2_the_notice_survives_until_input_is_actually_flowing_again() {
+    let mut t = Target::new();
+    t.feed(left(true));
+    t.engage_succeeds();
+    t.feed(Trigger::SubmitFailed(SubmitError::Overflow));
+    assert_eq!(t.session.notice(), Some(Notice::Overflow));
+
+    // Every tick between the failure and the recapture keeps saying why.
+    for _ in 0..10 {
+        t.feed(Trigger::Retry);
+        assert_eq!(t.session.notice(), Some(Notice::Overflow));
+    }
+
+    // The click that re-captures is not enough: the writer has not acknowledged yet, so nothing
+    // is flowing and the explanation still stands.
+    t.feed(left(true));
+    assert_eq!(t.session.capture(), CaptureState::Engaging);
+    assert_eq!(
+        t.session.notice(),
+        Some(Notice::Overflow),
+        "engaging is not engaged"
+    );
+
+    t.feed(Trigger::EngageSucceeded);
+    assert_eq!(t.session.capture(), CaptureState::Captured);
+    assert_eq!(
+        t.session.notice(),
+        None,
+        "a successful engagement is what clears it"
+    );
+}
+
+#[test]
+fn s2_a_second_failure_replaces_the_notice_rather_than_stacking_on_it() {
+    let mut t = Target::new();
+    t.feed(left(true));
+    t.engage_succeeds();
+    t.feed(Trigger::SubmitFailed(SubmitError::Overflow));
+    t.feed(left(true));
+    t.feed(Trigger::EngageSucceeded);
+    t.feed(Trigger::SubmitFailed(SubmitError::LinkDown));
+    assert_eq!(
+        t.session.notice(),
+        Some(Notice::LinkDown),
+        "the title must describe the failure that just happened"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// S2-release-notice — §2.6.1: an `Unsent` release means the target may still be holding keys.
+// Across a §2.7 reconnect the writer sends a release-all on the replacement link, and *that* is
+// what makes the warning obsolete. Nothing else may clear it.
+// ---------------------------------------------------------------------------------------------
+
+fn record(epoch: u64, reason: ReleaseReason, outcome: ReleaseOutcome) -> ReleaseRecord {
+    ReleaseRecord {
+        epoch,
+        reason,
+        outcome,
+    }
+}
+
+#[test]
+fn s2_an_unsent_release_is_reported_once_and_stays_on_screen() {
+    let mut notice = ReleaseNotice::default();
+    assert_eq!(notice.observe(None), None, "nothing has been released yet");
+    assert!(!notice.raised());
+
+    let unsent = record(4, ReleaseReason::LinkDown, ReleaseOutcome::Unsent);
+    assert_eq!(notice.observe(Some(unsent)), Some(unsent), "logged once");
+    assert!(notice.raised());
+
+    // The tick runs four times a second; the warning must not be logged four times a second.
+    for _ in 0..10 {
+        assert_eq!(notice.observe(Some(unsent)), None, "already reported");
+        assert!(notice.raised(), "and still true");
+    }
+}
+
+#[test]
+fn s2_the_reconnects_release_clears_an_unsent_notice() {
+    let mut notice = ReleaseNotice::default();
+    notice.observe(Some(record(
+        4,
+        ReleaseReason::LinkDown,
+        ReleaseOutcome::Unsent,
+    )));
+    assert!(notice.raised());
+
+    // §2.7 step 3: the writer commissions the replacement link and releases everything on it.
+    // The keys really are up now, so the warning must go — this is the whole reason the notice
+    // is driven from `last_release` rather than latched when the link went down.
+    let reconnected = record(5, ReleaseReason::Reconnected, ReleaseOutcome::Submitted);
+    assert_eq!(notice.observe(Some(reconnected)), Some(reconnected));
+    assert!(
+        !notice.raised(),
+        "a release that reached the replacement link retires the UNSENT warning"
+    );
+}
+
+#[test]
+fn s2_a_later_unsent_release_raises_the_notice_again() {
+    let mut notice = ReleaseNotice::default();
+    notice.observe(Some(record(
+        1,
+        ReleaseReason::FocusLost,
+        ReleaseOutcome::Submitted,
+    )));
+    assert!(!notice.raised());
+    notice.observe(Some(record(
+        2,
+        ReleaseReason::Shutdown,
+        ReleaseOutcome::Unsent,
+    )));
+    assert!(notice.raised(), "each release is judged on its own outcome");
 }

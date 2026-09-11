@@ -17,8 +17,9 @@
 //!   gets a [`crate::link::LinkError::Timeout`] instead of a hang.
 //!
 //! Layout: `port` opens the port and nothing else, `reader` owns the reader thread and the
-//! matcher, [`SerialLink`] joins them. The split is deliberate — Stage 2's reconnect (§2.7) needs
-//! to re-run the open without touching the matcher (§12, Stage 2).
+//! matcher, [`SerialLink`] joins them, and `source` re-runs the open on demand for Stage 2's
+//! reconnect (§2.7, §12). The split is what makes that reopen cost nothing: the matcher was never
+//! entangled with opening in the first place.
 //!
 //! [`fake`] is a scripted CH9329 on a pty (§9.3) so the tests exercise this module unmodified.
 
@@ -27,10 +28,12 @@ pub mod fake;
 mod link;
 mod port;
 mod reader;
+mod source;
 
-pub use link::SerialLink;
+pub use link::{SerialLink, RESYNC_PREAMBLE_LEN};
 pub use port::OpenOptions;
 pub use reader::SerialStats;
+pub use source::SerialLinkSource;
 
 /// Free-function form of [`SerialLink::lock_state_from`], for callers that hold only a `Reply`.
 pub fn lock_state_from(reply: &crate::link::Reply) -> Option<crate::proto::DeviceInfo> {

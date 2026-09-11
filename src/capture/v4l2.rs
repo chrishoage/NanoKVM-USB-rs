@@ -74,7 +74,9 @@ use v4l::prelude::*;
 use v4l::video::Capture;
 use v4l::{Format, FourCC};
 
-use super::{jpeg, CaptureError, CompressedFrame, FrameSource, MAX_HEIGHT, MAX_WIDTH};
+use super::{
+    jpeg, CaptureError, CompressedFrame, FrameSource, SourceOpener, MAX_HEIGHT, MAX_WIDTH,
+};
 
 /// The pixel format. §6/A1: the device advertises exactly one, and there is no uncompressed
 /// path at any resolution.
@@ -288,6 +290,37 @@ impl V4l2Source {
     /// from — A6 says only the JPEG header of each frame is trustworthy — it is here for logs.
     pub fn negotiated_format(&self) -> Format {
         self.format
+    }
+
+    /// `G_FMT` **now**, on the live fd, rather than the copy taken at open time.
+    ///
+    /// This exists to answer §11 q13 ("does a target resolution change alter the negotiated UVC
+    /// format, or does the device rescale internally?"). **Answered on 2026-09-11: it does not.**
+    /// Through a 720p window on the target, `G_FMT` and the SOF dimensions both stayed
+    /// `MJPG 1920x1080` — the device rescales internally (`docs/STAGE2_FINDINGS.md` §6 item 3).
+    /// The call stays, because that answer is one unit on one link and is worth re-checking.
+    /// A6 forbids taking frame dimensions from
+    /// `G_FMT`, and that stands — this is not a source of dimensions, it is a *measurement of
+    /// the driver's own opinion*, to be logged next to the SOF dimensions so the two can be seen
+    /// to agree or disagree. `examples/capture-probe.rs` is the instrument that does it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the ioctl reports, classified by [`map_io`]: [`CaptureError::Disconnected`] once
+    /// the node is gone.
+    pub fn query_negotiated_format(&self) -> Result<Format, CaptureError> {
+        self.dev.format().map_err(map_io)
+    }
+
+    /// `G_PARM`'s current frame interval as `(numerator, denominator)`, read now.
+    ///
+    /// The companion to [`V4l2Source::query_negotiated_format`] for the same q13 measurement:
+    /// A7 says the driver keeps its own rate unless `S_PARM` is called, so a rate that has
+    /// changed underneath us is worth seeing rather than assuming. Measured over a target reboot
+    /// and a target mode change, it never moved off `1/60`.
+    pub fn query_frame_interval(&self) -> Result<(u32, u32), CaptureError> {
+        let p = self.dev.params().map_err(map_io)?;
+        Ok((p.interval.numerator, p.interval.denominator))
     }
 
     /// Buffer flags from the most recent frame. Stage 0 verified every buffer reports
@@ -669,6 +702,39 @@ impl FrameSource for V4l2Source {
         })
     }
 
+    /// Stop and restart streaming on the same fd: the B2 rebuild, on demand (§6.1 "attempt
+    /// restart").
+    ///
+    /// Identical to the rebuild a failed dequeue schedules — `STREAMOFF` (via the old stream's
+    /// `Drop`), a fresh arena, re-prime, `STREAMON` — and counted in the same
+    /// [`V4l2Source::stream_rebuilds`]. The pipeline calls this when no frame has arrived for
+    /// `PipelineConfig::restart_after` and there is no error to explain it: vb2 can be sitting
+    /// on a queue that will never complete another buffer, and only `STREAMOFF` clears that.
+    ///
+    /// **This can panic** for the reason in module docs item 4: dropping the old stream runs the
+    /// crate's destructors on the calling thread. The capture thread's `catch_unwind` is what
+    /// makes that survivable.
+    fn restart(&mut self) -> Result<(), CaptureError> {
+        self.stream_broken = true;
+        self.rebuild_stream()
+    }
+
+    /// The mode `S_FMT` committed to at open time (§6: never accept a different mode silently).
+    ///
+    /// Deliberately the stored copy rather than a fresh `G_FMT`: this is on the frame path, and
+    /// the live `G_FMT` is the *driver's* opinion, which the 2026-09-11 measurement showed can
+    /// keep saying 1920x1080 while the device streams 640x480. What the pipeline's watchdog
+    /// needs is what was asked for and acknowledged, which is exactly this.
+    ///
+    /// **Constant for the life of this source.** `self.format` is set once, by the `S_FMT` in
+    /// [`V4l2Source::open`], and nothing else writes it: [`FrameSource::restart`] is
+    /// `REQBUFS`/`QBUF`/`STREAMON` on the same fd with no `S_FMT` and no `S_PARM`, so a restart
+    /// cannot renegotiate anything. The only way this value changes is a new `open()`, which is
+    /// why the pipeline re-reads it on a reopen and nowhere else.
+    fn negotiated_dimensions(&self) -> Option<(u32, u32)> {
+        Some((self.format.width, self.format.height))
+    }
+
     fn describe(&self) -> String {
         format!(
             "V4L2 {} {} {}x{} @{} fps, {} mmap buffers",
@@ -680,6 +746,98 @@ impl FrameSource for V4l2Source {
             self.buffers
         )
     }
+}
+
+/// Opens [`V4l2Source`] on a fixed node, again and again (§6.1: "attempt rediscovery").
+///
+/// This is the path-based opener, and deliberately the dumb one: it knows a node, a mode and a
+/// rate, and it re-runs exactly the negotiation [`V4l2Source::open`] performs. It does **not**
+/// search for the device — §8's pairing rules are `discovery`'s job, and an opener that guessed
+/// at a different node after a replug would be the "guessing" §8 forbids. A discovery-backed
+/// opener wraps this one rather than replacing it.
+///
+/// Every failure mode of a device that is on its way back is reported rather than retried here:
+/// the pipeline owns the backoff, so `open` returning `ENOENT`/`ENODEV`/`EBUSY` is the normal
+/// answer while the driver probes, not an error worth special-casing.
+pub struct V4l2Opener {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    fps: u32,
+    timeout: Option<Duration>,
+}
+
+impl V4l2Opener {
+    /// An opener for `path` at `width`x`height`@`fps`, the same arguments
+    /// [`V4l2Source::open`] takes.
+    pub fn new(path: impl Into<PathBuf>, width: u32, height: u32, fps: u32) -> Self {
+        V4l2Opener {
+            path: path.into(),
+            width,
+            height,
+            fps,
+            timeout: None,
+        }
+    }
+
+    /// Apply [`V4l2Source::set_timeout`] to every source this opener produces. Without it each
+    /// new source starts at [`DEFAULT_TIMEOUT`], which is what production wants and what a test
+    /// that needs a shorter stall does not.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = Some(timeout);
+    }
+
+    /// The node this opener will keep trying.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl SourceOpener for V4l2Opener {
+    fn open(&mut self) -> Result<Box<dyn FrameSource>, CaptureError> {
+        let mut source = V4l2Source::open(&self.path, self.width, self.height, self.fps)?;
+        if let Some(t) = self.timeout {
+            source.set_timeout(t);
+        }
+        Ok(Box::new(source))
+    }
+
+    /// Describes the *intent*, because this has to read sensibly with no device present — which
+    /// is exactly when the pipeline is logging it.
+    fn describe(&self) -> String {
+        format!(
+            "V4L2 {} MJPG {}x{} @{} fps",
+            self.path.display(),
+            self.width,
+            self.height,
+            self.fps
+        )
+    }
+}
+
+/// `G_FMT` and `G_PARM` on a **second, non-streaming** handle to `path`.
+///
+/// The q13 instrument (`examples/capture-probe.rs`) has to report the negotiated format once a
+/// second while the pipeline owns the streaming fd behind a `Box<dyn FrameSource>`, and while
+/// that fd may be in the middle of being reopened. V4L2 allows many opens of a node and only
+/// one streaming owner; both ioctls here are read-only, so this observes the driver without
+/// touching the capture. The handle is opened and closed per call, so a probe that is killed
+/// mid-query leaves nothing holding the node.
+///
+/// Returns the format and the frame interval as `(numerator, denominator)`.
+///
+/// # Errors
+///
+/// [`CaptureError::Disconnected`] when the node is gone — which is the answer during a replug,
+/// and is why the probe prints `no device` rather than exiting.
+pub fn query_format(path: &Path) -> Result<(Format, (u32, u32)), CaptureError> {
+    let dev = Device::with_path(path).map_err(map_io)?;
+    let format = dev.format().map_err(map_io)?;
+    let params = dev.params().map_err(map_io)?;
+    Ok((
+        format,
+        (params.interval.numerator, params.interval.denominator),
+    ))
 }
 
 /// `v4l2_buffer.timestamp` to a `Duration` on `CLOCK_MONOTONIC` (§5.5).
@@ -968,6 +1126,40 @@ mod tests {
     fn opening_a_nonexistent_node_is_disconnection_not_a_panic() {
         let r = V4l2Source::open(Path::new("/dev/video-nanokvm-absent"), 1920, 1080, 60);
         assert!(matches!(r, Err(CaptureError::Disconnected)), "{r:?}");
+    }
+
+    /// The opener has to be usable, and honest, with no device present — that is the state it
+    /// exists for. A `describe()` that needed a live source would print nothing exactly when the
+    /// pipeline is logging "still trying".
+    #[test]
+    fn an_opener_on_an_absent_node_describes_itself_and_reports_disconnection() {
+        let mut opener = V4l2Opener::new("/dev/video-nanokvm-absent", 1920, 1080, 60);
+        let described = opener.describe();
+        assert!(
+            described.contains("/dev/video-nanokvm-absent") && described.contains("1920x1080"),
+            "{described}"
+        );
+        assert_eq!(opener.path(), Path::new("/dev/video-nanokvm-absent"));
+        // ENOENT on a node that is not there is `Disconnected`, which is what the pipeline's
+        // reopen loop treats as "not back yet" and retries.
+        let r = opener.open();
+        assert!(
+            matches!(r.as_ref().err(), Some(CaptureError::Disconnected)),
+            "{:?}",
+            r.err()
+        );
+        // And again: an opener is called over and over, so it must not be single-shot.
+        assert!(matches!(
+            opener.open().err(),
+            Some(CaptureError::Disconnected)
+        ));
+    }
+
+    /// The same classification through the read-only query path the probe uses.
+    #[test]
+    fn querying_an_absent_node_is_disconnection_not_a_panic() {
+        let r = query_format(Path::new("/dev/video-nanokvm-absent"));
+        assert!(matches!(r.as_ref().err(), Some(CaptureError::Disconnected)));
     }
 
     #[test]

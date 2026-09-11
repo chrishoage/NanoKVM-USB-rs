@@ -493,6 +493,24 @@ fn an_unsolicited_push_with_no_request_in_flight_is_still_delivered() {
     assert_eq!(link.stats().unsolicited, 1);
 }
 
+/// Poll `garbage_bytes` up to a deadline, the way the fake's own `wait_for_received` polls.
+///
+/// The count is folded by the **reader thread**, which is not synchronised with `transact`:
+/// `get_info` returns as soon as its own reply is routed, and the bytes injected ahead of it may
+/// still be in flight in the parser. Asserting the total immediately is therefore a race — it
+/// failed about one run in sixteen — and the fix is the one the rest of this file already uses:
+/// wait for the condition with a bound, never sleep and hope.
+fn wait_for_garbage(link: &SerialLink, at_least: u64, timeout: Duration) -> u64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let seen = link.stats().garbage_bytes;
+        if seen >= at_least || Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn the_reader_thread_survives_pure_garbage() {
     let (fake, mut link) = rig(default_script());
@@ -503,7 +521,11 @@ fn the_reader_thread_survives_pure_garbage() {
         .get_info(Duration::from_secs(2))
         .expect("still working");
     assert!(info.target_connected);
-    assert!(link.stats().garbage_bytes >= 128);
+    let garbage = wait_for_garbage(&link, 128, TIMEOUT);
+    assert!(
+        garbage >= 128,
+        "only {garbage} of the 128 garbage bytes were counted"
+    );
     assert_eq!(link.is_down(), None);
 }
 

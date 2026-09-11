@@ -45,7 +45,7 @@
 //! is still pending clears the flag before forwarding, because the up it was waiting for can no
 //! longer arrive.
 
-use crate::input::{Event, ReleaseReason, SubmitError};
+use crate::input::{Event, ReleaseOutcome, ReleaseReason, ReleaseRecord, SubmitError};
 use crate::proto::report::button;
 use crate::proto::HidKey;
 
@@ -76,6 +76,34 @@ impl CaptureState {
     }
 }
 
+/// Why input stopped, kept until the user deliberately re-captures (§2.8).
+///
+/// §2.8 requires an overflow to be "surfaced — not a silent counter", and the Stage 1 viewer did
+/// not meet that: an overflow released the session, logged a warning, and put the title back to
+/// `[click or Enter to capture]`, which is indistinguishable from the user having pressed `Pause`.
+/// A user who never reads the log therefore saw input stop for no stated reason. The notice is
+/// carried in the session so that the *reason the last session ended* is on screen until a new
+/// one starts, and so that a pure reducer test can pin both raising it and clearing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// [`SubmitError::Overflow`]: coalescing could not make room, so the session was cancelled.
+    Overflow,
+    /// [`SubmitError::LinkDown`]: the serial transport went away under the session (§2.7 is
+    /// reconnecting, but nothing may be forwarded until it comes back and the user re-captures).
+    LinkDown,
+}
+
+impl Notice {
+    /// What the title says. Both name the cause *and* the way out, because "input interrupted"
+    /// with no instruction is only marginally better than silence.
+    pub fn title_fragment(self) -> &'static str {
+        match self {
+            Notice::Overflow => "input interrupted: queue overflowed — click to re-capture",
+            Notice::LinkDown => "input stopped: serial link down",
+        }
+    }
+}
+
 /// The reducer's whole state: the capture phase, the consumed-edge bookkeeping described in the
 /// module docs, and the one-shot close latch.
 ///
@@ -92,6 +120,10 @@ pub struct Session {
     /// feeds `CloseRequested` while `interrupted` is set, and a release-all per tick would bump
     /// `requested_epoch` every 250 ms until the loop actually stops (§2.6).
     closing: bool,
+    /// Why the last session ended, when it ended for a reason the user needs telling (§2.8).
+    /// Cleared by the next successful engagement — the deliberate recapture §2.8 asks for — and
+    /// by nothing else, so it cannot be missed by looking away for a tick.
+    notice: Option<Notice>,
 }
 
 impl Session {
@@ -119,6 +151,11 @@ impl Session {
     /// The same for `Enter`.
     pub fn enter_consumed(&self) -> bool {
         self.consumed_enter
+    }
+
+    /// Why input stopped, if it stopped for a reason worth showing (§2.8).
+    pub fn notice(&self) -> Option<Notice> {
+        self.notice
     }
 }
 
@@ -216,6 +253,20 @@ fn forward(event: Event) -> Actions {
     vec![Action::Forward(event)]
 }
 
+/// Which §2.8 notice, if any, a refused submission leaves on screen.
+///
+/// Only the two failures the user can neither predict nor undo get one. `Disengaged` does not:
+/// the producer disengages *after* some other cancellation, whose own trigger already carried
+/// whatever notice was owed — and a link failure behind it is already in the title from
+/// [`crate::input::Stats::link_down`]. `ShuttingDown` does not either: the window is going away.
+fn notice_for(error: SubmitError) -> Option<Notice> {
+    match error {
+        SubmitError::Overflow => Some(Notice::Overflow),
+        SubmitError::LinkDown => Some(Notice::LinkDown),
+        SubmitError::Disengaged | SubmitError::ShuttingDown => None,
+    }
+}
+
 /// Which §2.6 reason a refused submission corresponds to.
 fn reason_for(error: SubmitError) -> ReleaseReason {
     match error {
@@ -295,6 +346,50 @@ fn plain_input(session: Session, event: Event) -> (Session, Actions) {
     }
 }
 
+/// The §2.6.1 release-outcome notice, as a two-field state machine over
+/// [`crate::input::Stats::last_release`].
+///
+/// An `Unsent` release means the target may still be holding keys and nothing local can fix it,
+/// so it is shown until something contradicts it. What contradicts it is the **next** release
+/// that was actually submitted — which, across a §2.7 reconnect, is the release-all the writer
+/// sends on the replacement link (`Writer::commission`, reason `Reconnected`): the keys really
+/// are released then, and the title must stop claiming otherwise.
+///
+/// It lives here, in the pure module, because "does the notice clear when the reconnect's release
+/// lands?" is a question about this bookkeeping and not about winit. `App` keeps the logging.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReleaseNotice {
+    /// The epoch of the last record acted on, so each release is reported once rather than every
+    /// tick (§2.6.1).
+    reported_epoch: Option<u64>,
+    raised: bool,
+}
+
+impl ReleaseNotice {
+    /// Fold in the latest [`crate::input::Stats::last_release`].
+    ///
+    /// Returns the record when it has not been seen before, so the caller logs it exactly once.
+    /// Records are matched by epoch: epochs increase monotonically (§2.6) and every completed
+    /// sequence has its own, so "same epoch" is "same release" and nothing else.
+    pub fn observe(&mut self, last_release: Option<ReleaseRecord>) -> Option<ReleaseRecord> {
+        let record = last_release?;
+        if self.reported_epoch == Some(record.epoch) {
+            return None;
+        }
+        self.reported_epoch = Some(record.epoch);
+        self.raised = match record.outcome {
+            ReleaseOutcome::Unsent => true,
+            ReleaseOutcome::Submitted => false,
+        };
+        Some(record)
+    }
+
+    /// Whether the title should be carrying the "release UNSENT" warning.
+    pub fn raised(&self) -> bool {
+        self.raised
+    }
+}
+
 /// Which release a `Captured` session owes when the producer has gone quiet without ever refusing
 /// a submission, or `None` if it owes none.
 ///
@@ -368,7 +463,15 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
         FocusLost if s.capture != Released => release(s, ReleaseReason::FocusLost),
         InhibitorInactive if s.capture != Released => release(s, ReleaseReason::UserRequested),
         ReleaseKey if s.capture != Released => release(s, ReleaseReason::UserRequested),
-        SubmitFailed(e) if s.capture != Released => release(s, reason_for(e)),
+        SubmitFailed(e) if s.capture != Released => {
+            let (mut s, actions) = release(s, reason_for(e));
+            // §2.8: surface it. The notice outlives the release, because the release is over in
+            // a tick and the user may be looking at the target rather than at the title.
+            if let Some(notice) = notice_for(e) {
+                s.notice = Some(notice);
+            }
+            (s, actions)
+        }
 
         // ---- waiting on the writer's acknowledgement (§2.6) -------------------------------------
         EngageSucceeded if s.capture == Engaging => {
@@ -376,6 +479,10 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
             // very often still held when the acknowledgement lands, and its up must still be
             // eaten.
             s.capture = Captured;
+            // Input is flowing again, so the reason the *previous* session ended has been read
+            // and acted on. Clearing it here rather than on the click means a recapture that is
+            // still waiting on the writer's acknowledgement keeps saying why it is waiting.
+            s.notice = None;
             (s, Actions::new())
         }
         Retry if s.capture == Engaging => (s, vec![Action::TryEngage]),

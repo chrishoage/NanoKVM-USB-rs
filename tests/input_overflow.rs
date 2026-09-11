@@ -18,6 +18,8 @@ fn config() -> Config {
     Config {
         max_barriers: 16,
         transact_timeout: Duration::from_millis(50),
+        // Slice A added `Config::reconnect`; these paths use `spawn`, which never reconnects.
+        ..Config::default()
     }
 }
 

@@ -37,10 +37,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::input::queue::QueueState;
 use crate::input::stats::{Counters, ReleaseRecord};
 use crate::input::{Config, ReleaseReason};
+use crate::proto::frame::DeviceInfo;
 
 /// Lock a mutex, recovering from poisoning.
 ///
@@ -51,6 +53,27 @@ use crate::input::{Config, ReleaseReason};
 /// So the poison is discarded rather than unwrapped.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What is known about the transport: whether it is up, since when, and what it last said.
+///
+/// **All three live under one mutex, and the mutex is what [`crate::input::Stats`] reads**, so a
+/// snapshot cannot straddle a link transition. `down` duplicates `Shared::link_down` on purpose:
+/// `link_down` is read by every `submit` and must stay a lock-free atomic, but a reader that took
+/// the atomic and this mutex separately could see `down == true` with no `down_since`, or a live
+/// link still carrying one — the two are written in one order and were read in the other. The
+/// writers below hold this mutex **across** the atomic store, so the pair is only ever observed
+/// before or after a transition, never inside one.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LinkState {
+    /// The transport has failed and no replacement has been commissioned (§2.6.1). The mirror of
+    /// `Shared::link_down` that a consistent snapshot is taken from.
+    pub(crate) down: bool,
+    /// When the current outage began (§2.7: the log line says how long the link was down).
+    /// `Some` exactly while `down` is true.
+    pub(crate) down_since: Option<Instant>,
+    /// The last `GET_INFO` that answered (§2.7 step 3d).
+    pub(crate) device_info: Option<DeviceInfo>,
 }
 
 /// Everything the producers and the writer both touch.
@@ -69,8 +92,11 @@ pub(crate) struct Shared {
     pub(crate) cancel: AtomicBool,
     /// Whether `submit` is accepted (§2.6 last paragraph, §2.8 "require deliberate recapture").
     pub(crate) engaged: AtomicBool,
-    /// The transport has failed under the writer. No reconnect in Stage 1 (§2.7).
+    /// The transport has failed under the writer, and no replacement has been commissioned yet
+    /// (§2.6.1). Cleared only by a completed §2.7 sequence, and only by the writer.
     pub(crate) link_down: AtomicBool,
+    /// [`LinkState`]: when this outage began, and the last `GET_INFO` that answered.
+    pub(crate) link_state: Mutex<LinkState>,
     /// At least one transact timed out.
     pub(crate) degraded: AtomicBool,
     /// Set by `WriterHandle::shutdown` and by dropping the handle, always in the same critical
@@ -95,6 +121,7 @@ impl Shared {
             cancel: AtomicBool::new(false),
             engaged: AtomicBool::new(true),
             link_down: AtomicBool::new(false),
+            link_state: Mutex::new(LinkState::default()),
             degraded: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             counters: Counters::default(),
@@ -106,7 +133,57 @@ impl Shared {
     /// A cancellation trigger (§2.6): bump `requested_epoch`, set the flag, disengage, wake the
     /// writer. It enqueues nothing and it does not wait for the writer.
     pub(crate) fn trigger(&self, reason: ReleaseReason) {
-        let _ = self.raise(reason, false);
+        let _ = self.raise(ReasonSlot::Note(reason), false);
+    }
+
+    /// The writer's own trigger for the §2.7 sequence, raised on a link that has just been opened.
+    /// Returns the epoch it requested and the reason it took over, if any.
+    ///
+    /// It is a cancellation like any other — the epoch advances, the flag is set and the producer
+    /// is disengaged, so a producer that re-engaged while the link was down (which `engage` allows,
+    /// since it only checks the ack) is disengaged again and its events are drained rather than
+    /// written on the new link.
+    ///
+    /// It differs from [`Shared::trigger`] in what it does with the one-slot reason: it **takes**
+    /// whatever is there rather than adding to it. Both halves of that matter, and both are in the
+    /// same critical section as the epoch bump:
+    ///
+    /// - *Taking* it: a trigger that landed while the writer was inside `LinkSource::open` — after
+    ///   the last flag check and before this call — has its reason sitting in the slot with no
+    ///   sequence of its own left to run, because this sequence covers its epoch and then clears
+    ///   the flag. Leaving it there would strand it, and the next unrelated release would inherit
+    ///   it and be mislabelled.
+    /// - *Not adding* to it: the slot is left free for a trigger that arrives **during** the
+    ///   sequence — a shutdown between steps 3a and 3e — so that trigger's own sequence is
+    ///   labelled with its own reason. The writer supplies `Reconnected` itself.
+    pub(crate) fn begin_reconnect(&self) -> (u64, Option<ReleaseReason>) {
+        self.raise(ReasonSlot::Take, false)
+    }
+
+    /// Mark the transport failed, remembering when, if this is the transition into an outage.
+    /// Called by the writer on a transport failure and once at startup by
+    /// [`crate::input::spawn_with_source`], which has no link yet.
+    ///
+    /// The atomic is stored **while the mutex is held**, so the two halves of the transition are
+    /// one critical section to anyone reading a snapshot — see [`LinkState`].
+    pub(crate) fn mark_link_down(&self) {
+        let mut state = lock(&self.link_state);
+        if state.down_since.is_none() {
+            state.down_since = Some(Instant::now());
+        }
+        state.down = true;
+        self.link_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Record an accepted link (§2.7 step 3e) and return how long the outage lasted. One critical
+    /// section, for the reason on [`LinkState`].
+    pub(crate) fn mark_link_up(&self, info: DeviceInfo) -> Option<std::time::Duration> {
+        let mut state = lock(&self.link_state);
+        let down_for = state.down_since.take().map(|t| t.elapsed());
+        state.device_info = Some(info);
+        state.down = false;
+        self.link_down.store(false, Ordering::SeqCst);
+        down_for
     }
 
     /// The shutdown trigger. Identical to [`Shared::trigger`], except that `shutting_down` is set
@@ -114,24 +191,45 @@ impl Shared {
     /// indivisible to anyone holding the queue lock — which is every producer path. Returns the
     /// epoch `E` this call requested, so the caller can wait for exactly its own release.
     pub(crate) fn begin_shutdown(&self) -> u64 {
-        self.raise(ReleaseReason::Shutdown, true)
+        self.raise(ReasonSlot::Note(ReleaseReason::Shutdown), true)
+            .0
     }
 
-    /// The body both triggers share. Returns the epoch this trigger requested.
-    fn raise(&self, reason: ReleaseReason, shutting_down: bool) -> u64 {
-        let epoch = {
+    /// The body every trigger shares. Returns the epoch this trigger requested and, for
+    /// [`ReasonSlot::Take`], the reason it took out of the slot.
+    fn raise(&self, slot: ReasonSlot, shutting_down: bool) -> (u64, Option<ReleaseReason>) {
+        let raised = {
             let mut q = lock(&self.queue);
             if shutting_down {
                 self.shutting_down.store(true, Ordering::SeqCst);
             }
             let epoch = self.requested_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-            q.note_reason(reason);
+            let taken = match slot {
+                ReasonSlot::Note(reason) => {
+                    q.note_reason(reason);
+                    None
+                }
+                ReasonSlot::Take => q.pending_reason.take(),
+            };
             self.cancel.store(true, Ordering::SeqCst);
             // Input stays disengaged until the user deliberately re-grabs (§2.8).
             self.engaged.store(false, Ordering::SeqCst);
-            epoch
+            (epoch, taken)
         };
         self.wake.notify_all();
-        epoch
+        raised
     }
+}
+
+/// What a trigger does with the queue's one-slot pending reason (§2.6).
+///
+/// The two are exclusive by construction, which is the point of naming them: an ordinary trigger
+/// adds a reason for a sequence that has not run yet, while the writer's reconnect *is* the
+/// sequence and so takes what is there. See [`Shared::begin_reconnect`].
+enum ReasonSlot {
+    /// Coalesce this reason into the slot, most severe wins (`QueueState::note_reason`).
+    Note(ReleaseReason),
+    /// Empty the slot and hand its contents to the caller, which is about to run the sequence
+    /// that covers it.
+    Take,
 }

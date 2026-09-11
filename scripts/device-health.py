@@ -10,6 +10,11 @@ which is throwaway Stage 0 code. Read-only apart from one GET_INFO request. Exit
 anything is wrong.
 
 Usage:  scripts/device-health.py [video-node] [tty-node]      (defaults: video4 ttyACM1)
+
+If a node is missing or the link has wedged, scripts/usb-replug.py makes the kernel unplug and
+replug the dongle (plan §6.1 S2-4); run this again afterwards to confirm it came back. It works
+with the node already gone — name the dongle by sysfs port path, e.g. `--port 3-2.2 dongle` —
+and it reports the new /dev names if the kernel hands out different minors.
 """
 import os
 import sys
@@ -18,6 +23,13 @@ import time
 
 GET_INFO = bytes([0x57, 0xAB, 0x00, 0x01, 0x00, 0x03])
 BAUD = termios.B57600
+
+# The three vendor:product ids the containment rule requires. Keep in step with the constants of
+# the same names in src/discovery/mod.rs; this script and that module implement one rule, and a
+# health check that accepts what the client rejects is worse than no health check.
+VIDEO_ID = ("345f", "2133")
+SERIAL_ID = ("1a86", "55d3")
+INTERNAL_HUB_ID = ("1a40", "0101")
 
 
 def usb_device_of(sysfs_link):
@@ -46,9 +58,26 @@ def port_dir_of(dev):
     return os.path.join(parent, f"{hub}:1.0", f"{hub}-port{port}")
 
 
+def usb_id(d):
+    return (attr(d, "idVendor"), attr(d, "idProduct"))
+
+
 def check_pairing(video, tty, report):
-    """NATIVE_CLIENT_PLAN §8. Same USB device is proof; failing that, the kernel's port
-    `peer` link proves the two sit on one physical connector."""
+    """NATIVE_CLIENT_PLAN §8, as implemented by src/discovery. Same USB device is proof; failing
+    that, the kernel's port `peer` link proves the two sit on one physical connector; failing
+    that, both being direct children of the dongle's own internal hub.
+
+    The third case is not proof and does not say it is. §8 itself calls it a degradation: on a
+    USB 2.0-only port "the check degrades to a common-ancestor test, which is sound *because the
+    shared ancestor is inside the dongle*" -- and nothing in sysfs asserts that it is. It is also
+    narrower here than §8's wording, deliberately: `1a40:0101` is an unbranded generic hub chip,
+    so "shared ancestor is a hub" would pair any two devices behind any cheap hub -- a webcam and
+    an unrelated CDC-ACM device on one dock do exactly that. All three ids are therefore required,
+    and all three are commodity part numbers, which is what "degraded" in its verdict is saying.
+
+    The evidence strings printed below are the ones `discovery::Evidence::kind()` and its
+    `Display` produce, word for word, so this check and the client can be compared directly.
+    `src/discovery/mod.rs` has a unit test that fails if this file stops containing them."""
     v = usb_device_of(f"/sys/class/video4linux/{video}/device")
     s = usb_device_of(f"/sys/class/tty/{tty}/device")
     if not v or not s:
@@ -64,17 +93,30 @@ def check_pairing(video, tty, report):
         report(True, "pairing", "same USB device (busnum:devnum) — proof")
         return True
 
-    peer = os.path.join(port_dir_of(v), "peer")
+    video_port = port_dir_of(v)
+    peer = os.path.join(video_port, "peer")
     if os.path.exists(peer):
-        peer_dev = os.path.realpath(os.path.join(os.path.realpath(peer), "device"))
+        peer_port = os.path.realpath(peer)
+        peer_dev = os.path.realpath(os.path.join(peer_port, "device"))
         if os.path.isdir(peer_dev) and (s == peer_dev or s.startswith(peer_dev + os.sep)):
-            report(True, "pairing", f"serial sits under the USB2 peer of the video port "
-                                    f"({os.path.basename(peer_dev)}) — proof")
+            report(True, "pairing",
+                   f"port peer: the serial device sits under {os.path.basename(peer_port)}, "
+                   f"which the kernel declares the peer of the video device's port "
+                   f"{os.path.basename(video_port)} — proof")
             return True
 
-    common = os.path.commonpath([v, s])
-    if os.path.exists(os.path.join(common, "idVendor")):
-        report(True, "pairing", f"both contained in {os.path.basename(common)} — weaker proof")
+    hub = os.path.commonpath([v, s])
+    while hub != "/" and not os.path.exists(os.path.join(hub, "idVendor")):
+        hub = os.path.dirname(hub)
+    if (os.path.exists(os.path.join(hub, "idVendor"))
+            and os.path.dirname(v) == hub and os.path.dirname(s) == hub
+            and usb_id(hub) == INTERNAL_HUB_ID
+            and usb_id(v) == VIDEO_ID and usb_id(s) == SERIAL_ID):
+        report(True, "pairing",
+               f"internal hub (degraded): both are direct children of the dongle's own hub "
+               f"{os.path.basename(hub)} {attr(hub,'idVendor')}:{attr(hub,'idProduct')} "
+               f"— §8's common-ancestor test, contained by that hub and by all three vendor ids, "
+               f"which are commodity part numbers rather than a kernel assertion")
         return True
 
     report(False, "pairing", "no evidence these are one device; use explicit --serial/--video")

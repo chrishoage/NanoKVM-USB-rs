@@ -21,3 +21,15 @@ Cargo.lock
 
 # Read-only upstream reference checkout, not part of this project.
 /reference/
+
+# sysfs fixture trees: build output, not source.
+#
+# The source is fixtures/sysfs/usb2-desk.sysfs — the 2026-09-10 recording of this desk,
+# serialised to one line-oriented file — plus fixtures/sysfs/synthesize.py, which expands it
+# and reconstructs the other trees from it. Expanded, they are ~1300 one-line files.
+# `cargo test` materialises them on demand (src/discovery/testing.rs), or run
+# `python3 fixtures/sysfs/synthesize.py` by hand. Every subdirectory is ignored, so a new
+# tree needs no entry here; only the top-level files are tracked.
+/fixtures/sysfs/*/
+/fixtures/sysfs/.synthesize.lock
+__pycache__/
