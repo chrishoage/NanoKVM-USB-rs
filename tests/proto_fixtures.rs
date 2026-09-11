@@ -5,10 +5,16 @@
 //! Also carries the fixed regression corpus from §9.2 item 6, whose three cases are known real
 //! traffic rather than fuzzer material.
 
+use std::time::Duration;
+
+use nanokvm::link::Link;
 use nanokvm::link::Reply;
 use nanokvm::proto::frame::{encode, Event, Frame, Parser};
 use nanokvm::proto::report::{KeyboardReport, MouseAbsReport, MouseRelReport, ABS_MAX};
+use nanokvm::proto::usb_string::{parse_usb_string, UsbStringKind};
 use nanokvm::proto::{cmd, DeviceInfo};
+use nanokvm::serial::fake::{Behaviour, FakeCh9329};
+use nanokvm::serial::SerialLink;
 use serde::Deserialize;
 
 // -- the fixture file -------------------------------------------------------
@@ -353,6 +359,92 @@ fn the_get_info_reply_fixture_parses_into_device_info() {
     let info = DeviceInfo::parse(&caps.data).expect("8-byte payload");
     assert!(info.caps_lock, "lockBits 0x02 is CapsLock");
     assert!(!info.num_lock && !info.scroll_lock);
+}
+
+// -- GET_USB_STRING: the replies, and the fake that imitates them -----------
+
+/// The three `GET_USB_STRING` reply fixtures, in the order a probe asks for them.
+fn usb_string_replies() -> Vec<(UsbStringKind, Entry)> {
+    let f = fixtures();
+    [
+        (
+            UsbStringKind::Manufacturer,
+            "get_usb_string_manufacturer_reply",
+        ),
+        (UsbStringKind::Product, "get_usb_string_product_reply"),
+        (UsbStringKind::Serial, "get_usb_string_serial_reply"),
+    ]
+    .into_iter()
+    .map(|(kind, name)| {
+        let entry = f
+            .response
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("fixture {name}"));
+        (
+            kind,
+            Entry {
+                name: entry.name.clone(),
+                cmd: entry.cmd,
+                data: entry.data.clone(),
+                len: entry.len,
+                frame: entry.frame.clone(),
+                checksum: entry.checksum,
+                observed: entry.observed,
+            },
+        )
+    })
+    .collect()
+}
+
+/// A16 measured the three *strings*; the 2026-09-11 probe run recorded the *bytes*. The parser is
+/// checked against those bytes rather than against a retyped payload (§9.1), which is what makes
+/// this a test of `parse_usb_string` and not of whoever typed the fixture.
+#[test]
+fn every_usb_string_reply_fixture_parses_to_the_string_a16_measured() {
+    let want = ["Sipeed", "NanoKVM-USB", "BA1612624UJPW2RUJ"];
+    for ((kind, entry), want) in usb_string_replies().into_iter().zip(want) {
+        assert_eq!(entry.cmd, cmd::GET_USB_STRING | 0x80, "{}", entry.name);
+        assert_eq!(
+            parse_usb_string(kind, &entry.data),
+            Ok(want.to_string()),
+            "{}",
+            entry.name
+        );
+        // The datasheet shape, now that it is observed rather than assumed: type, length, ascii.
+        assert_eq!(entry.data[0], kind.request_byte(), "{}", entry.name);
+        assert_eq!(
+            usize::from(entry.data[1]),
+            entry.data.len() - 2,
+            "{}: the length byte describes the rest of the payload",
+            entry.name
+        );
+        assert!(entry.observed, "{}: pinned from a hardware run", entry.name);
+    }
+}
+
+/// §9.3: the fake is only worth testing against if it answers what the device answers. Now that
+/// the replies are pinned, that is checkable — byte for byte, over the pty, through the real
+/// `SerialLink`.
+#[test]
+fn the_fake_answers_get_usb_string_with_the_fixture_bytes() {
+    let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn the fake CH9329");
+    let mut link = SerialLink::open(&fake.slave_path()).expect("open the fake's pty");
+    for (kind, entry) in usb_string_replies() {
+        let reply = link
+            .transact(
+                cmd::GET_USB_STRING,
+                &[kind.request_byte()],
+                Duration::from_millis(500),
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(reply.cmd, entry.cmd, "{}", entry.name);
+        assert_eq!(
+            reply.data, entry.data,
+            "the fake's {kind} reply is not the fixture's payload"
+        );
+    }
+    fake.stop();
 }
 
 // -- regression corpus, §9.2 item 6 -----------------------------------------

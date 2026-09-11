@@ -17,8 +17,9 @@
 //!   right shape**, which is exactly the trap in §3.4/A17: the ack proves parsing, not effect;
 //! - a frame whose checksum does not verify → the error frame `cmd | 0xC0` with `0xE4`
 //!   (fixture `err_checksum_on_get_info`, §3.1/A14);
-//! - `GET_USB_STRING` with an empty payload → `0xCA` with `0xE5` (fixture
-//!   `err_param_on_get_usb_string`);
+//! - `GET_USB_STRING` with an empty payload, or a string type outside 0..=2 → `0xCA` with `0xE5`
+//!   (fixture `err_param_on_get_usb_string`); types 0, 1 and 2 → the three strings A16 measured,
+//!   in the datasheet's `[type, len, ascii…]` shape (A16 read the strings, not the bytes);
 //! - **any other command → the five-byte reply `57 AB 00 (cmd|0x80) 00` with no checksum byte**
 //!   (§3.2, A13, fixture disagreement `unknown_command_reply_has_no_checksum_byte`). This is the
 //!   one that hangs a naive host reader for ever, so the fake must be able to produce it.
@@ -42,12 +43,17 @@ use std::time::{Duration, Instant};
 
 use crate::proto::cmd;
 use crate::proto::frame::{encode, Event, Frame, Parser, ADDR, HEAD};
+use crate::proto::usb_string::{UsbStringKind, UsbStrings};
 
 /// The `get_info_reply` payload (Appendix, fixture `get_info_reply`): version 1.8, target
 /// connected, all lock bits off. Tests that assert on byte-level correctness should load the
 /// fixture file instead of relying on this constant; it exists so `Behaviour::default` has an
 /// answer without doing I/O.
 pub const DEFAULT_GET_INFO_PAYLOAD: [u8; 8] = [0x38, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+/// The three `GET_USB_STRING` answers A16 measured on this unit. The last one is unit-unique and
+/// unrelated to either USB `iSerial`, which is what makes it worth printing in a listing.
+pub const DEFAULT_USB_STRINGS: [&str; 3] = ["Sipeed", "NanoKVM-USB", "BA1612624UJPW2RUJ"];
 
 /// Checksum-error code, as the device sends it (fixture `err_checksum_on_get_info`).
 pub const ERR_CHECKSUM: u8 = 0xE4;
@@ -69,6 +75,8 @@ const FRAGMENT_GAP: Duration = Duration::from_millis(1);
 pub struct Behaviour {
     /// Payload of the `GET_INFO` reply (Appendix).
     pub get_info_payload: Vec<u8>,
+    /// The `GET_USB_STRING` answers, manufacturer then product then serial (A16).
+    pub usb_strings: UsbStrings,
     /// Commands answered with an error frame `cmd | 0xC0` carrying this code, instead of the
     /// normal reply (§3.1).
     pub reject: Vec<(u8, u8)>,
@@ -85,6 +93,11 @@ impl Default for Behaviour {
     fn default() -> Behaviour {
         Behaviour {
             get_info_payload: DEFAULT_GET_INFO_PAYLOAD.to_vec(),
+            usb_strings: UsbStrings {
+                manufacturer: DEFAULT_USB_STRINGS[0].to_string(),
+                product: DEFAULT_USB_STRINGS[1].to_string(),
+                serial: DEFAULT_USB_STRINGS[2].to_string(),
+            },
             reject: Vec::new(),
             fragment_replies: false,
             delay_reply: Duration::ZERO,
@@ -454,10 +467,14 @@ fn script_reply(state: &FakeState, request: &Frame) -> Plan {
         | cmd::SEND_MS_REL_DATA
         | cmd::SEND_MY_HID_DATA => frame_bytes(request.cmd | 0x80, &[0x00]),
         // Observed: an empty payload is a parameter error, not a string (fixture
-        // `err_param_on_get_usb_string`). The non-empty form returns strings the fake does not
-        // model (A16), so it acknowledges instead.
-        cmd::GET_USB_STRING if request.data.is_empty() => error_frame(request.cmd, ERR_PARAM),
-        cmd::GET_USB_STRING => frame_bytes(request.cmd | 0x80, &[0x00]),
+        // `err_param_on_get_usb_string`), and so is a type byte outside the three strings A16
+        // read. The reply shape is the datasheet's `[type, len, ascii…]`: A16 recorded the
+        // strings but not the bytes, so this is the fake's assumption and not a measurement —
+        // which is why `SerialLink::get_usb_strings` accepts both shapes and logs the raw reply.
+        cmd::GET_USB_STRING => match usb_string_reply(&knobs.script.usb_strings, &request.data) {
+            Some(payload) => frame_bytes(request.cmd | 0x80, &payload),
+            None => error_frame(request.cmd, ERR_PARAM),
+        },
         // §3.2, A13: five bytes, no checksum byte, for ever.
         other => vec![HEAD[0], HEAD[1], ADDR, other | 0x80, 0x00],
     };
@@ -490,6 +507,23 @@ fn write_reply(master: RawFd, plan: Plan) {
     } else {
         write_all(master, &out);
     }
+}
+
+/// The `[type, len, ascii…]` payload answering a `GET_USB_STRING` request, or `None` for a
+/// request the device would answer with `ERR_PARAM` — an empty payload (fixture
+/// `err_param_on_get_usb_string`) or a string type it does not have.
+fn usb_string_reply(strings: &UsbStrings, request: &[u8]) -> Option<Vec<u8>> {
+    let &[type_byte, ..] = request else {
+        return None;
+    };
+    let kind = UsbStringKind::ALL
+        .into_iter()
+        .find(|k| k.request_byte() == type_byte)?;
+    let text = strings.get(kind).as_bytes();
+    let len = u8::try_from(text.len()).ok()?;
+    let mut payload = vec![type_byte, len];
+    payload.extend_from_slice(text);
+    Some(payload)
 }
 
 /// A well-formed frame, or an empty vector if the payload could not be framed. Never panics:

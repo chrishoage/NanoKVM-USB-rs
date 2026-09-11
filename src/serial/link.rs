@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::link::{Link, LinkError, Reply};
 use crate::proto::frame::DeviceInfo;
+use crate::proto::usb_string::{parse_usb_string, UsbStringKind, UsbStrings};
 use crate::proto::{cmd, encode};
 use crate::serial::port::{self, OpenOptions};
 use crate::serial::reader::{self, SerialStats, Shared};
@@ -218,6 +219,37 @@ impl SerialLink {
                 format!("GET_INFO reply: {e}"),
             ))
         })
+    }
+
+    /// `GET_USB_STRING`: the manufacturer, product and unit serial strings (A16, §8).
+    ///
+    /// Three transactions, one per string, because the command carries the string type in its
+    /// payload and answers all three with the same `0x8A`. That is also why the reply's own type
+    /// byte is checked rather than trusted (see [`parse_usb_string`]): matching by command byte —
+    /// which is the rule everywhere else (A12) — cannot tell these three apart.
+    ///
+    /// A16 read the strings but did not record the reply bytes, so **the raw payload of each
+    /// reply is logged at `debug` with its type**: a hardware run can lift them straight out of
+    /// the log and pin a fixture, after which the parser's two accepted shapes can become one.
+    ///
+    /// A reply that is not a string is [`LinkError::Io`] with [`std::io::ErrorKind::InvalidData`],
+    /// for the reason spelled out on [`SerialLink::get_info`]: the device reported no error and a
+    /// reply did arrive, so it is neither `Device` nor `Timeout`, and it does not mark the link
+    /// down.
+    pub fn get_usb_strings(&mut self, timeout: Duration) -> Result<UsbStrings, LinkError> {
+        let mut strings = UsbStrings::default();
+        for kind in UsbStringKind::ALL {
+            let reply = self.transact(cmd::GET_USB_STRING, &[kind.request_byte()], timeout)?;
+            log::debug!("GET_USB_STRING {kind} reply payload: {:02X?}", reply.data);
+            let text = parse_usb_string(kind, &reply.data).map_err(|e| {
+                LinkError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("GET_USB_STRING {kind} reply: {e}"),
+                ))
+            })?;
+            strings.set(kind, text);
+        }
+        Ok(strings)
     }
 
     /// Write bytes straight at the port, outside the framing layer.

@@ -74,6 +74,31 @@ impl NodeProbe for RealProbe {
     }
 }
 
+/// A probe that opens nothing and answers nothing, for a discovery run against a *recorded* sysfs
+/// tree (`--sysfs-root`).
+///
+/// A recording names the `/dev` nodes that existed when it was taken, and those names belong to
+/// whatever is plugged into **this** machine now: `usb2-desk` names `/dev/video0`–`3`, which on
+/// this desk are the user's webcam (CLAUDE.md). Probing them would open someone else's hardware to
+/// answer a question about a fixture, so the flag that replaces the sysfs also replaces the probe.
+///
+/// The refusal is an [`io::ErrorKind::Unsupported`] rather than a silent `false`: [`super::inventory`]
+/// records it, the listing prints it, and a node with no answer stays eligible — so the listing
+/// shows every candidate pair and claims none of them is *the* capture node, which is exactly the
+/// truth when nothing was asked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoProbe;
+
+impl NodeProbe for NoProbe {
+    fn is_capture_node(&self, _dev: &Path) -> Result<bool, io::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "not probed: --sysfs-root names a recorded tree, whose /dev names belong to this \
+             machine's own devices",
+        ))
+    }
+}
+
 /// One `VIDIOC_QUERYCAP` on an already-open descriptor.
 ///
 /// This is the body of `v4l::Device::query_caps`, which is the only part of `v4l::Device` this

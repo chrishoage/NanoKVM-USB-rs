@@ -483,21 +483,13 @@ impl<'a> App<'a> {
         }
         self.last_reconnects = stats.reconnects;
         match stats.device_info {
+            // `DeviceInfo`'s own `Display`, so this line spells the lock bits the way every
+            // other command does: `caps=on`, never `caps=true`.
             Some(info) => log::info!(
-                "serial link back after {} reconnect(s), {} attempt(s): CH9329 firmware {:.1}, \
-                 target {}, locks: num={} caps={} scroll={}. Input stays released until you \
-                 capture again.",
+                "serial link back after {} reconnect(s), {} attempt(s): {info}. Input stays \
+                 released until you capture again.",
                 stats.reconnects,
-                stats.reconnect_attempts,
-                info.version,
-                if info.target_connected {
-                    "connected"
-                } else {
-                    "NOT connected"
-                },
-                info.num_lock,
-                info.caps_lock,
-                info.scroll_lock
+                stats.reconnect_attempts
             ),
             // The writer clears `link_down` only once `GET_INFO` has answered, so this is a
             // race with the snapshot rather than a device that said nothing.

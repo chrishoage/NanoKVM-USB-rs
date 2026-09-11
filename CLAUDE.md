@@ -13,6 +13,10 @@ niri on Wayland.
 4. `docs/STAGE2_FINDINGS.md` — what Stage 2 changed: amendments C1–C14, reconnect/recovery/
    discovery as built, and **all three hardware measurements taken** — target reboot, resolution
    change, and the kernel-side replug (which found two real bugs, C13 and C14).
+5. `docs/STAGE3_FINDINGS.md` — what Stage 3 changed: amendments D1–D10, the CLI as built
+   (`devices`, `shot`, `key`, `type`, `macro`), the two blind adversarial reviews, and the
+   hardware verification — by consequence, as always: a lock bit read back, the typed line on the
+   target's screen.
 
 Raw per-spike evidence runs to roughly 3500 lines and **lives on the `stage-0` branch**, under
 `docs/stage0/`, alongside the throwaway spike crates in `spikes/`. **Do not read it up front.**
@@ -27,7 +31,7 @@ are the evidence and the plan is the bug.
 **Identify hardware by USB identity, never by node name.** Node names are whatever the kernel had
 free at enumeration: after a replug the dongle can come back as `/dev/video0` and `/dev/ttyACM0`
 (it will, if the dock is unplugged at the time), and today's names can belong to something else
-tomorrow. `--list-devices` prints what discovery currently sees.
+tomorrow. `nanokvm devices` prints what discovery currently sees.
 
 | | Identity (stable) | Today's names |
 | --- | --- | --- |
@@ -36,7 +40,7 @@ tomorrow. `--list-devices` prints what discovery currently sees.
 | Target | A Raspberry Pi 3B running the Raspberry Pi OS desktop at 1080p | — |
 
 - **Never open anything on bus 5.** It is the user's, not ours. Check with
-  `readlink -f /sys/class/video4linux/videoN/device` or `--list-devices` rather than assuming
+  `readlink -f /sys/class/video4linux/videoN/device` or `nanokvm devices` rather than assuming
   a number.
 - Of the dongle's two video nodes, one is the capture node and the other is a metadata sibling.
   Which is which is decided by `VIDIOC_QUERYCAP`, never by the number (`discovery::probe`).
@@ -51,7 +55,9 @@ tomorrow. `--list-devices` prints what discovery currently sees.
 - **The captured video is the target's only feedback channel.** It has no network. Never
   unplug the HDMI cable, and never change the target's resolution.
 - The target is disposable and you may drive it. **Never send a blind mouse click** — a click
-  on a live desktop can launch or destroy something. Motion is safe.
+  on a live desktop can launch or destroy something. Motion is safe. The CLI has **no mouse path
+  at all, by test**: nothing under `src/cli/` or `src/script/` can build a mouse report, and
+  `tests/cli_keys.rs` reads every file in both to keep it so.
 - Always send a release-all before exiting anything that sent input.
 - A hardware test or example that hardcodes a node name (`tests/*_hardware.rs`,
   `examples/capture-probe.rs`) must **say so in a comment**, naming the identity it means, so a
@@ -88,16 +94,22 @@ tomorrow. `--list-devices` prints what discovery currently sees.
 - `spikes/` is **throwaway Stage 0 code** and is not on `main`. Do not build on it, do not tidy
   it, do not test it.
 - `src/` is the crate, laid out per plan §4: `proto/` (pure), `link.rs` (the one seam
-  between the input writer and a transport), `input/`, `serial/`, `capture/`, `viewer/`, and
-  `discovery/` (§8: pairing the two nodes from sysfs alone). `proto` and `input` do no I/O, and
-  `discovery` reads `/sys` plus one `QUERYCAP`; keep it that way. `discovery::reopen` is the one
-  module that sits above the rest — it is what `main.rs` reopens devices through.
+  between the input writer and a transport), `input/`, `serial/`, `capture/`, `viewer/`,
+  `discovery/` (§8: pairing the two nodes from sysfs alone), `script/` (pure: the chord and macro
+  compiler behind `key`/`type`/`macro`) and `cli/` (the subcommands and their I/O). `proto`,
+  `input` and `script` do no I/O, and `discovery` reads `/sys` plus one `QUERYCAP`; keep it that
+  way. `discovery::reopen` is the one module that sits above the rest — it is what `main.rs`
+  reopens devices through.
+- **`--dry-run` on `key`/`type`/`macro` opens no device and does not even read `/sys`**, and
+  `nanokvm devices` without `--probe` opens no serial node — its only device access is
+  discovery's read-only `QUERYCAP`. Use them to check a script, or the desk, before touching
+  hardware.
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets
   --features hardware -- -D warnings` and `cargo test` must all be clean before anything is
   called done. The second clippy run matters because the hardware tests only compile under that
   feature, so nothing else ever type-checks them.
-- `cargo test` runs everything that needs no hardware, including the keyboard-example tests in
-  `tests/type_keys.rs` (they drive the built binary against a pty fake, not the dongle).
+- `cargo test` runs everything that needs no hardware, including the keyboard-command tests in
+  `tests/cli_keys.rs` (they drive the built binary against a pty fake, not the dongle).
   Hardware tests are behind `--features hardware` and `#[ignore]`; run them one binary at a time
   with `--test-threads=1`, e.g. `cargo test --features hardware --test serial_hardware --test
   capture_hardware -- --ignored --nocapture --test-threads=1`. They toggle the target's CapsLock

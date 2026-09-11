@@ -85,7 +85,7 @@ pub mod reopen;
 pub mod sysfs;
 pub mod testing;
 
-pub use probe::{NodeProbe, RealProbe};
+pub use probe::{NoProbe, NodeProbe, RealProbe};
 pub use reopen::{DiscoveringLinkSource, DiscoveringOpener, Mode, NodeResolver};
 pub use sysfs::{RealSysfs, Sysfs};
 
@@ -324,8 +324,7 @@ impl fmt::Display for Pair {
 /// Everything discovery found, whether or not it paired.
 ///
 /// This is the message a user reads when told to pass `--video`/`--serial` (§8), and it is also
-/// what `--list-devices` prints. It is Stage 3's `devices` listing brought forward, because §8's
-/// error path needs it anyway.
+/// what `nanokvm devices` prints (§12 Stage 3), because §8's error path needs it anyway.
 #[derive(Clone, Debug, Default)]
 pub struct Inventory {
     pub videos: Vec<VideoNode>,
@@ -355,7 +354,7 @@ impl Inventory {
     /// The same listing, with the nodes `--video`/`--serial` name marked and the selection those
     /// flags produce spelled out.
     ///
-    /// `--list-devices` uses this rather than plain [`Display`](fmt::Display): a listing that
+    /// `nanokvm devices` uses this rather than plain [`Display`](fmt::Display): a listing that
     /// silently ignored the flags on its own command line would be answering a question the user
     /// did not ask (finding 7 of the Stage 2 review).
     pub fn listing<'a>(&'a self, constraints: &'a Constraints) -> Listing<'a> {

@@ -23,6 +23,11 @@ env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 
+# The §9.1 packet fixtures are read by the crate itself now, not just by tests: `script::dry_run`
+# names the frames it prints from `fixtures/packets/ch9329.toml`.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
 # default-features = false drops the libudev enumeration dependency (§7.2).
 serialport = { version = "4", default-features = false }
 
@@ -33,6 +38,12 @@ v4l = { version = "0.14.0", default-features = false, features = ["v4l2"] }
 # Decoder of record (§1.3, A19): RGBA output, strict mode, one thread.
 zune-jpeg = "0.5.15"
 zune-core = "0.5.3"
+
+# `nanokvm shot foo.png` only. The device sends MJPEG and nothing else (§6, A1), so a `.jpg` shot
+# is the device's own bytes and this never runs; a `.png` one encodes a single already-decoded
+# RGBA frame. Default features, and deliberately not the `image` crate: one format, one call, and
+# no decoders linked in that nothing here asks for.
+png = "0.18"
 
 winit = "0.30.13"
 wgpu = "26.0"
@@ -47,8 +58,6 @@ wayland-protocols = { version = "0.32.13", features = ["client", "unstable"] }
 
 [dev-dependencies]
 proptest = "1"
-serde = { version = "1", features = ["derive"] }
-toml = "0.9"
 # openpty for the fake CH9329 (§9.3).
 nix = { version = "0.31", features = ["term", "fs", "poll"] }
 

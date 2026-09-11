@@ -23,6 +23,8 @@
 //! failed frame. See [`Parser`] for why that is the difference between recovering the next reply
 //! and eating it.
 
+use std::fmt;
+
 use crate::link::Reply;
 
 /// Frame header, both bytes (Appendix).
@@ -427,6 +429,56 @@ impl DeviceInfo {
     }
 }
 
+/// The reply as one line, in one wording for every command that prints it.
+///
+/// `key`, `type` and the viewer's startup line used to print `caps=true` while `devices --probe`
+/// printed `caps=on` for the same bit, which reads as two different facts about the target. The
+/// lock bits are *states of the target's keyboard* (Appendix) and `on`/`off` is what a user checks
+/// them against, so that is the spelling, and it lives here — next to the type — rather than in
+/// each caller.
+impl fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CH9329 firmware {:.1}, target {}, locks: num={} caps={} scroll={}",
+            self.version,
+            if self.target_connected {
+                "connected"
+            } else {
+                "NOT connected"
+            },
+            on_off(self.num_lock),
+            on_off(self.caps_lock),
+            on_off(self.scroll_lock),
+        )
+    }
+}
+
+impl DeviceInfo {
+    /// Just the three lock bits, `num=… caps=… scroll=…`.
+    ///
+    /// For the one caller that has a `0x81` frame but not a *query* answer: the device pushes an
+    /// unsolicited lock-state frame after a lock-key change (A12), and reporting its version and
+    /// target flag as if they had just been asked for would be claiming more than was observed
+    /// (§3.4). The spelling is the same one [`DeviceInfo`]'s `Display` uses.
+    pub fn locks(&self) -> String {
+        format!(
+            "num={} caps={} scroll={}",
+            on_off(self.num_lock),
+            on_off(self.caps_lock),
+            on_off(self.scroll_lock)
+        )
+    }
+}
+
+fn on_off(bit: bool) -> &'static str {
+    if bit {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +679,39 @@ mod tests {
         assert!((info.version - 1.8).abs() < 1e-6, "{}", info.version);
         assert!(info.target_connected);
         assert!(!info.num_lock && !info.caps_lock && !info.scroll_lock);
+    }
+
+    /// One wording for every command that prints this (H2): `key`, `type`, `devices --probe` and
+    /// the viewer's startup line all print these bits, and they used to disagree — `caps=true`
+    /// here, `caps=on` there, for one bit of one reply.
+    #[test]
+    fn the_info_line_reports_lock_bits_as_states() {
+        let info = DeviceInfo {
+            version: 1.8,
+            target_connected: true,
+            num_lock: false,
+            caps_lock: true,
+            scroll_lock: false,
+        };
+        assert_eq!(
+            info.to_string(),
+            "CH9329 firmware 1.8, target connected, locks: num=off caps=on scroll=off"
+        );
+        let inverted = DeviceInfo {
+            target_connected: false,
+            num_lock: true,
+            caps_lock: false,
+            scroll_lock: true,
+            ..info
+        };
+        assert_eq!(
+            inverted.to_string(),
+            "CH9329 firmware 1.8, target NOT connected, locks: num=on caps=off scroll=on"
+        );
+        // The bits alone, for the unsolicited push, in the same spelling.
+        assert_eq!(info.locks(), "num=off caps=on scroll=off");
+        assert_eq!(inverted.locks(), "num=on caps=off scroll=on");
+        assert!(inverted.to_string().ends_with(&inverted.locks()));
     }
 
     #[test]

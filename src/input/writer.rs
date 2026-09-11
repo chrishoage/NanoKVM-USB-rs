@@ -678,20 +678,12 @@ impl Writer {
             if !initial {
                 Counters::bump(&self.shared.counters.reconnects);
             }
+            // `DeviceInfo`'s own `Display`, so the lock bits read the same here as in every
+            // command that prints them: `caps=on`, never `caps=true`.
             log::info!(
-                "{} on {}: CH9329 firmware {:.1}, target {}, locks: num={} caps={} scroll={} \
-                 (attempt {attempt}, down for {:?})",
+                "{} on {}: {info} (attempt {attempt}, down for {:?})",
                 if initial { "link up" } else { "reconnected" },
                 self.source_desc,
-                info.version,
-                if info.target_connected {
-                    "connected"
-                } else {
-                    "NOT connected"
-                },
-                info.num_lock,
-                info.caps_lock,
-                info.scroll_lock,
                 down_for.unwrap_or_default()
             );
         }

@@ -772,10 +772,11 @@ fn a_mixed_probe_failure_is_still_reported_as_ambiguous() {
     );
 }
 
-// ---- --list-devices honours the flags on its own command line (review finding 7) ------------
+// ---- `devices` honours the flags on its own command line (review finding 7) -----------------
 
-/// `--list-devices --video X --serial Y` used to print the unfiltered table and exit 0, so the
-/// flags looked ignored. The listing marks what they name and spells out the selection.
+/// `devices --video X --serial Y` (Stage 1's `--list-devices`) used to print the unfiltered
+/// table and exit 0, so the flags looked ignored. The listing marks what they name and spells
+/// out the selection.
 #[test]
 fn a_listing_marks_the_nodes_the_flags_name() {
     let sysfs = fixture("usb2-desk");

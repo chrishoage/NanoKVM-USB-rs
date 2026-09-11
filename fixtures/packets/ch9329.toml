@@ -21,6 +21,10 @@
 #
 # `observed = true` means a byte-identical frame was also seen on the wire
 # during the Stage 0 spike (see fixtures/traffic/). That is CORROBORATION.
+# Where a frame was observed on a later run instead, `observed_on` names that
+# run -- the GET_USB_STRING requests and their three replies were pinned by the
+# Stage 3 `nanokvm devices --probe` run of 2026-09-11, which logged the raw
+# reply payloads A16 had measured only as strings.
 # Where derivation and observation disagree, see [[disagreement]] at the end.
 
 [meta]
@@ -203,6 +207,45 @@ checksum = 0x10
 checksum_derivation = "0x102 + 0x04(CMD) + 0x07(LEN) + 0x03(sum DATA) = 0x110 -> & 0xFF = 0x10"
 observed = false
 
+[[packet]]
+name = "get_usb_string_manufacturer"
+cmd = 0x0A
+cmd_name = "GET_USB_STRING"
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the manufacturer string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+data = [0x00]
+len = 0x01
+frame = "57 AB 00 0A 01 00 0D"
+checksum = 0x0D
+checksum_derivation = "0x102 + 0x0A(CMD) + 0x01(LEN) + 0x00 = 0x10D -> & 0xFF = 0x0D"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
+
+[[packet]]
+name = "get_usb_string_product"
+cmd = 0x0A
+cmd_name = "GET_USB_STRING"
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the product string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+data = [0x01]
+len = 0x01
+frame = "57 AB 00 0A 01 01 0E"
+checksum = 0x0E
+checksum_derivation = "0x102 + 0x0A(CMD) + 0x01(LEN) + 0x01 = 0x10E -> & 0xFF = 0x0E"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
+
+[[packet]]
+name = "get_usb_string_serial"
+cmd = 0x0A
+cmd_name = "GET_USB_STRING"
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the unit serial string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+data = [0x02]
+len = 0x01
+frame = "57 AB 00 0A 01 02 0F"
+checksum = 0x0F
+checksum_derivation = "0x102 + 0x0A(CMD) + 0x01(LEN) + 0x02 = 0x10F -> & 0xFF = 0x0F"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
+
 # --------------------------------------------------------------------------
 # Responses. Same framing rule; CMD is request | 0x80 on success and
 # request | 0xC0 on error. Included so the DECODE side has an authority too.
@@ -284,6 +327,42 @@ frame = "57 AB 00 C2 01 E4 A9"
 checksum = 0xA9
 checksum_derivation = "0x102 + 0xC2(CMD) + 0x01(LEN) + 0xE4 = 0x2A9 -> & 0xFF = 0xA9"
 observed = true
+
+[[response]]
+name = "get_usb_string_manufacturer_reply"
+cmd = 0x8A
+payload_meaning = "GET_USB_STRING reply for type 0x00: [type, len, ascii...] -- 0x00 manufacturer, 6 bytes, \"Sipeed\". Raw payload read from RUST_LOG=debug on 2026-09-11, which is what turned A16's measured STRING into a pinned reply FRAME."
+data = [0x00, 0x06, 0x53, 0x69, 0x70, 0x65, 0x65, 0x64]
+len = 0x08
+frame = "57 AB 00 8A 08 00 06 53 69 70 65 65 64 F4"
+checksum = 0xF4
+checksum_derivation = "0x102 + 0x8A(CMD) + 0x08(LEN) + 0x260(sum DATA) = 0x3F4 -> & 0xFF = 0xF4"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
+
+[[response]]
+name = "get_usb_string_product_reply"
+cmd = 0x8A
+payload_meaning = "GET_USB_STRING reply for type 0x01: 0x01 product, 11 bytes, \"NanoKVM-USB\". Note this is the DEVICE's own product string and is not the USB interface name, which reads \"USB2 Video\" or \"USB3 Video\" depending on the port (CLAUDE.md)."
+data = [0x01, 0x0B, 0x4E, 0x61, 0x6E, 0x6F, 0x4B, 0x56, 0x4D, 0x2D, 0x55, 0x53, 0x42]
+len = 0x0D
+frame = "57 AB 00 8A 0D 01 0B 4E 61 6E 6F 4B 56 4D 2D 55 53 42 36"
+checksum = 0x36
+checksum_derivation = "0x102 + 0x8A(CMD) + 0x0D(LEN) + 0x39D(sum DATA) = 0x536 -> & 0xFF = 0x36"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
+
+[[response]]
+name = "get_usb_string_serial_reply"
+cmd = 0x8A
+payload_meaning = "GET_USB_STRING reply for type 0x02: 0x02 serial, 17 bytes, \"BA1612624UJPW2RUJ\". A16: this is unit-unique and unrelated to either USB iSerial, which makes it the one identifier sysfs cannot see (§8's last paragraph)."
+data = [0x02, 0x11, 0x42, 0x41, 0x31, 0x36, 0x31, 0x32, 0x36, 0x32, 0x34, 0x55, 0x4A, 0x50, 0x57, 0x32, 0x52, 0x55, 0x4A]
+len = 0x13
+frame = "57 AB 00 8A 13 02 11 42 41 31 36 31 32 36 32 34 55 4A 50 57 32 52 55 4A 04"
+checksum = 0x04
+checksum_derivation = "0x102 + 0x8A(CMD) + 0x13(LEN) + 0x465(sum DATA) = 0x604 -> & 0xFF = 0x04"
+observed = true
+observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
 
 [[response]]
 name = "err_param_on_get_usb_string"

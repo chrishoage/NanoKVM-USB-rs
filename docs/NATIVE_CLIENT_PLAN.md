@@ -86,6 +86,11 @@ And one testing principle, learned the expensive way (A17):
 > **On this device an acknowledgement is not evidence of effect.** Hardware assertions must
 > observe a consequence — a pixel moved, a lock bit changed — not an `ACK`.
 
+Building the later stages corrected this document again, and those amendments are cited the same
+way, from their own findings documents rather than folded in here: B*n* in
+`docs/STAGE1_FINDINGS.md`, C*n* in `docs/STAGE2_FINDINGS.md`, and **D1–D10 in
+`docs/STAGE3_FINDINGS.md`** — what the CLI stage changed about §2.9, §8, §10.2 and §12.
+
 ---
 
 ## 1. Language: Rust
@@ -1281,10 +1286,17 @@ not act on (§3.4).
 **Exit:** survives target reboots, replugs, resolution changes and overload without
 stuck keys or restarts.
 
-### Stage 3 — CLI conveniences
+### Stage 3 — CLI conveniences — **COMPLETE**
 
-`devices`, `shot`, `key <chord>`, `type` with declared layout and unreachable-character
-policy (§10.2), macro files.
+Five subcommands on the one binary, with `nanokvm` alone still the viewer: `devices` (the §8
+listing, plus an opt-in `--probe` that opens only the serial node discovery would select),
+`shot` (one frame to `.jpg`, `.png` or stdout, under a stated frame policy), `key <chord>`,
+`type` with the declared layout and unreachable-character policy §10.2 asked for, and `macro`
+files. Verified on hardware by consequence — the target's lock bit, the typed commands on its
+screen — on 2026-09-11.
+
+Evidence, the ten amendments this document needs as a result (D1–D10) and the measurements are
+in `docs/STAGE3_FINDINGS.md`.
 
 ### Stage 4 — Optional extensions
 

@@ -6,9 +6,11 @@
 pub mod frame;
 pub mod keymap;
 pub mod report;
+pub mod usb_string;
 
 pub use frame::*;
 pub use report::*;
+pub use usb_string::*;
 
 /// Command bytes (Appendix).
 pub mod cmd {
