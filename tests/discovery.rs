@@ -19,7 +19,8 @@ use proptest::prelude::*;
 
 use nanokvm::discovery::testing::{fixture, MapProbe, OverrideSysfs};
 use nanokvm::discovery::{
-    discover, inventory, Constraints, DiscoveryError, Evidence, Pair, Sysfs, UsbDevice,
+    discover, inventory, AudioPairing, Constraints, DiscoveryError, Evidence, Pair, Sysfs,
+    UsbDevice,
 };
 
 /// Device directories inside the `usb2-desk` recording, for the mutation tests.
@@ -819,4 +820,343 @@ fn a_listing_calls_out_a_flag_it_could_not_find() {
     let text = inv.listing(&constraints).to_string();
     assert!(text.contains("/dev/ttyUSB0"), "{text}");
     assert!(text.contains("still be used"), "{text}");
+}
+
+// ---- the sound card (§8 evidence 1, §12 Stage 4a) -------------------------------------------
+//
+// The dongle's `345f:2133` carries a USB Audio Class control/streaming pair on interfaces `1.2`
+// and `1.3` alongside its two UVC interfaces, so `/sys/class/sound/card8/device` resolves to an
+// interface of the *same USB device* as `/dev/video4`'s. That is §8's evidence 1 — the proof the
+// video-and-serial pairing cannot have on this hardware — and `audio_for` implements only it.
+// The trees below are what stops that claim from quietly degrading into containment.
+
+/// The desk as recorded, plus the sound records merged into it on 2026-09-11: `card8` sits under
+/// `3-2.2.2:1.2`, which is an interface of `3-2.2.2` — the very device `/dev/video4` resolves to.
+#[test]
+fn the_capture_node_pairs_with_the_sound_card_on_its_own_usb_device() {
+    let sysfs = fixture("usb2-desk");
+    let inv = inventory(&sysfs, &desk_probe());
+    let pair = only_pair(&inv);
+
+    let card = match &pair.audio {
+        AudioPairing::Paired(c) => c,
+        other => panic!("expected the dongle's own card to pair, got {other:?}\n{inv}"),
+    };
+    assert_eq!(card.name, "card8");
+    assert_eq!(card.id.as_deref(), Some("Video"));
+    assert_eq!(usb(&card.usb).name, "3-2.2.2");
+    assert_eq!(usb(&card.usb).sysfs, usb(&pair.video.usb).sysfs);
+    // The name ALSA is handed. Derived from `card8`, never stored.
+    assert_eq!(card.alsa_device().as_deref(), Some("hw:8"));
+    assert_eq!(card.alsa_card_id().as_deref(), Some("hw:CARD=Video"));
+}
+
+/// The number is parsed back out of the `cardN` directory name on every call, and the `number`
+/// attribute the recording also carries is the cross-check that the name really is the number.
+/// Card numbers renumber on replug exactly as `/dev` names do (C13), so anything that remembered
+/// one would open a stranger's card after a reboot.
+#[test]
+fn every_cards_number_is_the_one_in_its_directory_name() {
+    for tree in ["usb2-desk", "usb3-stage0", "usb3-rootport", "two-dongles"] {
+        let sysfs = fixture(tree);
+        let inv = inventory(&sysfs, &two_dongle_probe());
+        for card in &inv.cards {
+            let attr = sysfs
+                .read_attr(&card.sysfs, "number")
+                .unwrap_or_else(|| panic!("{tree}: {} has no `number` attribute", card.name));
+            assert_eq!(
+                card.number().map(|n| n.to_string()),
+                Some(attr.clone()),
+                "{tree}: {} parses to a different number than its `number` attribute {attr}",
+                card.name
+            );
+            assert_eq!(card.alsa_device(), Some(format!("hw:{attr}")));
+        }
+    }
+}
+
+/// The negative control the audio rule needs, and the reason it is same-device rather than
+/// containment: the webcam's microphone is a card on the *webcam's* USB device. Nothing about it
+/// may reach the dongle's pair, and the dongle's card may not reach the webcam.
+#[test]
+fn a_sound_card_belongs_to_its_own_usb_device_and_to_no_other() {
+    let sysfs = fixture("usb2-desk");
+    let inv = inventory(&sysfs, &desk_probe());
+
+    // By the USB device, never by the card's name: that number is invented by
+    // `synthesize.py` (MANIFEST.md says so), and a test that pinned it would make the
+    // reconstruction's arbitrary choice into a fact this suite depends on.
+    let webcam_card = inv
+        .cards
+        .iter()
+        .find(|c| c.usb.as_ref().is_some_and(|u| u.name == "5-1.4.4.4.2"))
+        .expect("the bus-5 negative control must carry the webcam's card");
+    assert_eq!(usb(&webcam_card.usb).id(), (0x046d, 0x086b));
+
+    for pair in &inv.pairs {
+        assert_ne!(
+            pair.audio.card().map(|c| c.name.as_str()),
+            Some(webcam_card.name.as_str()),
+            "the webcam's microphone must never be offered to the dongle:\n{inv}"
+        );
+    }
+}
+
+/// The *measured* bus-5 negative control, and the one card in this fixture set that was read off
+/// a live `/sys` on a bus that is not ours: `0d8c:0016` "USB Audio Device" on `5-1.1.1`, card0 on
+/// 2026-09-11. It belongs to its own USB device, it is listed, and it is never the dongle's — the
+/// same claim the reconstructed webcam card makes, made this time by a recording.
+#[test]
+fn the_recorded_bus_5_sound_card_belongs_to_its_own_device_and_never_to_the_dongle() {
+    let sysfs = fixture("usb2-desk");
+    let inv = inventory(&sysfs, &desk_probe());
+
+    let card = inv
+        .cards
+        .iter()
+        .find(|c| c.name == "card0")
+        .expect("the recording carries the dock's own USB sound card");
+    let card_usb = usb(&card.usb);
+    assert_eq!(card_usb.name, "5-1.1.1");
+    assert_eq!(card_usb.id(), (0x0d8c, 0x0016));
+    assert_eq!(card.id.as_deref(), Some("Device"));
+
+    let pair = only_pair(&inv);
+    assert_eq!(
+        pair.audio.card().map(|c| c.name.as_str()),
+        Some("card8"),
+        "the dongle's own card is the one that pairs:\n{inv}"
+    );
+    assert_ne!(
+        usb(&pair.video.usb).sysfs,
+        card_usb.sysfs,
+        "and it is a different USB device on a different bus entirely"
+    );
+    // Listed, because "why did my card not pair?" is a question this listing answers.
+    assert!(
+        inv.to_string()
+            .contains("card0 \"Device\" (hw:0) on 5-1.1.1"),
+        "{inv}"
+    );
+}
+
+/// The case that separates §8's evidence 1 from its evidence 3. `two-dongles` puts an ordinary
+/// USB sound card on a free port of the *second dongle's own internal hub*: contained by that
+/// hub exactly as the capture device is, and on a different USB device. Containment would pair
+/// it. Same-device does not, so that pair honestly reports no audio.
+#[test]
+fn a_card_under_the_dongles_own_hub_but_on_another_device_does_not_pair() {
+    let sysfs = fixture("two-dongles");
+    let inv = inventory(&sysfs, &two_dongle_probe());
+
+    let card = inv
+        .cards
+        .iter()
+        .find(|c| c.name == "card9")
+        .expect("the second dongle's hub must carry the negative-control sound card");
+    let card_usb = usb(&card.usb);
+    assert_eq!(card_usb.name, "3-2.3.3");
+
+    let second = inv
+        .pairs
+        .iter()
+        .find(|p| p.video.dev == Path::new("/dev/video6"))
+        .expect("the second dongle must still pair its own two nodes");
+    // Contained by the same hub as the capture node, which is what makes this a control.
+    assert_eq!(
+        card_usb.sysfs.parent(),
+        usb(&second.video.usb).sysfs.parent(),
+        "the control only works if the card really is under the dongle's own hub"
+    );
+    // Two cards are under that hub: `card9` on the sound device and `card10` on the capture
+    // device itself. Containment cannot tell them apart; same-device picks exactly one.
+    assert_eq!(
+        second.audio.card().map(|c| c.name.as_str()),
+        Some("card10"),
+        "the card on the capture device is the one that pairs:\n{inv}"
+    );
+    assert!(
+        !inv.pairs
+            .iter()
+            .any(|p| p.audio.card().is_some_and(|c| c.name == "card9")),
+        "a card contained by the dongle's hub is not a card on the dongle:\n{inv}"
+    );
+
+    // And the first dongle is unaffected: its own card still pairs.
+    let first = inv
+        .pairs
+        .iter()
+        .find(|p| p.video.dev == Path::new("/dev/video4"))
+        .expect("the first dongle must still pair");
+    assert_eq!(first.audio.card().map(|c| c.name.as_str()), Some("card8"));
+}
+
+/// Most cards on any desk are not USB at all — an HDMI codec, the motherboard's analogue output.
+/// They are listed, because "why did my card not pair?" is a question this listing answers, and
+/// they resolve to no USB device, so nothing can pair them.
+#[test]
+fn a_sound_card_that_is_not_a_usb_device_is_listed_and_never_paired() {
+    let sysfs = fixture("usb2-desk");
+    let inv = inventory(&sysfs, &desk_probe());
+
+    let pci: Vec<&str> = inv
+        .cards
+        .iter()
+        .filter(|c| c.usb.is_none())
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        pci,
+        vec!["card1", "card2", "card3"],
+        "the desk's three PCI cards must be listed:\n{inv}"
+    );
+    let listing = inv.to_string();
+    assert!(
+        listing.contains("card1 \"HDMI\" (hw:1) — not a USB device"),
+        "a card that could never pair says why:\n{listing}"
+    );
+    for pair in &inv.pairs {
+        assert!(
+            pair.audio
+                .card()
+                .is_none_or(|c| !pci.contains(&c.name.as_str())),
+            "a PCI card cannot be on a USB device:\n{inv}"
+        );
+    }
+}
+
+/// `/sys/class/sound` is not a directory of cards: it also holds `controlC8`, `pcmC8D0c`, `seq`
+/// and `timer`. The recording carries only the `card*` entries — `snapshot-sysfs.py` records the
+/// prefix discovery reads — so the live directory's other entries are put back here, as they were
+/// read from this desk on 2026-09-11, and must be ignored without disturbing anything.
+#[test]
+fn the_other_entries_in_the_sound_class_are_not_cards() {
+    struct ExtraEntries<S: Sysfs> {
+        inner: S,
+        class: &'static str,
+        extra: Vec<&'static str>,
+    }
+    impl<S: Sysfs> Sysfs for ExtraEntries<S> {
+        fn read_attr(&self, dir: &Path, name: &str) -> Option<String> {
+            self.inner.read_attr(dir, name)
+        }
+        fn read_link(&self, path: &Path) -> Option<PathBuf> {
+            self.inner.read_link(path)
+        }
+        fn list_dir(&self, dir: &Path) -> Vec<PathBuf> {
+            let mut entries = self.inner.list_dir(dir);
+            if dir == Path::new(self.class) {
+                entries.extend(self.extra.iter().map(|n| dir.join(n)));
+                entries.sort();
+            }
+            entries
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.inner.exists(path)
+        }
+    }
+
+    let plain = inventory(&fixture("usb2-desk"), &desk_probe());
+    let sysfs = ExtraEntries {
+        inner: fixture("usb2-desk"),
+        class: "/class/sound",
+        extra: vec!["controlC8", "hwC1D0", "pcmC8D0c", "seq", "timer"],
+    };
+    let inv = inventory(&sysfs, &desk_probe());
+
+    assert_eq!(
+        inv.cards.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        plain
+            .cards
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>(),
+        "only `card<N>` is a card:\n{inv}"
+    );
+    assert_eq!(
+        inv.pairs[0].audio.card().map(|c| c.name.clone()),
+        Some("card8".to_string())
+    );
+}
+
+/// Both SuperSpeed trees are reconstructions of Stage 0's `topology.md`, which recorded the two
+/// device nodes and nothing else: the dongle has not been on a SuperSpeed port since, and no
+/// readout of its sound card exists for that shape. So the audio interface is **absent from the
+/// reconstruction**, and this test states that rather than inventing a card — the dongle
+/// certainly still has one there, the same `345f:2133` with the same five interfaces, but nobody
+/// has read it and a fixture that claimed otherwise would be evidence of nothing.
+///
+/// What it does pin is the property that matters more: **absent audio changes nothing.** Both
+/// trees still pair their two nodes on the kernel's `peer` assertion, and both report no audio
+/// honestly rather than failing (§4.1 rev 5: audio is a side channel).
+#[test]
+fn the_superspeed_reconstructions_carry_no_sound_card_and_still_pair() {
+    for tree in ["usb3-stage0", "usb3-rootport"] {
+        let sysfs = fixture(tree);
+        let inv = inventory(&sysfs, &desk_probe());
+        assert!(
+            inv.cards.is_empty(),
+            "{tree}: topology.md recorded no sound card, so the tree must not claim one:\n{inv}"
+        );
+        let pair = only_pair(&inv);
+        assert!(
+            matches!(pair.evidence, Some(Evidence::PortPeer { .. })),
+            "{tree}: the pairing must be unaffected by the absent card:\n{inv}"
+        );
+        assert_eq!(pair.audio, AudioPairing::NoCard, "{tree}:\n{inv}");
+        assert!(inv.to_string().contains("sound cards:\n  (none)"), "{inv}");
+    }
+}
+
+/// A `--video` discovery never enumerated leaves nothing to match a card against. "Not asked" is
+/// a different answer from "no audio", and the message says which it is rather than implying the
+/// dongle has no sound card.
+#[test]
+fn an_unenumerated_video_override_reports_unknown_rather_than_no_audio() {
+    let sysfs = fixture("usb2-desk");
+    let constraints = Constraints {
+        video: Some(PathBuf::from("/dev/video99")),
+        serial: Some(PathBuf::from("/dev/ttyACM1")),
+    };
+    let pair = discover(&sysfs, &desk_probe(), &constraints).expect("both overrides are obeyed");
+    assert_eq!(pair.audio, AudioPairing::Unknown);
+    let text = pair.audio.to_string();
+    assert!(text.contains("given explicitly"), "{text}");
+}
+
+/// Two cards on one USB device is §8's ambiguity rule applied to audio: nothing is selected and
+/// both are named. The desk has no such device, so this is the one audio case expressed as a
+/// mutation over the recording — the *webcam's* card relabelled onto the dongle's interface is
+/// not expressible as an attribute override, so instead the dongle's video device is made to look
+/// like the webcam's, which puts both cards on one `busnum:devnum`.
+#[test]
+fn two_cards_on_one_usb_device_are_refused_rather_than_guessed_between() {
+    let sysfs = OverrideSysfs::new(fixture("usb2-desk"))
+        .set(DESK_VIDEO, "busnum", "5")
+        .set(DESK_VIDEO, "devnum", "98");
+    let inv = inventory(&sysfs, &desk_probe());
+    let pair = only_pair(&inv);
+
+    let names: Vec<String> = match &pair.audio {
+        AudioPairing::Ambiguous(cards) => {
+            // The webcam's card and the dongle's, now indistinguishable by the rule. Which
+            // *number* the webcam's card has is the reconstruction's invention, so the assertion
+            // is that there are two and that one of them is on the webcam.
+            assert_eq!(cards.len(), 2, "{cards:?}");
+            assert!(
+                cards
+                    .iter()
+                    .any(|c| c.usb.as_ref().is_some_and(|u| u.name == "5-1.4.4.4.2")),
+                "the webcam's own card must be one of the candidates: {cards:?}"
+            );
+            assert!(cards.iter().any(|c| c.name == "card8"));
+            cards.iter().map(|c| c.name.clone()).collect()
+        }
+        other => panic!("expected two candidate cards, got {other:?}\n{inv}"),
+    };
+    let text = pair.audio.to_string();
+    for name in &names {
+        assert!(text.contains(name.as_str()), "{text} must name {name}");
+    }
+    assert!(text.contains("refusing to guess"), "{text}");
 }

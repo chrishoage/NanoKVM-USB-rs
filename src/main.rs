@@ -1,7 +1,12 @@
 //! `nanokvm` — the viewer (plan §12, Stages 1 and 2).
 //!
-//! Wiring only: parse arguments, choose the two devices, start the three subsystems and hand the
+//! Wiring only: parse arguments, choose the devices, start the subsystems and hand the
 //! event loop over to [`nanokvm::viewer::run`].
+//!
+//! Stage 4a adds a fourth subsystem and a third device: the dongle's own sound card (§12 Stage
+//! 4a). It is started last, nothing waits for it, and `--no-audio` starts none of it — §4.1 rev 5
+//! makes audio a side channel, and the ordering here is what makes that true rather than
+//! intended.
 //!
 //! The order below is deliberate. **Serial comes up first and is never taken down by the capture
 //! path** (§6.1 S1-1): sending a chord to a target with no video is a primary use case, so a
@@ -46,10 +51,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 
+use nanokvm::audio::alsa::DefaultSinkOpener;
+use nanokvm::audio::{AudioConfig, AudioHandle};
 use nanokvm::capture::{Pipeline, PipelineConfig, V4l2Source};
 use nanokvm::cli::{devices, keys, shot, Command};
 use nanokvm::discovery::{
-    self, Constraints, DiscoveringLinkSource, DiscoveringOpener, Evidence, NodeKind, NodeResolver,
+    self, Constraints, DiscoveringCardOpener, DiscoveringLinkSource, DiscoveringOpener, Evidence,
+    NodeKind, NodeResolver,
 };
 use nanokvm::input::{self, ReleaseOutcome};
 use nanokvm::serial::{self, OpenOptions};
@@ -124,6 +132,11 @@ struct Args {
     #[arg(long, value_enum)]
     pointer: Option<PointerArg>,
 
+    /// Do not open the dongle's sound card. The viewer is then exactly what it was in Stage 3:
+    /// no card is opened, no audio thread runs, and the title says only "audio off".
+    #[arg(long)]
+    no_audio: bool,
+
     /// Seconds between statistics lines; 0 disables them. [default: 5]
     #[arg(long, value_name = "SECS")]
     stats_interval: Option<u64>,
@@ -131,6 +144,30 @@ struct Args {
     /// Quit cleanly after this many seconds. Development flag for bounded hardware runs.
     #[arg(long, value_name = "SECS", hide = true)]
     exit_after: Option<u64>,
+
+    /// Open this chrome popover at startup: Video, Keyboard, Mouse or Audio. Development flag —
+    /// it exists so §12 Stage 4b's "event-loop handling latency with a popover open" can be
+    /// measured on a desk where nothing may drive the pointer.
+    #[arg(long, value_name = "NAME", hide = true)]
+    chrome_popover: Option<String>,
+
+    /// Engage capture as soon as the window is up. Development flag: §12 Stage 4c's exit criterion
+    /// types onto the target, and nothing on this desk may drive the pointer or the keyboard for a
+    /// hardware run. It feeds the reducer the same Enter edge a keypress would, which is consumed
+    /// and never forwarded.
+    #[arg(long, hide = true)]
+    capture_on_start: bool,
+
+    /// Paste the clipboard as soon as capture engages. Development flag, and it implies
+    /// --capture-on-start: a paste needs a captured session, and nothing can click for it.
+    #[arg(long, hide = true)]
+    paste_on_capture: bool,
+
+    /// Feed the release key this many milliseconds after a paste starts. Development flag: §12
+    /// Stage 4c's exit criterion includes cancelling a running paste, and nobody can press the
+    /// release key for an unattended run. It takes the key's own path, not a private cancel.
+    #[arg(long, value_name = "MS", hide = true)]
+    paste_cancel_after_ms: Option<u64>,
 
     /// Read USB topology from this directory instead of /sys. Development flag: it points
     /// discovery at a recorded tree (`fixtures/sysfs/`) so that a test of the command line does
@@ -150,11 +187,26 @@ impl Args {
         if self.pointer.is_some() {
             return Some("--pointer");
         }
+        if self.no_audio {
+            return Some("--no-audio");
+        }
         if self.stats_interval.is_some() {
             return Some("--stats-interval");
         }
         if self.exit_after.is_some() {
             return Some("--exit-after");
+        }
+        if self.chrome_popover.is_some() {
+            return Some("--chrome-popover");
+        }
+        if self.capture_on_start {
+            return Some("--capture-on-start");
+        }
+        if self.paste_on_capture {
+            return Some("--paste-on-capture");
+        }
+        if self.paste_cancel_after_ms.is_some() {
+            return Some("--paste-cancel-after-ms");
         }
         None
     }
@@ -192,6 +244,11 @@ enum Needed {
 struct Selection {
     video: Option<PathBuf>,
     serial: Option<PathBuf>,
+    /// The sysfs directory of the USB device the video node belongs to, when discovery
+    /// enumerated one. It is what the audio card is paired against, and the only thing the card
+    /// opener needs — see [`discovery::reopen::CardResolver`], which is why it is carried here
+    /// rather than re-derived by a second run of discovery on every audio retry.
+    video_usb: Option<PathBuf>,
 }
 
 impl Selection {
@@ -202,10 +259,12 @@ impl Selection {
             NodeKind::Video => Selection {
                 video: Some(path),
                 serial: None,
+                video_usb: None,
             },
             NodeKind::Serial => Selection {
                 video: None,
                 serial: Some(path),
+                video_usb: None,
             },
         }
     }
@@ -297,6 +356,7 @@ fn select_devices(
         }
     }
     Selection {
+        video_usb: pair.video.usb.as_ref().map(|u| u.sysfs.clone()),
         video: Some(pair.video.dev),
         serial: Some(pair.serial.dev),
     }
@@ -428,6 +488,24 @@ fn main() -> Result<()> {
     }
 }
 
+/// Which chrome popover `--chrome-popover` named, or `None` when the flag was not given.
+///
+/// A development flag (§12 Stage 4b): it exists so the measurement with a popover open can be
+/// taken on a desk where nothing may drive the pointer. The names come from the popovers
+/// themselves, so the flag cannot name one that does not exist.
+fn chrome_popover(name: Option<&str>) -> Result<Option<nanokvm::viewer::chrome::Popover>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    viewer::chrome::ChromeUi::popover_by_name(name)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--chrome-popover {name}: expected one of Video, Keyboard, Mouse or Audio"
+            )
+        })
+}
+
 /// The serial node a keyboard command will open, or [`NO_NODE`] for a dry run that will not.
 fn serial_node(args: &Args, constraints: &Constraints, dry_run: bool) -> PathBuf {
     if dry_run {
@@ -543,19 +621,125 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     );
     let pipeline = Pipeline::start_with_opener(Box::new(opener), PipelineConfig::default());
 
+    // ---- the chrome's settings and the mode list (§12 Stage 4b) -----------------------------
+    // Loaded **before** the window, and a parse failure is returned rather than defaulted: §12
+    // Stage 4b says a malformed file is an error naming the key, not a silent reset, and an error
+    // raised after the window exists is one nobody reads. `None` — no `HOME`, no
+    // `XDG_CONFIG_HOME` — means the defaults and nothing remembered, which is honest degradation
+    // rather than a dotfile scattered in the working directory.
+    let chrome_store = viewer::chrome::Store::discover();
+    let chrome_config = match chrome_store.as_ref() {
+        Some(store) => store.load().with_context(|| {
+            format!(
+                "reading the chrome settings from {}. Fix the key it names, or delete the file to \
+                 start from the defaults.",
+                store.path().display()
+            )
+        })?,
+        None => {
+            log::warn!(
+                "neither XDG_CONFIG_HOME nor HOME is set, so the chrome's settings cannot be \
+                 remembered between runs; using the defaults"
+            );
+            viewer::chrome::Config::default()
+        }
+    };
+
+    // The Video popover's list, read from the device rather than written down (§12 Stage 4b). A
+    // read-only `VIDIOC_ENUM_FRAMESIZES` on a second handle — the pipeline owns the streaming one
+    // — and a failure is a warning with an empty list, because a menu that cannot be built is not
+    // a reason to refuse to show a picture.
+    let video_modes = match nanokvm::capture::v4l2::enumerate_modes(&video_path) {
+        Ok(modes) => {
+            log::info!(
+                "the device enumerates {} MJPEG mode(s): {}",
+                modes.len(),
+                modes
+                    .iter()
+                    .map(|(w, h)| format!("{w}x{h}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            modes
+        }
+        Err(e) => {
+            log::warn!(
+                "could not enumerate the device's capture modes ({e}); the chrome's Video \
+                 popover will say so rather than offer a guess"
+            );
+            Vec::new()
+        }
+    };
+
+    // ---- audio, last and least (§4.1 rev 5, §12 Stage 4a) ----------------------------------
+    // Started after video and input are already running, and nothing below waits for it: audio
+    // is a side channel, so a card that is absent, busy or unbound must leave the client exactly
+    // as usable as it was in Stage 3. `--no-audio` spawns nothing at all — not a thread, not an
+    // open — which is what makes "exactly Stage 3" checkable rather than merely intended.
+    //
+    // The card is resolved the same way the other two nodes are (§8, C13): rediscovered on every
+    // open, because card numbers renumber on replug exactly as /dev names do.
+    let audio = match (args.no_audio, &selection.video_usb) {
+        (true, _) => {
+            log::info!("audio: disabled by --no-audio; no sound card will be opened");
+            None
+        }
+        // A `--video` discovery never enumerated: there is no USB device for a card to belong to,
+        // so there is nothing to pair and nothing a retry could change. Saying so once beats two
+        // threads reporting the same thing for the rest of the session.
+        (false, None) => {
+            log::warn!(
+                "audio: the video node was given explicitly and discovery never enumerated it, \
+                 so there is no USB device to match a sound card against; running without audio. \
+                 `nanokvm devices` shows what discovery can see"
+            );
+            None
+        }
+        (false, Some(usb)) => {
+            let config = AudioConfig::default();
+            log::info!(
+                "audio: buffer {}x{} frames configured ({:?}), playing to ALSA {}",
+                config.ring.periods,
+                config.ring.period_frames,
+                config.ring.depth(),
+                nanokvm::audio::alsa::PLAYBACK_DEVICE,
+            );
+            Some(AudioHandle::spawn(
+                Box::new(DiscoveringCardOpener::real(usb.clone(), config)),
+                Box::new(DefaultSinkOpener::new(config)),
+                config,
+            ))
+        }
+    };
+
     // ---- the window ------------------------------------------------------------------------
     log::info!("press {RELEASE_KEY} (or Mod+Escape on niri) to release capture");
     // The defaults live here rather than in clap, because the flags have to stay `Option` to tell
     // "asked for" from "not mentioned" when a subcommand is present (see `viewer_only_flag`).
     let config = ViewerConfig {
-        pointer: args.pointer.unwrap_or(PointerArg::Abs).into(),
+        // The command line still wins at startup, and the chrome's remembered choice is the
+        // default when the flag was not given — which is why `--pointer` is an `Option`.
+        pointer: match args.pointer {
+            Some(p) => p.into(),
+            None => chrome_config.mouse_mode.into(),
+        },
         stats_interval: match args.stats_interval.unwrap_or(DEFAULT_STATS_INTERVAL_SECS) {
             0 => None,
             s => Some(Duration::from_secs(s)),
         },
         exit_after: args.exit_after.map(Duration::from_secs),
+        chrome_popover: chrome_popover(args.chrome_popover.as_deref())?,
+        // `--paste-on-capture` implies `--capture-on-start`: a paste needs a captured session, and
+        // the flag exists precisely for runs where nothing can capture one by hand.
+        capture_on_start: args.capture_on_start || args.paste_on_capture,
+        paste_on_capture: args.paste_on_capture,
+        paste_cancel_after: args.paste_cancel_after_ms.map(Duration::from_millis),
+        chrome: chrome_config,
+        chrome_store,
+        video_modes,
+        fps: args.fps,
     };
-    let result = viewer::run(&pipeline, producer, config, &INTERRUPTED);
+    let result = viewer::run(&pipeline, producer, audio.as_ref(), config, &INTERRUPTED);
 
     // ---- shutdown, release first -------------------------------------------------------------
     // §2.6: clean shutdown is a release-all trigger, and §2.6.1: an `Unsent` outcome means the
@@ -568,6 +752,9 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         ),
     }
     pipeline.stop();
+    // Explicit rather than left to the drop order, so the audio threads' last log lines land
+    // before the process exits and a stuck one is reported rather than silently detached.
+    drop(audio);
     result
 }
 

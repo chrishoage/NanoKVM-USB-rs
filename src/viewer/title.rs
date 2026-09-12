@@ -33,12 +33,44 @@
 
 use std::time::Duration;
 
+use crate::audio::{RingConfig, RingCounts};
 use crate::capture::PipelineState;
 use crate::viewer::state::Session;
 use crate::viewer::RELEASE_KEY;
 
 /// The title's fixed part.
 pub const APP_TITLE: &str = "NanoKVM-USB";
+
+/// What the title says about audio (§12 Stage 4a).
+///
+/// Three states, because those are the three things a user can do something about: it is off
+/// because they asked for it to be off, it is on (possibly muted), or it is unavailable and the
+/// reason is the actionable part — a card another process holds is fixed differently from a
+/// dongle that is not plugged in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AudioTitle<'a> {
+    /// `--no-audio`. Nothing was opened and no thread is running.
+    Off,
+    /// Running. The counters are shown only when one of them is nonzero, so a healthy session
+    /// says nothing about them — the same rule the rest of this title follows.
+    On {
+        muted: bool,
+        counts: RingCounts,
+        /// For the *configured* depth. §5.5: named for what it is, never as a latency.
+        ring: RingConfig,
+    },
+    /// Not running, and why. The reason is a borrowed condition message, so the wording comes
+    /// from [`crate::audio::AudioError`] and this function invents none of it.
+    Unavailable(&'a str),
+    /// A side is between "about to open its device" and "moved its first period" (hardware
+    /// defect D2). Carries the side's own name, `capture` or `playback`.
+    ///
+    /// D2: an open that never returns logs nothing and raises no condition, so "has not started"
+    /// and "working" read identically. This is the state that tells them apart while it lasts;
+    /// past [`crate::audio::AudioConfig::reopen_backoff_cap`] it becomes an ordinary
+    /// [`AudioTitle::Unavailable`], because by then it is not opening, it is stuck.
+    Opening(&'a str),
+}
 
 /// How long frames must be absent before the title says so (§6.1 S1-2). Matches the pipeline's
 /// own stall threshold, so the title and [`PipelineState::Stalled`] change together.
@@ -73,6 +105,8 @@ pub struct TitleFacts<'a> {
     pub video_size: Option<(u32, u32)>,
     /// [`crate::capture::PipelineStats::negotiated_dimensions`] — what `S_FMT` committed to.
     pub negotiated_size: Option<(u32, u32)>,
+    /// What audio is doing (§12 Stage 4a).
+    pub audio: AudioTitle<'a>,
 }
 
 /// The window title for these facts.
@@ -137,9 +171,48 @@ pub fn compose(f: &TitleFacts) -> String {
         }
     }
 
+    title.push_str(&audio_fragment(&f.audio));
+
     if f.release_unsent {
         title.push_str(" — release UNSENT — target may still hold keys");
     }
 
     title
+}
+
+/// The audio segment, as its own function because §12 Stage 4a states exactly what it has to
+/// carry: the state, the counters, and the buffer depth **labelled as configured**.
+///
+/// `--no-audio` produces `— audio off` and nothing else, ever. That is the whole of what §12
+/// Stage 4a allows the title to say when audio was not asked for: "with it, the viewer must be
+/// exactly Stage 3 (no card opened, nothing about audio in the title beyond 'off')".
+fn audio_fragment(audio: &AudioTitle) -> String {
+    match audio {
+        AudioTitle::Off => " — audio off".to_string(),
+        AudioTitle::Unavailable(why) => format!(" — audio unavailable: {why}"),
+        AudioTitle::Opening(side) => format!(" — audio opening ({side})…"),
+        AudioTitle::On {
+            muted,
+            counts,
+            ring,
+        } => {
+            let state = if *muted { "audio muted" } else { "audio on" };
+            // §5.5: the number is what was *configured*, not what any sample experienced. The
+            // word is in the title rather than only in the documentation because this is the
+            // only place a user sees it, and an unqualified "80 ms" would be read as latency.
+            let mut fragment = format!(
+                " — {state} (buffer {}x{} frames configured)",
+                ring.periods, ring.period_frames
+            );
+            // §2.8: surfaced, never silently absorbed — but a healthy session says nothing, the
+            // same rule the rest of this title follows.
+            if counts.any() {
+                fragment.push_str(&format!(
+                    ", overruns {}, underruns {}, drift {}/{}",
+                    counts.overruns, counts.underruns, counts.drift_drops, counts.drift_inserts
+                ));
+            }
+            fragment
+        }
+    }
 }

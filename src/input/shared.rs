@@ -74,6 +74,24 @@ pub(crate) struct LinkState {
     pub(crate) down_since: Option<Instant>,
     /// The last `GET_INFO` that answered (§2.7 step 3d).
     pub(crate) device_info: Option<DeviceInfo>,
+    /// How many times [`LinkState::device_info`] has been **written** — by a commissioning
+    /// (§2.7 step 3d) or by an on-demand refresh ([`crate::input::Producer::refresh_device_info`]).
+    ///
+    /// It exists because `device_info` alone cannot answer "is this reading fresh?". A caller that
+    /// has to decide something from the target's lock bits — the viewer's clipboard paste, which
+    /// refuses to type letters with the target's CapsLock on (§12 Stage 4c, D2) — would otherwise
+    /// be deciding from whatever the link reported when it was commissioned, which on a stable
+    /// link is the value from process start. Asking for a refresh and waiting for this number to
+    /// move is how that caller knows it is looking at an answer from the device rather than at a
+    /// memory of one.
+    pub(crate) info_generation: u64,
+    /// The newest [`LinkState::device_info`] is **not** an answer to the most recent request for
+    /// one: the transaction failed, the reply did not parse, or there was no link to ask.
+    ///
+    /// Cleared by any reading that does land. It is the difference between "the target's CapsLock
+    /// is off" and "the target's CapsLock was off the last time anyone could ask", and §12 Stage
+    /// 4c refuses to type letters through the second one (D2).
+    pub(crate) info_stale: bool,
 }
 
 /// Everything the producers and the writer both touch.
@@ -99,6 +117,14 @@ pub(crate) struct Shared {
     pub(crate) link_state: Mutex<LinkState>,
     /// At least one transact timed out.
     pub(crate) degraded: AtomicBool,
+    /// A 1-slot request for a fresh `GET_INFO` (§12 Stage 4c).
+    ///
+    /// Like the cancellation flag, setting an already-set flag is a no-op, so concurrent requests
+    /// coalesce into one transaction. It is serviced by the writer **between frames**, in the same
+    /// loop that owns every other write — the sole-serialization-point rule of §2.6 applies to a
+    /// read of the device just as it does to a write, and a second thread transacting on the link
+    /// would interleave two frames on a chip with no inter-byte timeout (§5.1).
+    pub(crate) refresh_info: AtomicBool,
     /// Set by `WriterHandle::shutdown` and by dropping the handle, always in the same critical
     /// section as the trigger that accompanies it. It closes `engage` and `submit` for good, and
     /// the writer exits once it is set and no cancellation is pending. Never cleared: after a
@@ -122,6 +148,7 @@ impl Shared {
             engaged: AtomicBool::new(true),
             link_down: AtomicBool::new(false),
             link_state: Mutex::new(LinkState::default()),
+            refresh_info: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             counters: Counters::default(),
@@ -181,9 +208,52 @@ impl Shared {
         let mut state = lock(&self.link_state);
         let down_for = state.down_since.take().map(|t| t.elapsed());
         state.device_info = Some(info);
+        state.info_generation = state.info_generation.wrapping_add(1);
+        state.info_stale = false;
         state.down = false;
         self.link_down.store(false, Ordering::SeqCst);
         down_for
+    }
+
+    /// Publish a `GET_INFO` reading taken outside a commissioning (§12 Stage 4c). One critical
+    /// section, like [`Shared::mark_link_up`], so a snapshot never shows a new generation with the
+    /// old reading.
+    pub(crate) fn publish_device_info(&self, info: DeviceInfo) {
+        let mut state = lock(&self.link_state);
+        state.device_info = Some(info);
+        state.info_generation = state.info_generation.wrapping_add(1);
+        state.info_stale = false;
+    }
+
+    /// Ask the writer for a fresh `GET_INFO`, and return the generation the request is *against*.
+    ///
+    /// The read and the store are in **one critical section**, for the same reason as every other
+    /// pair here: a caller that set the flag and then read the generation separately could have
+    /// the writer answer in between, and would then be waiting for a number that had already
+    /// moved. For the viewer's paste that is a 3 s wait ending in "the device did not answer
+    /// GET_INFO" about a device that answered in milliseconds. Both writers of the generation
+    /// ([`Shared::publish_device_info`], [`Shared::note_info_refresh_failed`]) take this mutex, so
+    /// the number returned is one that any answer to *this* request is greater than.
+    pub(crate) fn request_info_refresh(&self) -> u64 {
+        let generation = {
+            let state = lock(&self.link_state);
+            self.refresh_info.store(true, Ordering::SeqCst);
+            state.info_generation
+        };
+        self.wake.notify_all();
+        generation
+    }
+
+    /// Record that a refresh was attempted and produced nothing new.
+    ///
+    /// The generation still advances, so a caller waiting on it is released rather than left
+    /// waiting for a device that will not answer — and `info_stale` is set, so what it is released
+    /// *to* is "nobody could ask" and not a reading from some earlier minute wearing a fresh
+    /// number.
+    pub(crate) fn note_info_refresh_failed(&self) {
+        let mut state = lock(&self.link_state);
+        state.info_generation = state.info_generation.wrapping_add(1);
+        state.info_stale = true;
     }
 
     /// The shutdown trigger. Identical to [`Shared::trigger`], except that `shutting_down` is set

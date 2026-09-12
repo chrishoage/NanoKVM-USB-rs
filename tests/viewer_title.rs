@@ -13,11 +13,12 @@
 
 use std::time::Duration;
 
+use nanokvm::audio::{RingConfig, RingCounts};
 use nanokvm::capture::PipelineState;
 use nanokvm::input::SubmitError;
 use nanokvm::proto::report::button;
 use nanokvm::viewer::state::{reduce, CaptureState, Session, Trigger};
-use nanokvm::viewer::title::{compose, TitleFacts};
+use nanokvm::viewer::title::{compose, AudioTitle, TitleFacts};
 
 /// Everything fine: running, frames flowing, link up, nothing owed.
 fn healthy<'a>(session: Session) -> TitleFacts<'a> {
@@ -34,6 +35,17 @@ fn healthy<'a>(session: Session) -> TitleFacts<'a> {
         format_mismatch_accepted: false,
         video_size: Some((1920, 1080)),
         negotiated_size: Some((1920, 1080)),
+        audio: healthy_audio(),
+    }
+}
+
+/// Audio running with nothing dropped, which is the state every pre-Stage-4a test in this file
+/// implicitly assumes: the audio segment must not disturb anything they assert on.
+fn healthy_audio<'a>() -> AudioTitle<'a> {
+    AudioTitle::On {
+        muted: false,
+        counts: RingCounts::default(),
+        ring: RingConfig::default(),
     }
 }
 
@@ -266,12 +278,14 @@ fn every_condition_can_be_shown_together() {
         format_mismatch_accepted: true,
         video_size: Some((640, 480)),
         negotiated_size: Some((1920, 1080)),
+        audio: AudioTitle::Unavailable("capture hw:8 is gone: No such device"),
     });
     for expected in [
         "capture device gone, reconnecting (30s)",
         "serial DOWN, reconnecting (30s, 40 attempts)",
         "input interrupted: queue overflowed",
         "video 640x480, negotiated 1920x1080 not established",
+        "audio unavailable: capture hw:8 is gone: No such device",
         "release UNSENT",
     ] {
         assert!(title.contains(expected), "missing {expected:?} in {title}");
@@ -320,4 +334,158 @@ fn an_accepted_format_mismatch_is_in_the_title_and_a_negotiated_frame_clears_it(
         "the benign A6 transient was reported as a failure: {}",
         compose(&transient)
     );
+}
+
+// ---- audio (§12 Stage 4a) --------------------------------------------------------------------
+
+/// `--no-audio` must leave the viewer *exactly* as Stage 3 left it. The title is the only surface
+/// a Stage 3 viewer had, so "exactly Stage 3" is checkable here: two words, no counters, no
+/// buffer depth, no reason — and nothing about audio anywhere else in the string.
+#[test]
+fn no_audio_says_only_that_it_is_off() {
+    let mut f = healthy(captured());
+    f.audio = AudioTitle::Off;
+    let title = compose(&f);
+    assert!(title.contains(" — audio off"), "{title}");
+    for forbidden in [
+        "buffer",
+        "muted",
+        "overrun",
+        "underrun",
+        "drift",
+        "unavailable",
+    ] {
+        assert!(!title.contains(forbidden), "{forbidden:?} in {title}");
+    }
+}
+
+/// Running audio states the *configured* depth, in the words §5.5 requires: the number is what
+/// was configured, never an end-to-end latency this desk cannot measure.
+#[test]
+fn running_audio_states_the_configured_buffer_depth() {
+    let mut f = healthy(captured());
+    f.audio = AudioTitle::On {
+        muted: false,
+        counts: RingCounts::default(),
+        ring: RingConfig {
+            periods: 8,
+            period_frames: 480,
+        },
+    };
+    let title = compose(&f);
+    assert!(
+        title.contains("audio on (buffer 8x480 frames configured)"),
+        "{title}"
+    );
+    assert!(
+        !title.contains("latency") && !title.contains("ms"),
+        "the depth must not be dressed up as a latency: {title}"
+    );
+}
+
+/// Muted is a different word from off, because they are different situations: one card is open
+/// and running, the other was never opened.
+#[test]
+fn muted_audio_is_not_the_same_as_audio_off() {
+    let mut f = healthy(captured());
+    f.audio = AudioTitle::On {
+        muted: true,
+        counts: RingCounts::default(),
+        ring: RingConfig::default(),
+    };
+    let muted = compose(&f);
+    f.audio = AudioTitle::Off;
+    let off = compose(&f);
+    assert!(muted.contains("audio muted"), "{muted}");
+    assert!(!muted.contains("audio off"), "{muted}");
+    assert!(off.contains("audio off"), "{off}");
+    assert_ne!(muted, off);
+}
+
+/// §2.8: surfaced, never silently absorbed. A drop shows in the title — and a healthy session
+/// still says nothing about counters, the rule the whole of this title follows.
+#[test]
+fn the_audio_counters_appear_only_once_something_has_been_dropped() {
+    let mut f = healthy(captured());
+    let quiet = compose(&f);
+    assert!(!quiet.contains("overruns"), "{quiet}");
+
+    f.audio = AudioTitle::On {
+        muted: false,
+        counts: RingCounts {
+            overruns: 3,
+            underruns: 1,
+            drift_drops: 2,
+            drift_inserts: 0,
+            ..RingCounts::default()
+        },
+        ring: RingConfig::default(),
+    };
+    let title = compose(&f);
+    assert!(
+        title.contains("overruns 3, underruns 1, drift 2/0"),
+        "{title}"
+    );
+}
+
+/// The reason is the actionable part: "busy" is fixed by closing something, "gone" by plugging
+/// something in. The title carries the condition's own wording rather than a generic failure.
+#[test]
+fn unavailable_audio_says_why_rather_than_only_that_it_failed() {
+    let mut f = healthy(captured());
+    f.audio = AudioTitle::Unavailable("capture hw:8 is busy: Device or resource busy");
+    let title = compose(&f);
+    assert!(
+        title.contains("audio unavailable: capture hw:8 is busy: Device or resource busy"),
+        "{title}"
+    );
+}
+
+/// **Hardware defect D2.** A side that is still opening says so, and does not read as "on".
+///
+/// D2: an open that never returned logged nothing and raised no condition, so a side that had
+/// never opened was indistinguishable from one that was working — same title, same counters.
+/// The word "opening" is the whole of the difference a user sees while it lasts; past 4a's
+/// supervision limit it turns into an ordinary `audio unavailable:` with 4a's own wording.
+#[test]
+fn an_opening_side_says_so_rather_than_claiming_the_audio_is_on() {
+    let mut f = healthy(captured());
+    f.audio = AudioTitle::Opening("playback");
+    let opening = compose(&f);
+    assert!(
+        opening.contains("audio opening"),
+        "the title must say it is opening: {opening}"
+    );
+    assert!(
+        opening.contains("playback"),
+        "and which side, because the two are fixed in different places: {opening}"
+    );
+    assert!(
+        !opening.contains("audio on"),
+        "\"opening\" must not read as \"on\": that is the whole of D2: {opening}"
+    );
+    assert!(
+        !opening.contains("audio off"),
+        "nor as the deliberate --no-audio: {opening}"
+    );
+}
+
+/// An audio failure and a video failure are different failures and must be legible together. A
+/// title that let the audio segment displace the capture one would be hiding the more important
+/// of the two.
+#[test]
+fn an_audio_failure_never_displaces_a_video_or_serial_one() {
+    let mut f = healthy(captured());
+    f.pipeline = PipelineState::Reconnecting;
+    f.disconnected_for = Some(Duration::from_secs(5));
+    f.link_down = true;
+    f.link_down_for = Some(Duration::from_secs(5));
+    f.audio = AudioTitle::Unavailable("capture hw:8 is gone: No such device");
+    let title = compose(&f);
+    assert!(
+        title.contains("capture device gone, reconnecting (5s)"),
+        "{title}"
+    );
+    assert!(title.contains("serial DOWN, reconnecting"), "{title}");
+    assert!(title.contains("audio unavailable"), "{title}");
 }

@@ -1,4 +1,8 @@
 #nanokvm-sysfs 1
+# This desk, recorded 2026-09-10, plus the 2026-09-11 sound addendum: the `class/sound`
+# records (card0/1/2/3/8) were merged in from a later run, additions only, because the
+# sound class did not exist in snapshot-sysfs.py on 2026-09-10. Everything else is still
+# byte-for-byte the 2026-09-10 capture. See fixtures/sysfs/MANIFEST.md.
 l bus/usb/devices/1-0:1.0	../../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-0:1.0
 l bus/usb/devices/1-2	../../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-2
 l bus/usb/devices/1-2:1.0	../../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-2/1-2:1.0
@@ -65,9 +69,17 @@ l bus/usb/devices/usb6	../../../devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb
 l bus/usb/devices/usb7	../../../devices/pci0000:00/0000:00:08.3/0000:0c:00.0/usb7
 l bus/usb/devices/usb8	../../../devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb8
 l bus/usb/devices/usb9	../../../devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb9
+l class/sound/card0	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/sound/card0
+l class/sound/card1	../../devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card1
+l class/sound/card2	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.1/sound/card2
+l class/sound/card3	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.6/sound/card3
+l class/sound/card8	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/sound/card8
 l class/tty/ttyACM1	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.4/3-2.2.4:1.0/tty/ttyACM1
 l class/video4linux/video4	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.0/video4linux/video4
 l class/video4linux/video5	../../devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.0/video4linux/video5
+l devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card1/device	../..
+f devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card1/id	HDMI\n
+f devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.1/sound/card1/number	1\n
 f devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-0:1.0/bInterfaceClass	09\n
 f devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-0:1.0/bInterfaceNumber	00\n
 l devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.2/usb1/1-0:1.0/usb1-port1/peer	../../../usb2/2-0:1.0/usb2-port1
@@ -214,6 +226,9 @@ f devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb9/ma
 f devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb9/product	xHCI Host Controller\n
 f devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb9/serial	0000:09:00.0\n
 f devices/pci0000:00/0000:00:02.1/0000:05:00.0/0000:06:0c.0/0000:09:00.0/usb9/speed	20000\n
+l devices/pci0000:00/0000:00:08.1/0000:0b:00.1/sound/card2/device	../..
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.1/sound/card2/id	Generic\n
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.1/sound/card2/number	2\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-0:1.0/bInterfaceClass	09\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-0:1.0/bInterfaceNumber	00\n
 l devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-0:1.0/usb3-port1/peer	../../../usb4/4-0:1.0/usb4-port1
@@ -233,6 +248,9 @@ f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.1/bInterfaceNumber	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/bInterfaceClass	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/bInterfaceNumber	02\n
+l devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/sound/card8/device	../..
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/sound/card8/id	Video\n
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.2/sound/card8/number	8\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.3/bInterfaceClass	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.3/bInterfaceNumber	03\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2/3-2.2.2:1.4/bInterfaceClass	03\n
@@ -337,6 +355,9 @@ l devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-0:1.0/usb5-port1/peer	../.
 l devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-0:1.0/usb5-port2/peer	../../../usb6/6-0:1.0/usb6-port2
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/bInterfaceClass	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/bInterfaceNumber	00\n
+l devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/sound/card0/device	../..
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/sound/card0/id	Device\n
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.0/sound/card0/number	0\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.1/bInterfaceClass	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.1/bInterfaceNumber	01\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.1/5-1.1.1/5-1.1.1:1.2/bInterfaceClass	01\n
@@ -433,6 +454,9 @@ f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb6/manufacturer	Linux 7.2.2-arc
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb6/product	xHCI Host Controller\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb6/serial	0000:0b:00.4\n
 f devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb6/speed	10000\n
+l devices/pci0000:00/0000:00:08.1/0000:0b:00.6/sound/card3/device	../..
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.6/sound/card3/id	Generic_1\n
+f devices/pci0000:00/0000:00:08.1/0000:0b:00.6/sound/card3/number	3\n
 f devices/pci0000:00/0000:00:08.3/0000:0c:00.0/usb7/7-0:1.0/bInterfaceClass	09\n
 f devices/pci0000:00/0000:00:08.3/0000:0c:00.0/usb7/7-0:1.0/bInterfaceNumber	00\n
 l devices/pci0000:00/0000:00:08.3/0000:0c:00.0/usb7/7-0:1.0/usb7-port1/device	../../7-1

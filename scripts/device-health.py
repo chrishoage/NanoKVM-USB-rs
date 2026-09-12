@@ -2,12 +2,16 @@
 """Confirm the NanoKVM-USB is present, correctly paired, and answering.
 
 Run this before blaming your code. It checks, in order: both device nodes exist and are
-usable, they belong to the same physical dongle, and the CH9329 answers GET_INFO with a
+usable, they belong to the same physical dongle, the dongle's sound card is on that same USB
+device and offers the one format this client opens, and the CH9329 answers GET_INFO with a
 frame whose checksum recomputes.
 
 Uses only the standard library, and deliberately does not depend on anything under spikes/,
-which is throwaway Stage 0 code. Read-only apart from one GET_INFO request. Exits non-zero if
-anything is wrong.
+which is throwaway Stage 0 code. Read-only apart from one GET_INFO request.
+
+Exits non-zero for the nodes, the pairing and GET_INFO. **The audio checks are informational**
+and never fail the run: audio is a side channel (plan §4.1 rev 5), and a dongle with no sound
+card is a working KVM.
 
 Usage:  scripts/device-health.py [video-node] [tty-node]      (defaults: video4 ttyACM1)
 
@@ -123,6 +127,82 @@ def check_pairing(video, tty, report):
     return False
 
 
+def sound_card_of(usb_device):
+    """The ALSA card whose sysfs device is an interface of this USB device (plan §12 Stage 4a).
+
+    §8's evidence 1, and the only rule `discovery::audio_for` implements: the dongle's UAC
+    interfaces are interfaces of the *capture device itself*, so the card's `device` link resolves
+    up to the same USB device as the video node's. Not containment -- anything else plugged into
+    the dongle's own internal hub is contained by that hub too.
+
+    Returns (cardN, sysfs path) or None. Card numbers renumber on replug exactly as /dev names do,
+    so the number is read out of the directory name here and never assumed."""
+    base = "/sys/class/sound"
+    if not os.path.isdir(base):
+        return None
+    for name in sorted(os.listdir(base)):
+        if not name.startswith("card") or not name[4:].isdigit():
+            continue
+        link = os.path.join(base, name, "device")
+        if not os.path.exists(link):
+            continue
+        if usb_device_of(link) == usb_device:
+            return name, os.path.realpath(os.path.join(base, name))
+    return None
+
+
+# What /proc/asound/cardN/stream0 must say. Measured on this desk 2026-09-11: the dongle offers
+# one capture stream and exactly one format, so anything else means this is not that card.
+AUDIO_FORMAT = (("Format: S16_LE", "S16_LE"),
+                ("Channels: 2", "2 channels"),
+                ("Rates: 48000", "48000 Hz"))
+
+
+def check_audio(video, report):
+    """The paired sound card exists and offers the one format §12 Stage 4a expects.
+
+    Read-only, and it opens **nothing**: the card's identity comes from sysfs and its format from
+    /proc/asound, neither of which disturbs a device. Opening the PCM would take it away from
+    whatever is recording from it, which is the opposite of a health check.
+
+    **Informational, whatever it finds.** `report` here is the caller's `note`, not its `report`:
+    plan §4.1 rev 5 makes audio a side channel, and a dongle whose audio interface is unbound, or
+    a kernel without snd-usb-audio, is a fully working KVM. Exiting non-zero for it would make
+    this script refuse to bless a desk that is fine, and would train whoever runs it to ignore the
+    exit code. Video, serial and GET_INFO are what decide that."""
+    usb = usb_device_of(f"/sys/class/video4linux/{video}/device")
+    if not usb:
+        report(False, "audio card", "could not resolve the video node to its USB device")
+        return False
+    found = sound_card_of(usb)
+    if not found:
+        report(False, "audio card", f"no sound card belongs to {os.path.basename(usb)}; is "
+                                    "snd-usb-audio loaded?")
+        return False
+    card, _ = found
+    number = card[4:]
+    report(True, "audio card", f"{card} (hw:{number}) on {os.path.basename(usb)} "
+                               f"-- same USB device as the capture node, proof")
+
+    stream = f"/proc/asound/{card}/stream0"
+    try:
+        text = open(stream).read()
+    except OSError as e:
+        report(False, "audio format", f"{stream}: {e}")
+        return False
+    if "Capture:" not in text:
+        report(False, "audio format", f"{stream} declares no capture stream")
+        return False
+    missing = [label for needle, label in AUDIO_FORMAT if needle not in text]
+    if missing:
+        report(False, "audio format",
+               f"{stream} does not declare {', '.join(missing)} -- this client opens hw:{number} "
+               "with exactly S16_LE/2ch/48000 and nothing else")
+        return False
+    report(True, "audio format", "S16_LE, 2 channels, 48000 Hz capture (stream0)")
+    return True
+
+
 def get_info(tty, report):
     path = f"/dev/{tty}"
     try:
@@ -187,6 +267,10 @@ def main():
         if not ok:
             failures.append(label)
 
+    def note(ok, label, detail):
+        """Report without a verdict. For the side channel: seen, said, not counted."""
+        print(f"  [{'ok' if ok else 'note'}] {label:16} {detail}")
+
     print(f"NanoKVM-USB health check: /dev/{video}, /dev/{tty}\n")
 
     for node in (f"/dev/{video}", f"/dev/{tty}"):
@@ -199,6 +283,10 @@ def main():
 
     if not failures:
         check_pairing(video, tty, report)
+        # Audio before GET_INFO: it opens nothing and cannot disturb anything, and a missing card
+        # is worth reporting even on a desk whose serial link has wedged. It is reported through
+        # `note`, so nothing it finds can fail this script -- see `check_audio`.
+        check_audio(video, note)
         get_info(tty, report)
 
     print()

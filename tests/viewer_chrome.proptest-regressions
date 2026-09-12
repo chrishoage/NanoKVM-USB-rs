@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 10182e5a8377217152942a5efda394a9ab41c72dd0ffe72eaa3eafc723b6c89c # shrinks to i = RouteInputs { capture: Released, pointer: Absolute, popover_open: false, modal_open: false, pointer_over_chrome: false, paste_running: true, pointer_locked: false, outstanding: Outstanding { modifiers: 0, usages: [0, 0, 0, 0], buttons: 0 } }, key = Modifier(1)
+cc 81b67872c8b9561abc8375167f502c4976a701b596c2bea55288e427b4e83d03 # shrinks to i = RouteInputs { capture: Released, pointer: Absolute, popover_open: false, modal_open: true, pointer_over_chrome: false, paste_running: false, pointer_locked: false, outstanding: Outstanding { modifiers: 0, usages: [0, 0, 0, 0], buttons: 0 } }, mask = 1

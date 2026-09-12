@@ -189,6 +189,16 @@ impl Writer {
                 self.acquire(false);
                 continue;
             }
+            // A fresh `GET_INFO` was asked for (§12 Stage 4c). Serviced **here**, between frames
+            // and on this thread, for the same reason every write is: the writer is the sole
+            // serialization point (§2.6), and a second thread transacting on the link would
+            // interleave two frames on a chip with no inter-byte timeout (§5.1). `continue` rather
+            // than falling through, so a cancellation that arrived while the reply was in flight
+            // is seen at the top of the loop before anything is dequeued.
+            if self.shared.refresh_info.load(Ordering::SeqCst) {
+                self.refresh_device_info();
+                continue;
+            }
             // (3) Dequeue one entry.
             let Some(entry) = self.next_entry() else {
                 continue;
@@ -237,8 +247,9 @@ impl Writer {
             || self.shared.shutting_down.load(Ordering::SeqCst)
     }
 
-    /// Block until there is an entry, a cancellation, a shutdown — or the transport reports itself
-    /// gone. Returns `None` when the caller should re-run the checks at the top of the loop.
+    /// Block until there is an entry, a cancellation, a shutdown, a `GET_INFO` refresh request —
+    /// or the transport reports itself gone. Returns `None` when the caller should re-run the
+    /// checks at the top of the loop.
     ///
     /// **The wait is bounded** ([`LINK_HEALTH_POLL`]), and every wake asks the link whether it is
     /// still there. Without that this is where an idle writer sits for ever: nothing is queued, so
@@ -251,6 +262,12 @@ impl Writer {
                 let mut q = lock(&self.shared.queue);
                 if self.shared.cancel.load(Ordering::SeqCst)
                     || self.shared.shutting_down.load(Ordering::SeqCst)
+                    // §12 Stage 4c. Without this an **idle** writer never services a refresh: it
+                    // parks in this loop, and the loop only leaves it for an entry or a failure.
+                    // The request is a wake-up like any other, and the check belongs where the
+                    // other two are — under the queue lock every trigger also takes, so a flag set
+                    // between the test and the wait cannot lose its wake-up.
+                    || self.shared.refresh_info.load(Ordering::SeqCst)
                 {
                     return None;
                 }
@@ -599,11 +616,20 @@ impl Writer {
                 self.cancellation_sequence();
                 continue;
             }
+            // §12 Stage 4c: a refresh asked for while the writer is hunting for a link is answered
+            // here, without a transport — `refresh_device_info` sees `link_down` and records that
+            // nobody could ask. Otherwise a caller waiting on the generation waits out the whole
+            // reconnect ladder, which for a cable that is not coming back is for ever.
+            if self.shared.refresh_info.load(Ordering::SeqCst) {
+                self.refresh_device_info();
+                continue;
+            }
             let q = lock(&self.shared.queue);
             // Re-read under the lock, which every trigger also takes: without this the flag could
             // be set between the checks above and the wait below, and the wake-up lost.
             if self.shared.shutting_down.load(Ordering::SeqCst)
                 || self.shared.cancel.load(Ordering::SeqCst)
+                || self.shared.refresh_info.load(Ordering::SeqCst)
             {
                 continue;
             }
@@ -739,6 +765,56 @@ impl Writer {
             .transact(cmd::GET_INFO, &[], timeout)
             .map_err(Rejected::GetInfo)?;
         DeviceInfo::parse(&reply.data).map_err(Rejected::Parse)
+    }
+
+    /// Ask the device for its current `GET_INFO` and publish it (§12 Stage 4c).
+    ///
+    /// The flag is cleared **first**, so a request that arrives while this transaction is in
+    /// flight is not swallowed by the clear: it survives as a second request and is serviced on
+    /// the next pass. The generation is advanced on every completed attempt, successful or not, so
+    /// a caller waiting for it cannot be wedged by a device that will not answer — it sees the
+    /// generation move and `device_info` unchanged, which is the honest report of "asked, and this
+    /// is still the newest answer there is".
+    ///
+    /// **A failed transaction here does not end the session.** This is a read-only convenience —
+    /// no keystroke of the user's depends on it — and one timed-out `GET_INFO` is not evidence
+    /// that the transport is gone: the chip pushes unsolicited frames, and a reply that did not
+    /// arrive in time is a degraded link rather than a dead one. Escalating it to a
+    /// `ReleaseReason::LinkDown` cancellation would take a user's capture away on behalf of a menu
+    /// item that only wanted to know whether CapsLock was on. What it does instead is record the
+    /// failure, which makes the reading **stale** and makes the paste refuse rather than type
+    /// through an unknown lock state (D2, `chrome::paste`); if the link really has failed, the
+    /// next write finds it and §2.6.1 runs on the path that owns that decision.
+    fn refresh_device_info(&mut self) {
+        self.shared.refresh_info.store(false, Ordering::SeqCst);
+        if self.shared.link_down.load(Ordering::SeqCst) {
+            self.shared.note_info_refresh_failed();
+            return;
+        }
+        let timeout = self.reconnect_cfg.get_info_timeout;
+        let Some(link) = self.link.as_mut() else {
+            self.shared.note_info_refresh_failed();
+            return;
+        };
+        match link.transact(cmd::GET_INFO, &[], timeout) {
+            Ok(reply) => match DeviceInfo::parse(&reply.data) {
+                Ok(info) => {
+                    log::debug!("device info refreshed on request: {info}");
+                    self.shared.publish_device_info(info);
+                }
+                Err(e) => {
+                    log::warn!("the refreshed GET_INFO reply was unusable: {e}");
+                    self.shared.note_info_refresh_failed();
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "the refresh GET_INFO did not answer: {e}. The session is left engaged; the \
+                     reading is stale, which is what a paste refuses on"
+                );
+                self.shared.note_info_refresh_failed();
+            }
+        }
     }
 
     // ---------------------------------------------------------------- report emission

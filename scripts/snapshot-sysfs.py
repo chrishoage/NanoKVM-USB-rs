@@ -14,6 +14,7 @@ casing:
     OUTDIR/bus/usb/devices/3-2.2.2   -> relative symlink into devices/
     OUTDIR/class/video4linux/video4  -> relative symlink into devices/
     OUTDIR/class/tty/ttyACM1         -> relative symlink into devices/
+    OUTDIR/class/sound/card8         -> relative symlink into devices/
 
 Every symlink is written relative, so the tree can be committed, moved and checked out anywhere.
 Only the attributes discovery reads are copied, so the result is a few hundred small files and no
@@ -24,9 +25,16 @@ git. The same tree also serialises to **one line-oriented text file** (`.sysfs`)
 is committed; `fixtures/sysfs/synthesize.py` expands it back before the tests run.
 
     #nanokvm-sysfs 1            header, first line
+    # anything else               a comment, ignored on read
     d <path>                    a directory with nothing in it (an unoccupied hub port)
     f <path>\t<value>           an attribute file and its exact contents
     l <path>\t<target>          a symlink and its target, verbatim (always relative)
+
+Comments exist so a file's provenance can live in the file. A recording that is not a single
+run -- `usb2-desk.sysfs` is 2026-09-10 plus a 2026-09-11 sound addendum -- has to say so where
+the next person opens it, not only in MANIFEST.md. They are **not** preserved by a re-record:
+`write_snapshot` writes the header and the records, so re-add the comment by hand afterwards
+(MANIFEST.md's "Re-recording this desk" says the same).
 
 Paths are relative to the tree root and sorted bytewise, so the file diffs one device at a
 time. Values, targets and paths are escaped to pure ASCII -- `\\`, `\t`, `\n`, `\r` and `\xNN`
@@ -48,15 +56,21 @@ import sys
 import tempfile
 
 # What discovery reads, plus enough identification for a human reading the fixture.
+# `id` and `number` are the ALSA card's: discovery reads `id` for the `hw:CARD=` spelling, and
+# `number` is recorded so a reader can check it against the `cardN` directory name that the card
+# number is actually derived from (plan §12 Stage 4a).
 ATTRS = [
     "idVendor", "idProduct", "product", "manufacturer", "serial",
     "busnum", "devnum", "speed", "bDeviceClass",
     "bInterfaceNumber", "bInterfaceClass",
     "name", "dev", "index",
+    "id", "number",
 ]
 
-# Class directories discovery scans, with the name prefix it cares about.
-CLASSES = [("video4linux", "video"), ("tty", "ttyACM")]
+# Class directories discovery scans, with the name prefix it cares about. `/sys/class/sound`
+# holds `controlCN`, `pcmCNDMc`, `seq` and `timer` alongside the cards; only `cardN` is a card,
+# and only `cardN` is what `discovery::collect_sound_cards` looks at.
+CLASSES = [("video4linux", "video"), ("tty", "ttyACM"), ("sound", "card")]
 
 
 class Snapshot:
@@ -145,7 +159,15 @@ class Snapshot:
                 self.link(os.path.join(self.out, "class", cls, name), real)
                 device = os.path.join(real, "device")
                 if os.path.islink(device):
-                    self.link(os.path.join(dst, "device"), os.path.realpath(device))
+                    target = os.path.realpath(device)
+                    # Capture the link's target as well, so the link survives `write_links`'s
+                    # "only link to things that were actually captured" rule even when the target
+                    # is not a USB device. A PCI sound card resolves to a PCI device directory
+                    # that `usb_devices()` never walks; without this it would land in the fixture
+                    # as a *dangling* `device` link, and discovery would then reject it for the
+                    # wrong reason -- a missing link rather than a walk that finds no `idVendor`.
+                    self.capture(target)
+                    self.link(os.path.join(dst, "device"), target)
                 found.append((cls, name, real))
         return found
 
@@ -248,15 +270,19 @@ def write_snapshot(records, path):
 
 
 def expand(snapshot, treedir):
-    """Materialise a snapshot file as a directory tree. Creates `treedir` if it is missing."""
+    """Materialise a snapshot file as a directory tree. Creates `treedir` if it is missing.
+
+    Returns the number of records applied -- comments and blank lines are neither."""
     with open(snapshot) as fh:
         lines = fh.read().splitlines()
     if not lines or lines[0] != HEADER:
         raise ValueError("%s: not a %s snapshot" % (snapshot, HEADER))
     os.makedirs(treedir, exist_ok=True)
+    applied = 0
     for n, line in enumerate(lines[1:], start=2):
         if not line or line.startswith("#"):
             continue
+        applied += 1
         kind, rest = line[0], line[2:]
         path, _, payload = rest.partition("\t")
         dst = os.path.join(treedir, unesc(path).decode())
@@ -273,7 +299,7 @@ def expand(snapshot, treedir):
             os.symlink(unesc(payload).decode(), dst)
         else:
             raise ValueError("%s:%d: unknown record type %r" % (snapshot, n, kind))
-    return len(lines) - 1
+    return applied
 
 
 def read(path):

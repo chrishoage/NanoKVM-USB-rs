@@ -12,7 +12,7 @@
 //!   layout and is not part of Stage 1.
 
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 
 use crate::input::Event;
 use crate::proto::keymap::hid_key;
@@ -34,6 +34,9 @@ pub enum KeyAction {
     Forward { key: HidKey, down: bool },
     /// The release key was pressed: leave capture. Never forwarded (§12 Stage 1).
     Release,
+    /// The release key was pressed **with Shift held**: paste the clipboard into the target
+    /// (§12 Stage 4c). Never forwarded either — it is the same physical key.
+    Paste,
     /// Deliberately swallowed: a host auto-repeat (§2.5), or the release key's own key-up.
     Swallowed,
     /// A physical key this client does not map. Counted and logged; the target never sees it.
@@ -50,7 +53,25 @@ pub enum KeyAction {
 /// target cannot see half of it. Everything else goes through the keymap; a key with no HID usage
 /// is [`KeyAction::Unmapped`] rather than an error, because a key that maps to nothing is simply
 /// never sent.
-pub fn map_key(physical_key: PhysicalKey, state: ElementState, repeat: bool) -> KeyAction {
+///
+/// # The paste chord (§12 Stage 4c)
+///
+/// `Shift+Pause` is [`KeyAction::Paste`] and bare `Pause` is still [`KeyAction::Release`], so the
+/// never-forwarded surface stays **one key** — which is the whole reason §12 Stage 4c puts the
+/// trigger on a chord of the key already reserved rather than on a second one. Only Shift is
+/// examined: Ctrl+Pause, Alt+Pause and Super+Pause are the release, because a user reaching for
+/// the way out with a modifier still down must get the way out.
+///
+/// `modifiers` is the host's modifier state as winit last reported it in `ModifiersChanged`, which
+/// is the same state the target is being sent — the Shift of the chord was forwarded as an
+/// ordinary key-down before the Pause arrived, which is exactly why the paste job begins by
+/// releasing what the target holds (`chrome::paste`).
+pub fn map_key(
+    physical_key: PhysicalKey,
+    state: ElementState,
+    repeat: bool,
+    modifiers: ModifiersState,
+) -> KeyAction {
     // §2.5: discard host repeat before anything else, including the release key — a held release
     // key must not re-trigger release once per repeat.
     if repeat {
@@ -60,9 +81,12 @@ pub fn map_key(physical_key: PhysicalKey, state: ElementState, repeat: bool) -> 
         return KeyAction::Unmapped;
     };
     if code == KeyCode::Pause {
-        return match state {
-            ElementState::Pressed => KeyAction::Release,
-            ElementState::Released => KeyAction::Swallowed,
+        return match (state, modifiers.shift_key()) {
+            (ElementState::Pressed, true) => KeyAction::Paste,
+            (ElementState::Pressed, false) => KeyAction::Release,
+            // Both halves of both bindings are swallowed, so the target can never see half a
+            // keypress — including the case where Shift is let go between the press and the up.
+            (ElementState::Released, _) => KeyAction::Swallowed,
         };
     }
     match hid_key(code) {
@@ -213,7 +237,16 @@ mod tests {
     use winit::keyboard::{NativeKeyCode, PhysicalKey};
 
     fn key(code: KeyCode, state: ElementState, repeat: bool) -> KeyAction {
-        map_key(PhysicalKey::Code(code), state, repeat)
+        map_key(
+            PhysicalKey::Code(code),
+            state,
+            repeat,
+            ModifiersState::empty(),
+        )
+    }
+
+    fn key_with(code: KeyCode, state: ElementState, modifiers: ModifiersState) -> KeyAction {
+        map_key(PhysicalKey::Code(code), state, false, modifiers)
     }
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
@@ -301,9 +334,85 @@ mod tests {
             map_key(
                 PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
                 ElementState::Pressed,
-                false
+                false,
+                ModifiersState::empty(),
             ),
             KeyAction::Unmapped
+        );
+    }
+
+    /// §12 Stage 4c: the paste chord is `Shift+Pause`, and **bare Pause is still the release**.
+    /// Both are on one physical key, so the never-forwarded surface does not grow.
+    #[test]
+    fn shift_pause_is_the_paste_chord_and_bare_pause_is_still_the_release() {
+        assert_eq!(
+            key_with(KeyCode::Pause, ElementState::Pressed, ModifiersState::SHIFT),
+            KeyAction::Paste
+        );
+        assert_eq!(
+            key_with(
+                KeyCode::Pause,
+                ElementState::Pressed,
+                ModifiersState::empty()
+            ),
+            KeyAction::Release
+        );
+    }
+
+    /// Every other modifier leaves the release alone: a user reaching for the way out with Ctrl
+    /// still down must get the way out.
+    #[test]
+    fn only_shift_makes_pause_a_paste() {
+        for modifiers in [
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            ModifiersState::SUPER,
+            ModifiersState::CONTROL | ModifiersState::ALT,
+        ] {
+            assert_eq!(
+                key_with(KeyCode::Pause, ElementState::Pressed, modifiers),
+                KeyAction::Release,
+                "{modifiers:?}"
+            );
+        }
+        // Shift plus anything else is still the paste chord: the rule is "is Shift held".
+        assert_eq!(
+            key_with(
+                KeyCode::Pause,
+                ElementState::Pressed,
+                ModifiersState::SHIFT | ModifiersState::CONTROL
+            ),
+            KeyAction::Paste
+        );
+    }
+
+    /// The up of the paste chord is swallowed like the up of the release, in every modifier state
+    /// — including one where Shift was let go between the press and the up, which is what a user
+    /// who types the chord quickly actually produces.
+    #[test]
+    fn the_paste_chords_key_up_is_never_forwarded() {
+        for modifiers in [ModifiersState::SHIFT, ModifiersState::empty()] {
+            assert_eq!(
+                key_with(KeyCode::Pause, ElementState::Released, modifiers),
+                KeyAction::Swallowed,
+                "{modifiers:?}"
+            );
+        }
+    }
+
+    /// A held paste chord does not re-trigger, for the same reason a held release key does not
+    /// (§2.5): the host repeats, the target's own OS does not need it, and a paste per repeat
+    /// would be a queue of pastes.
+    #[test]
+    fn a_held_paste_chord_does_not_retrigger() {
+        assert_eq!(
+            map_key(
+                PhysicalKey::Code(KeyCode::Pause),
+                ElementState::Pressed,
+                true,
+                ModifiersState::SHIFT
+            ),
+            KeyAction::Swallowed
         );
     }
 

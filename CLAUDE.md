@@ -5,8 +5,9 @@ niri on Wayland.
 
 ## Read this first, and not more than this
 
-1. `docs/NATIVE_CLIENT_PLAN.md` — the design of record, currently **rev 4**. Start at §0.2, which
-   lists what Stage 0 measurement changed.
+1. `docs/NATIVE_CLIENT_PLAN.md` — the design of record, currently **rev 5**. Start at §0.2, which
+   lists what Stage 0 measurement changed, and §0.3, which lists what rev 5 changed about Stage 4
+   (audio, the egui chrome, clipboard paste; RFB and recording dropped).
 2. `docs/STAGE0_FINDINGS.md` — the evidence index and the 19 amendments.
 3. `docs/STAGE1_FINDINGS.md` — what building Stage 1 changed: the amendments B1–B7 the plan still
    needs, the module/test inventory, and the hardware numbers (taken on a USB 2.0 link).
@@ -17,6 +18,9 @@ niri on Wayland.
    (`devices`, `shot`, `key`, `type`, `macro`), the two blind adversarial reviews, and the
    hardware verification — by consequence, as always: a lock bit read back, the typed line on the
    target's screen.
+6. `docs/STAGE4_FINDINGS.md` — what Stage 4 changed: amendments E1–E20, audio/chrome/paste as
+   built, the three rounds of blind review, and the hardware verification — the 1 kHz tone in the
+   captured PCM, the drift in ppm, and the pasted clipboard's md5 on the target's screen.
 
 Raw per-spike evidence runs to roughly 3500 lines and **lives on the `stage-0` branch**, under
 `docs/stage0/`, alongside the throwaway spike crates in `spikes/`. **Do not read it up front.**
@@ -36,6 +40,7 @@ tomorrow. `nanokvm devices` prints what discovery currently sees.
 | | Identity (stable) | Today's names |
 | --- | --- | --- |
 | The dongle | a `1a40:0101` internal hub with `345f:2133` video and `1a86:55d3` serial as its direct children | `/dev/video4` + `/dev/video5`, `/dev/ttyACM1` |
+| The dongle's sound card | the USB Audio Class interface `1.2` of `345f:2133` — the **same USB device** as the capture node, which is why §8's strongest rule pairs it | `card8`, `hw:8` |
 | The user's hardware | **everything on USB bus 5** — the dock, carrying a Logitech webcam and an unrelated CDC-ACM device | `/dev/video0`–`3`, `/dev/ttyACM0` |
 | Target | A Raspberry Pi 3B running the Raspberry Pi OS desktop at 1080p | — |
 
@@ -44,6 +49,10 @@ tomorrow. `nanokvm devices` prints what discovery currently sees.
   a number.
 - Of the dongle's two video nodes, one is the capture node and the other is a metadata sibling.
   Which is which is decided by `VIDIOC_QUERYCAP`, never by the number (`discovery::probe`).
+- **Identify the sound card by sysfs, never by number.** Card numbers renumber on replug exactly
+  as `/dev` names do, and the desk's other four cards (three PCI codecs and a bus-5 USB card) are
+  in the same class directory. `hw:<N>` is parsed out of `/sys/class/sound/card<N>` at open time
+  and never remembered; `nanokvm devices` prints the pairing and its evidence.
 - **Never match on the product string.** The video interface calls itself "USB2 Video" on a USB
   2.0 link and "USB3 Video" on SuperSpeed — the same unit, the same `345f:2133`, a different
   name depending on which port it is in. The model is **Pro 4K60**, measured.
@@ -104,16 +113,32 @@ tomorrow. `nanokvm devices` prints what discovery currently sees.
   `nanokvm devices` without `--probe` opens no serial node — its only device access is
   discovery's read-only `QUERYCAP`. Use them to check a script, or the desk, before touching
   hardware.
+- **The viewer has hidden dev flags** for the things nothing on this desk may drive: besides
+  `--exit-after` and `--sysfs-root`, there are `--chrome-popover <Video|Keyboard|Mouse|Audio>`
+  (opens a popover so its cost can be measured), `--capture-on-start`, `--paste-on-capture`
+  (implies the former) and `--paste-cancel-after-ms <MS>` (feeds the real release key, not a
+  private cancel). All are viewer-only and are refused alongside a subcommand like every other
+  viewer flag. Use them rather than inventing a second code path for a measurement.
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy --all-targets
   --features hardware -- -D warnings` and `cargo test` must all be clean before anything is
   called done. The second clippy run matters because the hardware tests only compile under that
   feature, so nothing else ever type-checks them.
 - `cargo test` runs everything that needs no hardware, including the keyboard-command tests in
   `tests/cli_keys.rs` (they drive the built binary against a pty fake, not the dongle).
+  `cargo test --test viewer_chrome_ui -- --ignored` runs the four wgpu snapshot tests against
+  `tests/snapshots/*.png`; they are `#[ignore]`d because they need a real adapter (a GPU or
+  lavapipe), and the baseline PNGs are committed while the `.new`/`.diff`/`.old` ones are not.
   Hardware tests are behind `--features hardware` and `#[ignore]`; run them one binary at a time
   with `--test-threads=1`, e.g. `cargo test --features hardware --test serial_hardware --test
-  capture_hardware -- --ignored --nocapture --test-threads=1`. They toggle the target's CapsLock
-  twice and stream from the video node; they never click.
+  capture_hardware --test audio_hardware -- --ignored --nocapture --test-threads=1` (add
+  `--skip drift_over_ten_minutes`, which takes twelve minutes and is measured already). They
+  toggle the target's CapsLock twice, stream from the video node and open the sound card; they
+  never click.
+- **The viewer persists settings to `$XDG_CONFIG_HOME/nanokvm/config.toml`** (falling back to
+  `$HOME/.config`). Any hardware test or desk run that starts the shipped binary must point
+  `XDG_CONFIG_HOME` at a scratch directory, or it writes the user's own settings — one already
+  did. Avoid the word "audio" in that path: `XDG_CONFIG_HOME` also redirects the Vulkan loader's
+  layer search, which prints the paths it looked in.
 - `fixtures/packets/ch9329.toml` is the **authority** for protocol tests (§9.1). Tests must
   read it, never retype the bytes — retyping is how a transcription bug silently blesses a
   wrong encoder.

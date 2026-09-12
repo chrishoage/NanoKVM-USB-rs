@@ -35,6 +35,7 @@ use winit::window::Window;
 
 use crate::capture::v4l2::now_monotonic;
 use crate::capture::{DecodedFrame, Slot};
+use crate::viewer::chrome::frame::{ChromeFrame, ChromeReceiver};
 
 /// How long the render thread waits for a frame before looking at its other work (§5.2: it takes
 /// whatever is pending, it never drains a queue).
@@ -122,12 +123,23 @@ pub struct RenderStats {
     pub age_p50_us: u64,
     /// Longest capture-to-submit age in the interval.
     pub age_max_us: u64,
+    /// Median cost of the chrome's share of a frame, microseconds: `update_texture` for every
+    /// pending atlas delta, `update_buffers`, and `Renderer::render` into the pass — measured
+    /// around exactly those calls and nothing else (§12 Stage 4b asks for the chrome's per-frame
+    /// cost *next to* the Stage 1 number, which is what this separates out).
+    ///
+    /// Zero while no chrome frame has arrived; the samples are only taken when there is chrome to
+    /// draw, so a median of 0 means "not drawn", not "free".
+    pub egui_p50_us: u64,
+    /// Longest chrome draw in the interval.
+    pub egui_max_us: u64,
 }
 
 #[derive(Default)]
 struct StatsInner {
     present_us: VecDeque<u64>,
     age_us: VecDeque<u64>,
+    egui_us: VecDeque<u64>,
     presented: u64,
     surface_recoveries: u64,
 }
@@ -259,6 +271,7 @@ impl RenderShared {
         let mut s = lock(&self.stats);
         let mut present: Vec<u64> = s.present_us.drain(..).collect();
         let mut age: Vec<u64> = s.age_us.drain(..).collect();
+        let mut egui: Vec<u64> = s.egui_us.drain(..).collect();
         let out = RenderStats {
             presented: s.presented,
             surface_recoveries: s.surface_recoveries,
@@ -266,6 +279,8 @@ impl RenderShared {
             present_max_us: present.iter().copied().max().unwrap_or(0),
             age_p50_us: percentile(&mut age, 0.50),
             age_max_us: age.iter().copied().max().unwrap_or(0),
+            egui_p50_us: percentile(&mut egui, 0.50),
+            egui_max_us: egui.iter().copied().max().unwrap_or(0),
         };
         s.presented = 0;
         s.surface_recoveries = 0;
@@ -296,6 +311,11 @@ pub struct Gpu {
     /// `None` until the first frame arrives. Recreated whenever the frame dimensions change,
     /// which they can at any time (§6, A6).
     texture: Option<VideoTexture>,
+    /// The chrome's renderer (§12 Stage 4b). This thread owns **only** the renderer: the
+    /// `egui::Context`, the UI build and the tessellation are on the event loop, because the
+    /// routing rule needs the chrome's state synchronously while an input event is in hand
+    /// (§5.4; `viewer::chrome`'s module docs).
+    egui: egui_wgpu::Renderer,
 }
 
 struct VideoTexture {
@@ -518,6 +538,21 @@ impl Gpu {
             ..Default::default()
         });
 
+        // sRGB is handled for us: `Renderer::new` selects its gamma or linear framebuffer shader
+        // from `output_color_format.is_srgb()`, and `format` above prefers an sRGB surface — so
+        // passing it is correct and no colour correction of our own is wanted.
+        let egui = egui_wgpu::Renderer::new(
+            &device,
+            format,
+            egui_wgpu::RendererOptions {
+                // No MSAA: egui feathers its own edges, and there is no 3D embedded in this UI.
+                msaa_samples: 1,
+                // The video pass has no depth or stencil attachment, and egui needs neither.
+                depth_stencil_format: None,
+                ..Default::default()
+            },
+        );
+
         Ok(Gpu {
             window,
             surface,
@@ -528,6 +563,7 @@ impl Gpu {
             bind_layout,
             sampler,
             texture: None,
+            egui,
         })
     }
 
@@ -634,7 +670,12 @@ impl Gpu {
     ///
     /// Returns the video rectangle that was drawn, or `None` if there is no image yet. The
     /// caller times `present()` around this — the block is the point (§5.4).
-    fn draw(&mut self, shared: &RenderShared, captured_at: Option<Duration>) -> DrawOutcome {
+    fn draw(
+        &mut self,
+        shared: &RenderShared,
+        captured_at: Option<Duration>,
+        chrome: Option<&mut ChromeFrame>,
+    ) -> DrawOutcome {
         let acquired = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Timeout) => return DrawOutcome::Skipped,
@@ -667,6 +708,57 @@ impl Gpu {
             .texture
             .as_ref()
             .and_then(|t| letterbox((self.config.width, self.config.height), (t.width, t.height)));
+
+        // The chrome's own timing, measured around exactly its three calls and nothing else.
+        let mut egui_us = 0u64;
+        let mut egui_cbs: Vec<wgpu::CommandBuffer> = Vec::new();
+        let mut egui_free: Vec<egui::TextureId> = Vec::new();
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: chrome.as_ref().map_or(1.0, |c| c.pixels_per_point),
+        };
+        // Upload the atlas deltas and the vertex buffers **before** the pass begins: both encode
+        // copies, and a pass in progress forbids that.
+        //
+        // A frame laid out for a different surface size is **skipped, not scaled**: between a
+        // resize and the next chrome build the retained frame belongs to the old surface, and
+        // drawing it would put the pill at the wrong place — over the video, on a window the user
+        // is still dragging. Skipping costs at most one frame of a stale pill not appearing: the
+        // event loop marks the chrome dirty on `Resized` and rebuilds at the new size. The
+        // frame's texture deltas are deliberately left untouched, so nothing is lost from the
+        // atlas (`chrome::frame`'s module docs).
+        let surface = (self.config.width, self.config.height);
+        let chrome = match chrome {
+            Some(c) if !chrome_fits_surface(c.size_in_pixels, surface) => {
+                log::debug!(
+                    "render: chrome frame is {:?} but the surface is {surface:?}; skipping it \
+                     this pass",
+                    c.size_in_pixels
+                );
+                None
+            }
+            Some(c) if !c.primitives.is_empty() => {
+                let t0 = Instant::now();
+                for (id, delta) in std::mem::take(&mut c.textures_delta.set) {
+                    self.egui
+                        .update_texture(&self.device, &self.queue, id, &delta);
+                }
+                // Freed only *after* painting, per `FullOutput::textures_delta`'s own contract:
+                // the frame being drawn may still reference a texture this delta retires.
+                egui_free = std::mem::take(&mut c.textures_delta.free);
+                egui_cbs = self.egui.update_buffers(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &c.primitives,
+                    &screen,
+                );
+                egui_us += t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                Some(&*c)
+            }
+            _ => None,
+        };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nanokvm-video-pass"),
@@ -693,9 +785,34 @@ impl Gpu {
                     pass.draw(0..3, 0..1);
                 }
             }
+            // **The chrome draws after the video, in this pass, and the order is load-bearing.**
+            // The video quad sets a letterboxed viewport; `Renderer::render` sets its own viewport
+            // and resets only the *scissor* when it is done, never the viewport. Drawing egui
+            // first — or reusing this pass for the video afterwards — would letterbox the chrome
+            // into the video rectangle. `forget_lifetime` is what `Renderer::render`'s
+            // `&mut RenderPass<'static>` requires; the pass is dropped at the end of this block
+            // either way.
+            if let Some(c) = chrome {
+                let t0 = Instant::now();
+                let mut pass = pass.forget_lifetime();
+                self.egui.render(&mut pass, &c.primitives, &screen);
+                egui_us += t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            }
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        // egui's staging buffers must be submitted ahead of the encoder that reads them.
+        self.queue.submit(
+            egui_cbs
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        for id in egui_free {
+            self.egui.free_texture(&id);
+        }
+        if egui_us > 0 {
+            let mut st = lock(&shared.stats);
+            StatsInner::push(&mut st.egui_us, egui_us);
+        }
         // §5.5: capture-to-submit age, measured at submit and named nothing more than that.
         if let Some(t) = captured_at {
             let age = now_monotonic().saturating_sub(t);
@@ -736,10 +853,11 @@ pub fn spawn(
     gpu: Gpu,
     frames: Arc<Slot<DecodedFrame>>,
     shared: Arc<RenderShared>,
+    chrome: ChromeReceiver,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("nanokvm-render".to_string())
-        .spawn(move || render_loop(gpu, &frames, &shared))
+        .spawn(move || render_loop(gpu, &frames, &shared, &chrome))
 }
 
 /// What one pass of the render loop decided.
@@ -756,6 +874,10 @@ struct Passes {
     /// Whether there is anything new to draw. Starts `true` so the first pass paints the empty
     /// clear colour rather than leaving a blank surface.
     pending: bool,
+    /// The newest chrome, **retained** across passes so a redraw caused by a video frame still
+    /// carries the pill. Its `textures_delta` is drained by the draw that applies it; its
+    /// `primitives` stay until the event loop sends a new frame.
+    chrome: Option<ChromeFrame>,
 }
 
 /// Raises [`RenderShared`]'s finished flag however the thread leaves — returning, breaking, or
@@ -782,15 +904,21 @@ impl Drop for FinishGuard<'_> {
 /// below holds an invariant across the boundary, the mutexes are recovered from poison by design
 /// (see the module docs), and the loop stops on the first panic rather than carrying on over
 /// possibly-torn state.
-fn render_loop(mut gpu: Gpu, frames: &Arc<Slot<DecodedFrame>>, shared: &Arc<RenderShared>) {
+fn render_loop(
+    mut gpu: Gpu,
+    frames: &Arc<Slot<DecodedFrame>>,
+    shared: &Arc<RenderShared>,
+    chrome: &ChromeReceiver,
+) {
     let _finished = FinishGuard(shared);
     let mut passes = Passes {
         captured_at: None,
         pending: true,
+        chrome: None,
     };
     while !shared.stop.load(Ordering::SeqCst) {
         let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render_pass(&mut gpu, frames, shared, &mut passes)
+            render_pass(&mut gpu, frames, shared, chrome, &mut passes)
         }));
         let outcome = match step {
             Ok(step) => step,
@@ -805,7 +933,52 @@ fn render_loop(mut gpu: Gpu, frames: &Arc<Slot<DecodedFrame>>, shared: &Arc<Rend
             break;
         }
     }
+    // D8: this is the line the core dump pointed at. Whether `gpu` may be destroyed depends on
+    // whether anyone is still listening on the other end of the Wayland connection, which only
+    // the event loop knows.
+    release_gpu(gpu);
     log::info!("render thread finished");
+}
+
+/// **Let the render thread's GPU objects go without running their destructors** (hardware
+/// defect D8).
+///
+/// # The crash this exists to prevent, and why it is not "drop them carefully"
+///
+/// On a locked session the compositor schedules no frame callbacks, so `present()` blocks —
+/// `present p50 999 ms`, measured — and the event loop's bounded join ([`RenderShared::
+/// wait_finished`], 500 ms) expires. The event loop then **detaches** this thread so that
+/// shutdown can continue (§2.6: nothing may delay the shutdown that follows a release-all),
+/// `run_app` returns, and winit closes the Wayland connection. Anything this thread does to its
+/// EGL/wgpu objects after that marshals Wayland requests on a connection that is gone:
+/// `SEGV_MAPERR` inside `wl_proxy_marshal_flags`, under
+/// `<wgpu_hal::gles::egl::Inner as Drop>::drop`.
+///
+/// The first attempt at a fix was an `abandoned` flag the event loop set before detaching, which
+/// this thread would check before tearing down. **It crashed anyway, and the core dump named the
+/// reason**: the deadline does not land before the teardown, it lands *inside* it. The stack was
+/// `render_loop` → `release_gpu` → `drop_in_place<egui_wgpu::Renderer>` → … → `egl::Inner::drop`
+/// → `wl_proxy_marshal_flags`. The thread had left `present()`, read the flag as unset, and begun
+/// destroying — and the event loop's 500 ms expired while it was in there, detached it, and closed
+/// the connection out from under it. No flag read before the teardown can close that window,
+/// because the window *is* the teardown, and a handshake that made the event loop wait for it
+/// would be the unbounded join the detach exists to avoid.
+///
+/// # So nothing is destroyed, ever
+///
+/// `mem::forget` runs no destructor, so nothing here can reach libwayland whatever the event loop
+/// is doing. That is sound because **[`render_loop`] only ever returns while the process is on
+/// its way out**: either [`RenderShared::stop`] was set by the event loop's teardown, or a fatal
+/// error was recorded, which `App::tick` turns into a `CloseRequested` on the next pass. There is
+/// no path on which this thread ends and the process carries on needing a GPU. The kernel
+/// reclaims the device, the surface and the textures a moment later, as it does for every other
+/// allocation this process holds at `exit`.
+///
+/// Generic over what it is handed so the decision is testable without a GPU: the only thing it
+/// decides is *whether a destructor runs*, which any type that counts its own drops can observe.
+fn release_gpu<T>(gpu: T) {
+    log::debug!("render: leaving the GPU objects to the process exit (D8)");
+    std::mem::forget(gpu);
 }
 
 /// One pass of the render loop. See [`render_loop`].
@@ -813,9 +986,24 @@ fn render_pass(
     gpu: &mut Gpu,
     frames: &Slot<DecodedFrame>,
     shared: &RenderShared,
+    chrome: &ChromeReceiver,
     passes: &mut Passes,
 ) -> Step {
     let frame = frames.wait_take(FRAME_WAIT);
+    // Risk 4 of the 4b design: without this, a tooltip would never fade in while the video is
+    // stopped — a closed slot sleeps `FRAME_WAIT` and `pending` would never be set. The chrome's
+    // own clock is the event loop's `about_to_wait`, which folds egui's `repaint_delay` into its
+    // `WaitUntil`; this is only the arrival side of it.
+    if let Some(new_chrome) = chrome.drain() {
+        match passes.chrome.as_mut() {
+            // Absorb rather than replace: the retained frame may still be holding a
+            // `textures_delta` that no draw has applied yet (an occluded surface, say), and
+            // dropping it would lose a font-atlas page permanently.
+            Some(existing) => existing.absorb(new_chrome),
+            None => passes.chrome = Some(new_chrome),
+        }
+        passes.pending = true;
+    }
     let closed = frame.is_none() && frames.is_closed();
     if let Some(f) = frame {
         gpu.upload(&f);
@@ -844,7 +1032,7 @@ fn render_pass(
         }
         return Step::Continue;
     }
-    match gpu.draw(shared, passes.captured_at) {
+    match gpu.draw(shared, passes.captured_at, passes.chrome.as_mut()) {
         DrawOutcome::Presented => passes.pending = false,
         DrawOutcome::Skipped => {
             // Same reasoning as above: a skipped present leaves `pending` set, and with a closed
@@ -856,6 +1044,18 @@ fn render_pass(
         DrawOutcome::Fatal(msg) => return Step::Fatal(msg),
     }
     Step::Continue
+}
+
+/// Whether a chrome frame was laid out for the surface it is about to be drawn on (§12 Stage 4b,
+/// review item 13).
+///
+/// [`ChromeFrame::size_in_pixels`] is the window size the event loop tessellated against; the
+/// surface config is what the render thread is drawing into. They differ for the frame or two
+/// between a resize and the next chrome build, and a pill positioned in the old surface's
+/// coordinates lands somewhere it was never meant to be. Pure, so the comparison is asserted
+/// without a GPU.
+fn chrome_fits_surface(frame: [u32; 2], surface: (u32, u32)) -> bool {
+    frame == [surface.0, surface.1]
 }
 
 /// Best-effort text of a panic payload, for [`RenderShared::fatal`].
@@ -871,7 +1071,37 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+
+    /// Counts its own destruction, which is the only thing [`release_gpu`] decides.
+    struct CountsItsDrops(Arc<AtomicUsize>);
+
+    impl Drop for CountsItsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// **D8.** The render thread must never run its GPU destructors: the event loop's bounded
+    /// join can expire *while the teardown is in progress*, detach this thread and close the
+    /// Wayland connection under it — measured, with the core dump naming `release_gpu` →
+    /// `egl::Inner::drop` → `wl_proxy_marshal_flags`. See [`release_gpu`] for why no flag read
+    /// before the teardown can close that window.
+    ///
+    /// This test is the decision, not the mechanism: a future edit that "tidies up" by dropping
+    /// instead fails here rather than on someone's locked desk once in seven runs.
+    #[test]
+    fn the_render_threads_gpu_objects_are_never_destructed() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        release_gpu(CountsItsDrops(Arc::clone(&drops)));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a destructor ran, and it would have reached libwayland"
+        );
+    }
 
     #[test]
     fn letterbox_pillarboxes_a_wide_window() {
@@ -965,6 +1195,21 @@ mod tests {
         assert_eq!(first.age_p50_us, 16_000);
         let second = shared.take_stats();
         assert_eq!(second, RenderStats::default());
+    }
+
+    /// **Review item 13.** A chrome frame carries the surface size it was laid out for, and that
+    /// number is compared rather than carried for decoration: a frame from before a resize is
+    /// skipped, because its pill is positioned in the old surface's coordinates.
+    #[test]
+    fn a_chrome_frame_is_only_drawn_on_the_surface_it_was_laid_out_for() {
+        assert!(chrome_fits_surface([1920, 1080], (1920, 1080)));
+        // The frame or two between a resize and the next chrome build.
+        assert!(!chrome_fits_surface([1920, 1080], (1280, 720)));
+        assert!(!chrome_fits_surface([1920, 1080], (1920, 1081)));
+        assert!(
+            !chrome_fits_surface([1080, 1920], (1920, 1080)),
+            "not just the area"
+        );
     }
 
     #[test]

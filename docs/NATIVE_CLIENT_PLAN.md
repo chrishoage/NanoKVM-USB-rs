@@ -1,4 +1,4 @@
-# Native NanoKVM-USB Client — Design (rev 4)
+# Native NanoKVM-USB Client — Design (rev 5)
 
 Replace the Chromium-based client with a native Linux binary that drives the KVM over
 its CH9329 serial link and its UVC video node.
@@ -7,8 +7,9 @@ its CH9329 serial link and its UVC video node.
 - **Language:** Rust. Settled; see §1.
 - **Shape:** one crate, `lib` + `bin`, modules. No workspace. See §7.
 - **Reference implementation:** `sipeed/NanoKVM-USB` @ `1d1dd5e`.
-- **Status:** **Stage 0 complete.** Its findings are folded into this revision. Ready for
-  Stage 1 (§12).
+- **Status:** **Stages 0–3 complete.** Rev 5 replaces Stage 4 (§12): the extensions rev 4
+  listed were never asked for, and the one the reference client ships that this document
+  never mentioned — audio — is now in scope. See §0.3.
 
 **Priority: prove the complete local KVM experience early, then expand the
 architecture based on demonstrated need.**
@@ -90,6 +91,23 @@ Building the later stages corrected this document again, and those amendments ar
 way, from their own findings documents rather than folded in here: B*n* in
 `docs/STAGE1_FINDINGS.md`, C*n* in `docs/STAGE2_FINDINGS.md`, and **D1–D10 in
 `docs/STAGE3_FINDINGS.md`** — what the CLI stage changed about §2.9, §8, §10.2 and §12.
+
+### 0.3 Corrections to rev 4
+
+Rev 4's Stage 4 was written by the architecture, not by the user. Rev 5 rewrites it from what
+was actually asked for and from a fresh reading of the reference client and the hardware. The
+reference client's GUI inventory that this section rests on was taken from
+`reference/desktop/src/renderer/src/components/` on 2026-09-11; the audio facts were read from
+sysfs and `/proc/asound` on this desk the same day.
+
+| Rev 4 claim | Status | Correction |
+| --- | --- | --- |
+| Stage 4 is "RFB server, clipboard paste, session recording, mouse jiggler" | **Wrong scope** | RFB and session recording were never requested; both move to §10 as deferred with their reasons. The jiggler is deferred too (§10.4). Clipboard paste stays. |
+| No mention of audio anywhere in rev 1–4 | **Omission** | The dongle's video device carries a **USB Audio Class capture interface** on the *same* USB device as the UVC interfaces (`345f:2133`, interfaces 1.2 and 1.3, `snd-usb-audio`). The reference client plays it, always on. It is the first Stage 4 sub-stage. |
+| Stage 1: "the title is this client's whole user interface for everything that is not a pixel" | **Superseded** | Stage 4b adds on-screen chrome. The reference's UI is a floating translucent overlay over the video, not a native menu bar, which decides the toolkit (§12 Stage 4b). |
+| §7.2: link only `libc`, `libm`, `libgcc_s` | **Amended** | Plus `libasound`. The alternative — dlopening ALSA by hand — buys purity at the cost of a hand-written binding to a library every desktop host has. §7.2 says why. |
+| §8: the two nodes are separate USB devices, pairing needs the port `peer` link or hub containment | **Still true, and the audio node is easier** | The sound card's sysfs device *is* the capture node's USB device. Pairing it is same-device containment, which §8 rev 3 wished for and the serial node cannot offer. |
+| §10.2: text injection ships "in the CLI stage, not the core" | **Extended** | Paste is text injection from the clipboard. It reuses `script::compile` and the declared-layout rule; it does not get a second character mapper. Stage 4c. |
 
 ---
 
@@ -601,8 +619,12 @@ src/
   input/         event classes, coalescing, held-state, release-all  (§2)
   serial/        port open, reconnect, framing, writer thread + queue
   capture/       V4L2 streaming, format negotiation, MJPEG decode
-  discovery/     sysfs topology, serial↔video pairing            (§8)
+  discovery/     sysfs topology, serial↔video pairing, audio pairing (§8)
+  script/        chord and macro compiler behind key/type/macro/paste. Pure. (§10.2)
+  cli/           the subcommands and their I/O                   (§12 Stage 3)
+  audio/         ALSA capture from the dongle, ring buffer, playback (§12 Stage 4a)
   viewer/        winit window, wgpu render, input capture, shortcut inhibit
+  viewer/chrome  egui overlay: the menu pill, popovers, tooltips (§12 Stage 4b)
 ```
 
 **Two traits, both justified by a specific test:**
@@ -627,12 +649,21 @@ boundary.
 | **Render** | **wgpu acquire, draw, present** | — |
 | Serial writer | port writes, pacing | — |
 | Event loop | winit events, input | bounded input queue |
+| Audio capture | ALSA `hw:N` reads from the dongle (Stage 4a) | bounded PCM ring, drop-oldest |
+| Audio playback | ALSA `default` writes (Stage 4a) | — |
 
 Rev 3 had the event loop submitting renders. **Rev 4 splits rendering onto its own thread**,
 because `present()` blocks for about 99 % of every frame and would starve input (§5.4). The
 event loop no longer touches wgpu.
 
 The decode row also loses its YUYV alternative: there isn't one (§6).
+
+Rev 5 adds the two audio threads. Neither may touch the video handoff, the input queue or the
+render thread: audio is a side channel, and a stalled or absent sound card must leave the KVM
+exactly as usable as it was in Stage 3. The ring between them is bounded and drops whole
+periods, oldest first, counting what it dropped (§2.8's rule: surfaced, never silently
+absorbed). The chrome (Stage 4b) is not a thread — it draws on the render thread after the
+video quad, and is skipped entirely while hidden.
 
 Each video handoff carries **at most one pending frame, and the frame owns its bytes**.
 See §5.2 — that is the requirement; the data structure is not.
@@ -957,8 +988,19 @@ over `<linux/videodev2.h>` with no link directive; a negative control with `feat
 nothing re-adds it.
 
 **"Single binary" is defined as:** one dynamically-linked glibc executable, no installer, no
-bundled runtime, no sidecar; linking only `libc`, `libm` and `libgcc_s`; dlopening only the
-host's GPU driver and Wayland libraries; requiring neither `libv4l2` nor `libudev`.
+bundled runtime, no sidecar; linking only `libc`, `libm`, `libgcc_s` **and, from Stage 4a,
+`libasound`**; dlopening only the host's GPU driver and Wayland libraries; requiring neither
+`libv4l2` nor `libudev`.
+
+**Why `libasound` is the one exception (rev 5).** Audio needs *some* sound API, and every
+candidate links a library: the `alsa` crate links `libasound`, `cpal` links it too, a native
+PipeWire client links `libpipewire-0.3` and requires the daemon, and the PulseAudio simple API
+links `libpulse`. `libasound` is the smallest of these, is present on any host that has a
+sound card at all, and on a PipeWire desk `default` routes through `pipewire-alsa` so we are an
+ordinary PipeWire client without linking PipeWire. Dlopening it by hand through `libloading`
+would keep the three-library rule at the price of a hand-maintained binding for the dozen
+functions we call; not worth it. The rule is now: **link the four, dlopen nothing new.** The
+chrome adds no link surface: egui is pure Rust and draws through the wgpu device we already own.
 
 **Release target: `x86_64-unknown-linux-gnu`, built against an old glibc** (an oldstable
 container, or `cargo-zigbuild` targeting `gnu.2.28`), stripped, roughly 8 MB.
@@ -1117,7 +1159,7 @@ to physical HID codes, session ownership when two clients connect, encoding choi
 authentication, and cleanup on abrupt disconnect. Each is real work with real failure
 modes, and RFB is designed for desktop deltas rather than continuous video.
 
-Optional, and last.
+Deferred indefinitely (rev 5): it was never requested. Not in Stage 4.
 
 ### 10.2 Key forwarding and text injection are different operations
 
@@ -1133,6 +1175,24 @@ Text injection therefore needs an explicit `--layout` (default US QWERTY, stated
 help output, not assumed silently) and a declared policy for characters unreachable on
 that layout: fail loudly with the offending characters named, rather than sending
 approximations. Ship it in the CLI stage, not the core.
+
+Rev 5: clipboard paste (Stage 4c) is this operation with the clipboard as its source. The
+reference client's paste is a separate ASCII-to-US-usage table that skips non-ASCII silently,
+drops `\r`, and has no cap; ours goes through `script::compile` under the same layout and the
+same unreachable-character policy as `nanokvm type`, so there is one mapper and one rule.
+
+### 10.3 Session recording
+
+The reference records the browser `MediaStream` to WebM. Natively that means an encoder and a
+container we do not otherwise need, for a feature that was not asked for. `nanokvm shot` covers
+the case that was. Deferred.
+
+### 10.4 Mouse jiggler
+
+Trivial once the chrome exists — a timer that sends a relative `(+10,+10)`, `(-10,-10)` pair
+after 15 s of no real mouse event, as the reference does — and not asked for. Note when it is
+built that the reference's own implementation sends a malformed nested report
+(`libs/mouse-jiggler/index.ts`), so it is not a behaviour to copy. Deferred.
 
 ---
 
@@ -1298,10 +1358,164 @@ screen — on 2026-09-11.
 Evidence, the ten amendments this document needs as a result (D1–D10) and the measurements are
 in `docs/STAGE3_FINDINGS.md`.
 
-### Stage 4 — Optional extensions
+### Stage 4 — Audio, chrome, paste — **COMPLETE**
 
-RFB server (§10.1), clipboard paste, session recording, mouse jiggler. Each justified by
-demonstrated need, not by the architecture having room for it.
+Evidence, the twenty amendments this document needs as a result (E1–E20) and the measurements are
+in `docs/STAGE4_FINDINGS.md`.
+
+Rev 4 listed four extensions "justified by demonstrated need". The need was stated in rev 5's
+review: **audio output, which the reference client has and this design never mentioned; a GUI
+that mostly matches the reference's; and clipboard paste.** RFB, recording and the jiggler are
+in §10. Three sub-stages, in this order, because 4a is independent and hardware-measurable, 4b
+gives 4c a place to live, and each ends with `cargo fmt`, both clippy runs and `cargo test`
+clean plus a findings document (`docs/STAGE4_FINDINGS.md`, amendments E*n*).
+
+The same rule as every stage: **verify by consequence.** A tone heard is evidence; a stream
+that opened is not. A tooltip that appears is evidence; a widget that exists is not. A pasted
+line on the target's screen is evidence; a compiled sequence is not.
+
+#### 4a — Audio
+
+**What the hardware is (read 2026-09-11, this desk).** `345f:2133` carries five interfaces:
+two UVC (`1.0`, `1.1`), a USB Audio Class control and streaming pair (`1.2`, `1.3`, bound to
+`snd-usb-audio`) and a HID interface (`1.4`) this design does not use. The card exposes
+**one capture stream, S16_LE, 2 channels, 48 000 Hz only, asynchronous IN endpoint, 1 ms
+packets**, and no playback stream. On this desk it is `card8`, and PipeWire already has a node
+for it (`alsa_input.usb-MACROSILICON_USB2_Video_…`). Card numbers renumber exactly as video and
+tty names do: identify the card by sysfs, never by number.
+
+**Pairing (§8, extended).** `/sys/class/sound/cardN/device` resolves to an interface of the
+*same* USB device as the capture node's. That is same-device containment — the proof §8 rev 3
+wanted and the serial node could not give. `discovery` gains the sound class: the fixture
+recording `fixtures/sysfs/usb2-desk.sysfs` must be extended with `/sys/class/sound` (see
+`fixtures/sysfs/MANIFEST.md` for how to re-record) so the pairing is tested against the desk
+and the bus-5 negative control still rejects the Logitech webcam's audio interface.
+
+**What the reference does.** `getUserMedia` with the audio input sharing the video's
+`groupId`, 48 kHz, echo cancellation, noise suppression and AGC all off, latency 0, always on,
+no mute, no volume, and silently video-only if the OS denies the "microphone". We keep the
+signal path and add the controls it lacks.
+
+**Design.**
+
+- `audio/` opens the paired card with the `alsa` crate as `hw:N` (the device's native format
+  needs no conversion) and plays to ALSA `default` (`pipewire-alsa` here, plain ALSA
+  elsewhere, where `plug` resamples if the sink cannot do 48 kHz). §7.2 records the link
+  exception.
+- Two threads, §4.1. A bounded ring between them; on overflow drop whole periods, oldest
+  first, and count. On underrun play silence and count. Both counters are surfaced in the
+  chrome (4b) and the title until then.
+- **The capture and playback clocks are different crystals.** The dongle's and the host's
+  sample clocks drift, so over a long session the ring either fills or drains. Policy: drop or
+  insert one period at the ring's bounds and count it. **Measure the drift rate on hardware
+  over at least ten minutes** and record it, so the ring size is chosen from a number.
+- Failure isolation, non-negotiable: `EBUSY` (another client holds the card — PipeWire only
+  opens it while something records from its node), a missing card, a disappearing card and a
+  playback sink that vanishes each log once, set a surfaced condition, and change nothing
+  about video or input. Audio re-pairs through `discovery::reopen` on the same replug path as
+  the other two nodes (§2.7, C6).
+- Controls: a mute toggle in the chrome and `--no-audio` on the viewer. Default on, like the
+  reference. `nanokvm devices` lists the paired card.
+- Latency: report the *configured* buffer depth (periods × period size) as a number with its
+  provenance (§5.5). Do not claim an end-to-end figure this desk cannot measure.
+
+**Exit:** with the target playing a 1 kHz tone (driven through `nanokvm type`, e.g.
+`speaker-test -t sine -f 1000` on the Pi), a spectral peak at 1 kHz is found in the PCM we
+capture — a consequence, not an open stream — and the same tone is audible from the host's
+sink. Drift measured. Audio absent (`--no-audio`, or card unbound with `scripts/usb-replug.py`)
+leaves the Stage 3 viewer untouched, by the hardware test.
+
+#### 4b — Chrome
+
+**What the reference has (inventory taken 2026-09-11).** Not a native menu bar: a floating,
+draggable, translucent pill (`bg-neutral-800/70`, 34 px) over the video, collapsible to a grip,
+with click popovers — **Video** (resolution list with custom entries, CSS scale, device),
+**Serial** (port, baud 57600 default), **Keyboard** (paste, on-screen keyboard, saved and
+built-in shortcuts: `Win+Tab`, `Ctrl+Alt+Del`), **Mouse** (cursor style, absolute/relative,
+wheel direction and speed, jiggler), **Recorder**, and a **Settings** modal (language, updates,
+reset, about). A bottom-drawer on-screen keyboard with sticky modifiers. **No accelerators of
+its own**: every host key is forwarded. **No tooltips.** Fullscreen and rotation exist only in
+the browser build.
+
+**Toolkit: egui, drawn into the existing wgpu surface. Not GTK4.** Decided in the rev 5 review
+on these grounds:
+
+- GTK4 replaces the window layer rather than adding to it. It owns the loop, the surface and
+  the renderer; `render.rs` has no home inside it, and GTK4 has no pointer-lock API, so
+  `wayland.rs`'s self-bound registry would survive, re-targeted at `gdk4-wayland`. That is
+  roughly half the viewer rewritten to keep what already works, and it links about thirty
+  libraries against §7.2.
+- The reference's chrome is overlay-shaped — translucent panels floating over video — which
+  is egui's native idiom and GTK's awkward case.
+- egui keeps everything: `egui-winit` translates the events the loop already has; `egui-wgpu`
+  draws after the video quad on the render thread; hidden chrome costs nothing because it is
+  skipped, not drawn transparent. Pure Rust, no link surface.
+- Styling is sufficient: fills take alpha, corner radius, strokes and shadows are per-frame
+  fields, widgets have rest/hover/active/open visuals, fonts are supplied as TTF (embed the
+  Lucide icon font as a family for the reference's icons). Tooltips are built in, with an
+  initial delay, a grace period between neighbours, click suppression, and separate hover text
+  for disabled widgets — which is where the reason an action is unavailable belongs.
+- Cost: **`wgpu` 26 → 27.** No egui release pins 26; egui 0.33 pins 27 and builds on rustc
+  1.88, and egui 0.34+ needs rustc 1.92 (this desk has 1.89). §5.3's present-mode findings
+  must be re-checked after the bump, not assumed to carry.
+
+**Design.**
+
+- **Input routing is a pure rule with tests**, like `viewer::state`. While the pointer is over
+  the chrome or a popover is open, pointer events go to egui and not the target; while a
+  popover or modal is open, keys go to egui (the reference's `isKeyboardEnable=false`); while
+  capture is engaged in relative mode the chrome is unreachable and only `RELEASE_KEY` gets
+  out. The chrome never steals a key the target was going to get without the user having opened
+  something.
+- **Contents, matching the reference where it makes sense here:** Video (resolutions
+  *enumerated from the device*, not the reference's fixed list; no CSS scale — we letterbox),
+  Keyboard (paste, the two built-in shortcuts through `script::compile`), Mouse (absolute /
+  relative, cursor hide/show, wheel direction), Audio (mute, the 4a counters), and the
+  release key shown where the title used to show it. **Every control has a tooltip**, and
+  every disabled control's tooltip says why. Serial and video device pickers are not needed:
+  §8 pairs them. Settings modal, on-screen keyboard and language are **out of scope until
+  asked**.
+- Persist the reference's per-user choices (menu open, mouse mode, cursor, wheel direction,
+  mute, layout) in `$XDG_CONFIG_HOME/nanokvm/config.toml`. Missing file means the defaults;
+  a malformed file is an error naming the key, not a silent reset.
+- The title stays the fallback: everything §2.8 and §6.1 require surfaced is still in it, so
+  `title.rs` and its tests do not change.
+
+**Exit:** the pill and its popovers work on niri with the video underneath at full rate — the
+render thread's per-frame cost with the chrome open is **measured** and stated next to the
+Stage 1 number. Routing rule tested. Relative-mode capture still releases only on
+`RELEASE_KEY`. wgpu 27 present-mode enumeration re-verified.
+
+#### 4c — Clipboard paste
+
+**What the reference does.** Reads the clipboard, then per character: ASCII → US HID usage via
+its own table, Shift for `A–Z` and a fixed punctuation set, press, sleep 100 ms, release. No
+shortcut (`Ctrl+V` is forwarded), no layout, non-ASCII skipped silently, `\r` dropped, no
+cap, no cancel.
+
+**Design.**
+
+- **Source:** `wl-clipboard-rs` over the data-control protocol, which needs no focus and which
+  niri supports. It uses the `wayland-client` crate we already have. On a compositor without
+  data-control the menu item is disabled and its tooltip says so.
+- **Mapper:** `script::compile`, under the viewer's declared layout (a chrome setting; default
+  US QWERTY, stated). **Reject before sending anything** when a character is unreachable, and
+  list the offenders in the chrome — §10.2's rule, not the reference's skip. Normalise `\r\n`
+  and `\r` to Enter.
+- **Admission (§2.9):** a paste is a script-class sequence sent through the viewer's producer
+  at the paced rate Stage 3 measured. While it runs, host keys are **not** forwarded — a chord
+  landing mid-paste corrupts the text — except `RELEASE_KEY`, which cancels it under §2.6's
+  release-all. Progress and a cancel hint are shown in the chrome.
+- **Trigger:** the Keyboard popover item, plus a chord on the already-reserved `RELEASE_KEY`
+  (proposed `Shift+Pause`) so the never-forwarded surface stays one key. The chord is shown in
+  the item's tooltip.
+- No length cap; the rate and the cancel are the cap. State the expected duration in the
+  progress line.
+
+**Exit:** a multi-line clipboard containing every ASCII printable pastes onto the target's
+terminal and the screen shows it verbatim (`nanokvm shot` is the witness), an unreachable
+character is refused with its name before any key is sent, and `RELEASE_KEY` mid-paste stops
+it with no key left held (the lock-bit and held-state checks from Stage 3).
 
 ---
 

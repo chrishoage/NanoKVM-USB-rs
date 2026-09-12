@@ -363,6 +363,11 @@ pub struct PipelineStats {
     /// negotiated format could not be established on this device and what is on screen is what
     /// the device is actually sending.
     pub format_mismatch_accepted: u64,
+    /// Times a caller asked for a different mode and the opener accepted it (§12 Stage 4b, the
+    /// chrome's Video popover). Counted apart from [`PipelineStats::reopens`] — which it also
+    /// increments, because it really is a reopen — so that "the user changed the resolution" is
+    /// never mistaken for "the device went away".
+    pub format_changes: u64,
     /// What the current source's `S_FMT` committed to, or `None` when there is no source or it
     /// negotiated nothing. The other half of the comparison
     /// [`PipelineStats::last_resolution`] is one half of: the two differing while
@@ -382,6 +387,11 @@ struct Shared {
     started_at: Instant,
     stopping: AtomicBool,
     stall_after: Duration,
+    /// A mode the caller asked for, for the capture thread to apply on its next pass (§12 Stage
+    /// 4b). A 1-slot request, not a queue: a user clicking three resolutions in a second wants the
+    /// third, and three sequential reopens of a streaming node would take about a second and a
+    /// half to arrive at the same place.
+    format_request: Mutex<Option<(u32, u32, u32)>>,
 }
 
 struct Inner {
@@ -408,6 +418,7 @@ struct Inner {
     format_mismatch_restarts: u64,
     format_mismatch_reopens: u64,
     format_mismatch_accepted: u64,
+    format_changes: u64,
     negotiated_dimensions: Option<(u32, u32)>,
     disconnected_since: Option<Instant>,
     state: PipelineState,
@@ -438,6 +449,7 @@ impl Shared {
                 format_mismatch_restarts: 0,
                 format_mismatch_reopens: 0,
                 format_mismatch_accepted: 0,
+                format_changes: 0,
                 negotiated_dimensions: None,
                 disconnected_since: None,
                 state: PipelineState::Running,
@@ -445,6 +457,7 @@ impl Shared {
             started_at: Instant::now(),
             stopping: AtomicBool::new(false),
             stall_after,
+            format_request: Mutex::new(None),
         }
     }
 
@@ -655,6 +668,19 @@ fn backoff(shared: &Arc<Shared>, compressed: &Arc<Slot<CompressedFrame>>, nap: D
 /// A struct rather than a pile of `&mut` parameters because the recovery paths need most of it:
 /// the opener outlives every source, the stall timer has to survive a reopen, and the error
 /// bookkeeping has to be reset by one.
+/// The warning for a format request a source cannot honour (§12 Stage 4b).
+///
+/// A function rather than a literal at the call site because a wrapped string literal loses its
+/// meaning silently: without the `\` continuation this message carried eighteen spaces in the
+/// middle of a sentence and nothing failed. Here the wording is a value, and the test below reads
+/// it.
+fn format_refused(width: u32, height: u32, fps: u32) -> String {
+    format!(
+        "capture: {width}x{height}@{fps} was asked for, but this source cannot renegotiate; the \
+         current mode is unchanged"
+    )
+}
+
 struct Capture {
     /// Behind an `Arc<Mutex<_>>` because the open runs on a helper thread the capture thread
     /// abandons on shutdown — see [`Capture::open_detached`]. Never contended: at most one open
@@ -728,6 +754,38 @@ impl Capture {
             last_kind: None,
             restart_base: Instant::now(),
         }
+    }
+
+    /// Apply a pending [`PipelineHandle::request_format`], if there is one (§12 Stage 4b).
+    ///
+    /// Takes the request whether or not it can be honoured — a request left in the slot would be
+    /// retried on every pass — and releases the source only when the opener says it renegotiated.
+    /// The loop's own `reconnect` then opens the node afresh on the next pass, which is exactly
+    /// the `S_FMT`/`S_PARM`/`STREAMON` the new mode needs; that is the same road the format
+    /// watchdog's escalation takes (`Step::Reopen`), and for the same reason: there is one
+    /// negotiation in this client and this is not a second one.
+    ///
+    /// Deliberately **not** `lose_device`: nothing was lost, so `disconnects` and
+    /// `disconnected_since` must not say it was.
+    fn apply_format_request(&mut self, shared: &Arc<Shared>) {
+        let Some((width, height, fps)) = lock_or_recover(&shared.format_request).take() else {
+            return;
+        };
+        let accepted = {
+            let mut opener = lock_or_recover(&self.opener);
+            opener.set_format(width, height, fps)
+        };
+        if !accepted {
+            log::warn!("{}", format_refused(width, height, fps));
+            return;
+        }
+        log::info!("capture: renegotiating at {width}x{height}@{fps}; reopening the device");
+        {
+            let mut inner = lock_or_recover(&shared.inner);
+            inner.format_changes += 1;
+            inner.negotiated_dimensions = None;
+        }
+        self.release_source();
     }
 
     /// Drop the current source, absorbing a panicking destructor.
@@ -1352,6 +1410,11 @@ fn capture_loop(mut cap: Capture, compressed: &Arc<Slot<CompressedFrame>>, share
             break;
         }
 
+        // §12 Stage 4b: a mode the chrome asked for. Checked here, between passes, because
+        // renegotiating means releasing the source — and releasing a source the loop is inside
+        // `next_frame` on is not a thing this thread can do to itself.
+        cap.apply_format_request(shared);
+
         // `AssertUnwindSafe` because the state that could be observed after an unwind is exactly
         // the state this loop is here to manage: the source (released below, never used again)
         // and the shared counters (plain integers behind a mutex whose poisoning this module
@@ -1531,6 +1594,7 @@ impl PipelineHandle {
             format_mismatch_restarts: inner.format_mismatch_restarts,
             format_mismatch_reopens: inner.format_mismatch_reopens,
             format_mismatch_accepted: inner.format_mismatch_accepted,
+            format_changes: inner.format_changes,
             negotiated_dimensions: inner.negotiated_dimensions,
             disconnected_since: inner.disconnected_since,
             state,
@@ -1557,6 +1621,24 @@ impl PipelineHandle {
         lock_or_recover(&self.shared.inner)
             .last_frame_at
             .map(|t| t.elapsed())
+    }
+
+    /// Ask the capture thread to renegotiate at `width`x`height`@`fps` (§12 Stage 4b).
+    ///
+    /// **Non-blocking, and it promises nothing about the outcome.** It records a request; the
+    /// capture thread applies it on its next pass by asking the [`SourceOpener`] to
+    /// [`SourceOpener::set_format`] and then taking its ordinary reopen path — release the source,
+    /// `S_FMT`/`S_PARM`/`STREAMON` afresh — which is the one negotiation this client does, with
+    /// its reply already checked against what was asked for (§6). An opener that cannot
+    /// renegotiate leaves the current mode alone and logs it.
+    ///
+    /// Called from the event loop, which must never block (§5.4), so the request is a 1-slot
+    /// mutex rather than a handshake: a second request before the first is applied replaces it.
+    ///
+    /// The picture blanks for the reopen. Nothing about the **target's** resolution is touched —
+    /// this is the capture side only, and `CLAUDE.md` forbids changing the target's.
+    pub fn request_format(&self, width: u32, height: u32, fps: u32) {
+        *lock_or_recover(&self.shared.format_request) = Some((width, height, fps));
     }
 
     /// The current state, with staleness derived from the clock (§6.1).
@@ -1625,6 +1707,16 @@ impl Drop for PipelineHandle {
 mod tests {
     use super::*;
     use crate::capture::SyntheticSource;
+
+    /// **Review item 12.** The warning is one sentence: a wrapped literal that lost its `\`
+    /// continuation printed eighteen spaces in the middle of it and nothing noticed.
+    #[test]
+    fn the_refused_format_warning_reads_as_a_sentence() {
+        let msg = format_refused(1280, 720, 60);
+        assert!(!msg.contains("  "), "double space in: {msg}");
+        assert!(msg.contains("1280x720@60"), "{msg}");
+        assert!(msg.contains("cannot renegotiate"), "{msg}");
+    }
 
     fn fixture_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/frames/absrange")

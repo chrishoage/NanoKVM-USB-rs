@@ -733,25 +733,50 @@ fn n5_nothing_re_captures_after_a_close() {
 #[test]
 fn h6_only_keycode_pause_releases() {
     use winit::event::ElementState;
-    use winit::keyboard::{KeyCode, PhysicalKey};
+    use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
     assert_eq!(
         input_map::map_key(
             PhysicalKey::Code(KeyCode::Pause),
             ElementState::Pressed,
-            false
+            false,
+            ModifiersState::empty(),
         ),
         KeyAction::Release
     );
-    // Everything else that is mapped is forwarded, including the keys a user might guess at.
+    // Everything else that is mapped is forwarded, including the keys a user might guess at —
+    // **in every modifier state**, which is what keeps §12 Stage 4c's paste chord from having
+    // quietly reserved a second key.
     for c in [KeyCode::ScrollLock, KeyCode::Escape, KeyCode::F12] {
-        assert!(
-            matches!(
-                input_map::map_key(PhysicalKey::Code(c), ElementState::Pressed, false),
-                KeyAction::Forward { .. }
-            ),
-            "{c:?} is not forwarded, so it is a second escape nobody documented"
-        );
+        for modifiers in [
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            ModifiersState::CONTROL | ModifiersState::ALT,
+        ] {
+            assert!(
+                matches!(
+                    input_map::map_key(
+                        PhysicalKey::Code(c),
+                        ElementState::Pressed,
+                        false,
+                        modifiers
+                    ),
+                    KeyAction::Forward { .. }
+                ),
+                "{c:?} under {modifiers:?} is not forwarded, so it is a second escape nobody \
+                 documented"
+            );
+        }
     }
+    // The one chord there is, on the one key already reserved (§12 Stage 4c).
+    assert_eq!(
+        input_map::map_key(
+            PhysicalKey::Code(KeyCode::Pause),
+            ElementState::Pressed,
+            false,
+            ModifiersState::SHIFT,
+        ),
+        KeyAction::Paste
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

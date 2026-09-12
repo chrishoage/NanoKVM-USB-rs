@@ -41,9 +41,12 @@
 //!   wording is asserted rather than eyeballed.
 //! - [`render`]    — the render thread, the wgpu surface, and the letterbox geometry.
 //! - [`wayland`]   — `zwp_keyboard_shortcuts_inhibit_v1` on a second event queue (§1.5).
+//! - [`chrome`]    — the egui pill and its popovers, the pure input-routing rule that decides
+//!   whether an event is the target's or the chrome's, and the settings file (§12 Stage 4b).
 //! - [`app`]       — the winit `ApplicationHandler` that wires them together.
 
 pub mod app;
+pub mod chrome;
 pub mod input_map;
 pub mod render;
 pub mod state;

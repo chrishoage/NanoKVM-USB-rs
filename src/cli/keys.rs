@@ -47,7 +47,9 @@
 //!
 //! The 40 ms default pacing is for the *target*, not the chip: a keyboard ack round trip measured
 //! 4.16–4.19 ms (STAGE1_FINDINGS "hardware numbers", A11), so the chip could take reports ten
-//! times faster. Desktops drop keys delivered faster than a human types them.
+//! times faster. Desktops drop keys delivered faster than a human types them. The number itself is
+//! [`crate::script::REPORT_DELAY_MS`], because the viewer's clipboard paste runs at the same rate
+//! (§12 Stage 4c) and two literals that agree today are two literals that will not.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -93,7 +95,7 @@ pub struct KeyArgs {
 
     /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
     /// is ~4 ms.
-    #[arg(long, value_name = "MS", default_value_t = 40)]
+    #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
     /// Print the frames that would be sent and exit. Opens no device and sends nothing.
@@ -120,7 +122,7 @@ pub struct TypeArgs {
 
     /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
     /// is ~4 ms.
-    #[arg(long, value_name = "MS", default_value_t = 40)]
+    #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
     /// Print the frames that would be sent and exit. Opens no device and sends nothing.
@@ -150,7 +152,7 @@ pub struct MacroArgs {
 
     /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
     /// is ~4 ms.
-    #[arg(long, value_name = "MS", default_value_t = 40)]
+    #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
     /// Print the frames that would be sent and exit. Opens no device and sends nothing.

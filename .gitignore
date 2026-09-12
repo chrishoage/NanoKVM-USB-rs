@@ -33,3 +33,10 @@ Cargo.lock
 /fixtures/sysfs/*/
 /fixtures/sysfs/.synthesize.lock
 __pycache__/
+
+# egui_kittest snapshot scratch. The baseline `.png` under tests/snapshots/ IS committed — it is
+# the visual evidence for §12 Stage 4b — and these three are what a failing or updated comparison
+# leaves beside it.
+/tests/snapshots/*.new.png
+/tests/snapshots/*.diff.png
+/tests/snapshots/*.old.png

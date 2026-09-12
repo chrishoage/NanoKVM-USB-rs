@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7ddb9282edf464c5fae18238bee9b4e9b1dc17915d582260be354dc1d6318fe3 # shrinks to config = RingConfig { periods: 5, period_frames: 1 }, ops = [], outage = 1, drained = false
+cc e009b197e112a69b47e8dd6e78c6a4ed747e7e12077952b2a863a5629f57ec69 # shrinks to config = RingConfig { periods: 1, period_frames: 1 }, ops = [], outage = 5, drained = false

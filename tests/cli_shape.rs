@@ -146,13 +146,17 @@ fn the_devices_help_works() {
 /// names the flag, because "unexpected argument" would leave the user guessing which one.
 #[test]
 fn a_viewer_flag_with_a_subcommand_is_a_usage_error() {
-    for argv in [
-        vec!["--pointer", "relative", "devices"],
-        vec!["devices", "--pointer", "relative"],
+    for (argv, flag) in [
+        (vec!["--pointer", "relative", "devices"], "--pointer"),
+        (vec!["devices", "--pointer", "relative"], "--pointer"),
+        // §12 Stage 4a's flag is a viewer flag like the others: `devices` opens no card, so
+        // "do not open the card" is meaningless to it and saying nothing would be worse.
+        (vec!["--no-audio", "devices"], "--no-audio"),
+        (vec!["devices", "--no-audio"], "--no-audio"),
     ] {
         let out = run(&argv);
         assert_eq!(out.status.code(), Some(2), "{argv:?}: {}", stderr(&out));
-        assert!(stderr(&out).contains("--pointer"), "{}", stderr(&out));
+        assert!(stderr(&out).contains(flag), "{}", stderr(&out));
         assert!(stderr(&out).contains("devices"), "{}", stderr(&out));
     }
 }
@@ -195,6 +199,79 @@ fn the_listing_names_the_pair_of_the_recorded_desk() {
     assert!(
         !text.contains("/dev/video9"),
         "the listing must come from the fixture, not from this machine:\n{text}"
+    );
+}
+
+/// §12 Stage 4a: `nanokvm devices` prints the paired card. The recorded desk's dongle carries
+/// `card8` on the same USB device as `/dev/video4`, and the listing says so with the evidence —
+/// which is the strongest §8 has, and the one the video-and-serial pairing cannot have here.
+#[test]
+fn the_listing_names_the_paired_sound_card_and_the_evidence_for_it() {
+    let out = run(&["devices"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("sound cards:"), "{text}");
+    assert!(
+        text.contains("card8 \"Video\" (hw:8)"),
+        "the ALSA name the client would open must be in the listing:\n{text}"
+    );
+    assert!(
+        text.contains("audio: card8"),
+        "the pair must say which card is its own:\n{text}"
+    );
+    assert!(
+        text.contains("same USB device as the capture node (busnum:devnum) — proof"),
+        "the audio pairing states its evidence, which is §8's strongest:\n{text}"
+    );
+    // The webcam's card is in the same recording and belongs to someone else's hardware.
+    assert!(
+        text.contains("card7"),
+        "the listing is everything found:\n{text}"
+    );
+    assert!(
+        !text.contains("audio: card7"),
+        "no pair may claim the webcam's microphone:\n{text}"
+    );
+}
+
+/// And a desk with no sound card at all says "no audio" honestly rather than leaving the line out.
+/// The SuperSpeed reconstruction is exactly that desk: `topology.md` recorded the dongle's two
+/// device nodes and nothing about its audio interface, so the tree has no card to find (see
+/// `fixtures/sysfs/MANIFEST.md`). The pairing must be unaffected, which is §4.1 rev 5's whole
+/// point about audio being a side channel.
+#[test]
+fn a_desk_with_no_sound_card_says_no_audio_rather_than_leaving_the_line_out() {
+    let root = nanokvm::discovery::testing::fixture("usb3-stage0")
+        .root()
+        .to_path_buf();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nanokvm"));
+    cmd.args(["devices", "--sysfs-root"])
+        .arg(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY");
+    let mut guard = ChildGuard::spawn("nanokvm", &mut cmd).expect("spawn the nanokvm binary");
+    let mut out = guard.take_stdout();
+    let status = guard
+        .wait_bounded(EXIT_BOUND)
+        .expect("poll the child")
+        .expect("devices must exit promptly");
+    let mut text = String::new();
+    if let Some(o) = out.as_mut() {
+        let _ = o.read_to_string(&mut text);
+    }
+
+    assert!(status.success(), "{text}");
+    assert!(text.contains("sound cards:\n  (none)"), "{text}");
+    assert!(
+        text.contains("audio: no audio: no sound card belongs to the capture node's USB device"),
+        "the pair still pairs and says honestly that it has no audio:\n{text}"
+    );
+    assert!(
+        text.contains("/dev/video4 + /dev/ttyACM1"),
+        "an absent card changes nothing about the pairing:\n{text}"
     );
 }
 

@@ -68,6 +68,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use v4l::buffer::{Flags, Type};
+use v4l::framesize::FrameSizeEnum;
 use v4l::io::traits::{CaptureStream, Stream as StreamTrait};
 use v4l::memory::Memory;
 use v4l::prelude::*;
@@ -813,6 +814,63 @@ impl SourceOpener for V4l2Opener {
             self.fps
         )
     }
+
+    /// Renegotiate at the next open (§12 Stage 4b). Nothing is committed here: `S_FMT` happens in
+    /// [`V4l2Source::open`], where its reply is already checked against what was asked for and a
+    /// mismatch is a [`CaptureError::Config`] rather than a silent downgrade (§6).
+    fn set_format(&mut self, width: u32, height: u32, fps: u32) -> bool {
+        self.width = width;
+        self.height = height;
+        self.fps = fps;
+        true
+    }
+}
+
+/// The MJPEG frame sizes the device at `path` enumerates (§12 Stage 4b).
+///
+/// `VIDIOC_ENUM_FRAMESIZES` for [`FOURCC_MJPG`] on a **second, non-streaming** handle, exactly as
+/// [`query_format`] does and for the same reason: V4L2 allows many opens and one streaming owner,
+/// this ioctl is read-only, and the pipeline may be mid-reopen. The handle is opened and closed
+/// per call.
+///
+/// The chrome's resolution list is this, and not a list written down anywhere in this client (§12
+/// Stage 4b: "resolutions *enumerated from the device*, not the reference's fixed list"). Sizes
+/// past the [`MAX_WIDTH`]/[`MAX_HEIGHT`] sanity ceiling are dropped rather than offered: the
+/// decoder would refuse a frame that big, so offering the mode would be offering a failure.
+///
+/// Stepwise and continuous ranges are reduced to their **maximum** only. The device advertises
+/// discrete sizes (§6, measured), so this arm exists to be honest rather than to be used: a
+/// continuous range has no natural list of entries and inventing one would put modes in the menu
+/// that nothing measured.
+///
+/// # Errors
+///
+/// [`CaptureError::Disconnected`] when the node is gone, which is the answer during a replug.
+pub fn enumerate_modes(path: &Path) -> Result<Vec<(u32, u32)>, CaptureError> {
+    let dev = Device::with_path(path).map_err(map_io)?;
+    let sizes = dev
+        .enum_framesizes(FourCC::new(FOURCC_MJPG))
+        .map_err(map_io)?;
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for frame in sizes {
+        // `FrameSizeEnum::to_discrete` expands a stepwise range by its step, which for a 2x2 step
+        // over 4K is hundreds of thousands of entries and a menu nobody can use. Taking the
+        // maximum is the deliberate reduction the doc comment above describes.
+        let (w, h) = match frame.size {
+            FrameSizeEnum::Discrete(d) => (d.width, d.height),
+            FrameSizeEnum::Stepwise(s) => (s.max_width, s.max_height),
+        };
+        if w == 0 || h == 0 || !super::dimensions_in_range(w, h) {
+            continue;
+        }
+        if !out.contains(&(w, h)) {
+            out.push((w, h));
+        }
+    }
+    // Largest first: the reference lists them that way, and the mode a user reaches for after
+    // 1080p is 720p rather than 640x480.
+    out.sort_unstable_by_key(|&(w, h)| std::cmp::Reverse((w, h)));
+    Ok(out)
 }
 
 /// `G_FMT` and `G_PARM` on a **second, non-streaming** handle to `path`.

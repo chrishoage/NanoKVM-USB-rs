@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Materialise every sysfs fixture tree from the one file that is committed.
 
-`usb2-desk.sysfs` is the recording — this desk, 2026-09-10, serialised by
-`scripts/snapshot-sysfs.py`. It holds the captured part and nothing else. This script expands it
-into `usb2-desk/`, writes back the bus-5 negative control the dock took with it when it
-unplugged itself mid-session, and builds the three trees that are not on this desk and cannot be:
-the SuperSpeed shape needs the dongle on a USB 3 port (Stage 0 had it, Stage 1 lost it), and the
-two-dongle ambiguity needs a second dongle. Every device it writes is listed in MANIFEST.md with
+`usb2-desk.sysfs` is the recording — this desk, 2026-09-10, plus the 2026-09-11 sound addendum,
+serialised by `scripts/snapshot-sysfs.py` (its own header comment says which is which). It holds
+the captured part and nothing else. This script expands it into `usb2-desk/`, writes back the
+bus-5 negative control the dock took with it when it unplugged itself mid-session, and builds
+the three trees that are not on this desk and cannot be: the SuperSpeed shape needs the dongle
+on a USB 3 port (Stage 0 had it, Stage 1 lost it), and the two-dongle ambiguity needs a second
+dongle. Every device it writes is listed in MANIFEST.md with
 the source of its attribute values, so the trees stay auditable.
 
 The four trees are build output and are **not committed** (.gitignore). `cargo test`
@@ -165,6 +166,17 @@ def bus5_negative_control(root=DESK):
     for i in range(4):
         class_node(root, "video4linux", f"video{i}", f"{cam}/5-1.4.4.4.2:1.0",
                    name="Logi 4K Stream Edition", index=str(i), dev=f"81:{i}")
+    # The webcam's microphone: a USB Audio Class interface on the *same* USB device as its video
+    # interface, which is exactly the shape §8's evidence 1 pairs on. It is here so that the
+    # audio rule has a reconstructed negative control: the card pairs with the *webcam*, and must
+    # never be offered to the dongle. (The measured version of the same control is `card0` on
+    # `5-1.1.1`, which is in the recording itself.) **Reconstructed, and further from measurement
+    # than the rest of this subtree** -- see MANIFEST.md. The interface number, the card number
+    # and the ALSA `id` string were never read on this desk, and no test asserts on any of those
+    # values: `tests/discovery.rs` finds this card by its USB device, not by its name.
+    usb_interface(root, f"{cam}/5-1.4.4.4.2:1.2", "5-1.4.4.4.2:1.2",
+                  bInterfaceNumber="02", bInterfaceClass="01")
+    class_node(root, "sound", "card7", f"{cam}/5-1.4.4.4.2:1.2", id="Edition", number="7")
 
     acm = f"{hub}/5-1.4.4.4.3"
     usb_device(root, acm, "5-1.4.4.4.3",
@@ -327,6 +339,13 @@ def two_dongles():
                name="USB2 Video: USB2 Video", index="0", dev="81:6")
     class_node(root, "video4linux", "video7", f"{vid}/3-2.3.2:1.0",
                name="USB2 Video: USB2 Video", index="1", dev="81:7")
+    # The second unit's own sound card, on its own UAC control interface, exactly as the first
+    # unit's card8 sits on 3-2.2.2:1.2 in the recording. It is what makes this tree the fixture
+    # for "the card came back under a different number after a replug": one resolver asked across
+    # a change of tree sees hw:8 become hw:10 (`discovery::reopen`'s tests).
+    usb_interface(root, f"{vid}/3-2.3.2:1.2", "3-2.3.2:1.2",
+                  bInterfaceNumber="02", bInterfaceClass="01")
+    class_node(root, "sound", "card10", f"{vid}/3-2.3.2:1.2", id="Video_1", number="10")
 
     ser = f"{ihub}/3-2.3.4"
     usb_device(root, ser, "3-2.3.4", idVendor="1a86", idProduct="55d3", busnum="3", devnum="43",
@@ -335,8 +354,24 @@ def two_dongles():
                   bInterfaceNumber="00", bInterfaceClass="02")
     class_node(root, "tty", "ttyACM2", f"{ser}/3-2.3.4:1.0", dev="166:2")
 
+    # An ordinary USB sound card on port 3 of the *second dongle's own internal hub*. It is the
+    # negative control the audio rule needs and nothing else in the fixture set provides: a sound
+    # card contained under the dongle's hub, alongside its capture node, on a different USB
+    # device. §8's evidence-3 containment would pair it; evidence 1 -- identical busnum:devnum,
+    # which is the only rule `discovery::audio_for` implements -- must not. The hub has four
+    # ports and two of them are free, so nothing about the arrangement is exotic. The ids,
+    # product string and ALSA `id` are this desk's own `5-1.1.1` (0d8c:0016, card0 "Device",
+    # read 2026-09-11); its position here is synthetic, like the rest of this tree.
+    snd = f"{ihub}/3-2.3.3"
+    usb_device(root, snd, "3-2.3.3", idVendor="0d8c", idProduct="0016", busnum="3", devnum="42",
+               speed="12", bDeviceClass="00", product="USB Audio Device", manufacturer="C-Media")
+    usb_interface(root, f"{snd}/3-2.3.3:1.0", "3-2.3.3:1.0",
+                  bInterfaceNumber="00", bInterfaceClass="01")
+    class_node(root, "sound", "card9", f"{snd}/3-2.3.3:1.0", id="Device", number="9")
+
     port(root, hs, "3-2", 3, device_path=ihub)
     port(root, ihub, "3-2.3", 2, device_path=vid)
+    port(root, ihub, "3-2.3", 3, device_path=snd)
     port(root, ihub, "3-2.3", 4, device_path=ser)
     publish(root, final)
 

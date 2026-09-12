@@ -156,6 +156,17 @@ pub struct Stats {
     /// that the reply parser is realigned and a CH9329 is answering, so it is `Some` exactly when
     /// a link has been accepted at least once — the version and lock bits are a by-product.
     pub device_info: Option<DeviceInfo>,
+    /// How many times [`Stats::device_info`] has been written — by a commissioning or by a
+    /// [`crate::input::Producer::refresh_device_info`] request. A caller that needs a *fresh*
+    /// reading asks for one and waits for this number to move; see §12 Stage 4c, which refuses to
+    /// type letters into a target whose CapsLock is on and must not decide that from the reading
+    /// the link was commissioned with (D2).
+    pub device_info_generation: u64,
+    /// [`Stats::device_info`] is not an answer to the most recent
+    /// [`crate::input::Producer::refresh_device_info`]: nobody could ask. A caller deciding
+    /// something from the target's lock bits must treat them as unknown rather than as current
+    /// (§12 Stage 4c, D2).
+    pub device_info_stale: bool,
     /// Queue entries discarded by a reconnect's "never replay" drain (§2.7 step 1). A click
     /// queued three seconds ago may land somewhere destructive, so it is dropped and counted
     /// rather than delivered late.

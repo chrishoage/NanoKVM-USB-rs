@@ -342,6 +342,28 @@ impl Producer {
         Ok(())
     }
 
+    /// Ask the writer for a fresh `GET_INFO` (§12 Stage 4c), and return the
+    /// [`Stats::device_info_generation`] the request is against.
+    ///
+    /// **Non-blocking, and it enqueues nothing.** Like the cancellation flag it is one slot, so
+    /// repeated requests coalesce; the writer services it between frames and then advances the
+    /// generation, whether or not the device answered. A caller that needs the answer waits for
+    /// the snapshot's generation to pass **the number returned here** and then reads
+    /// [`Stats::device_info`].
+    ///
+    /// The generation comes back from this call rather than from a following `stats()` because a
+    /// writer that answers in between would otherwise hand the caller a baseline that has already
+    /// moved, and the caller would wait out its whole deadline for an answer it already had. It is
+    /// read in the same critical section the request is made in (`Shared::request_info_refresh`).
+    ///
+    /// The caller that needs this is the viewer's clipboard paste: the target's CapsLock decides
+    /// whether the letters it is about to type arrive inverted (D2), and the reading it must not
+    /// decide from is the one the link happened to be commissioned with.
+    #[must_use = "the returned generation is the baseline a caller waits on"]
+    pub fn refresh_device_info(&self) -> u64 {
+        self.shared.request_info_refresh()
+    }
+
     /// Request a release-all (§2.6): focus loss, capture release, an explicit binding, or
     /// shutdown. Bumps `requested_epoch`, sets the 1-slot cancellation flag, disengages input and
     /// wakes the writer. It enqueues nothing and it never blocks on the writer or the device,
@@ -488,6 +510,8 @@ impl Producer {
             reconnect_attempts: load(&c.reconnect_attempts),
             down_since: link_state.down_since,
             device_info: link_state.device_info,
+            device_info_generation: link_state.info_generation,
+            device_info_stale: link_state.info_stale,
             queue_discarded_on_reconnect: load(&c.queue_discarded_on_reconnect),
             degraded: self.shared.degraded.load(Ordering::SeqCst),
             acked_epoch: load(&self.shared.acked_epoch),

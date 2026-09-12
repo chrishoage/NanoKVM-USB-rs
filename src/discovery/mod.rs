@@ -63,6 +63,29 @@
 //! names `--video`/`--serial`, because that is the one case where the automatic answer can be
 //! wrong with nothing looking wrong.
 //!
+//! ## The third node: the sound card (§12 Stage 4a)
+//!
+//! The dongle's `345f:2133` carries **five** interfaces: two UVC (`1.0`, `1.1`), a USB Audio
+//! Class control and streaming pair (`1.2`, `1.3`, bound to `snd-usb-audio`) and a HID interface
+//! (`1.4`) nothing here uses. So `/sys/class/sound/cardN/device` resolves to an interface of the
+//! *same USB device* as the capture node's — which is [`Evidence::SameDevice`], §8's item 1, the
+//! proof the video-and-serial pairing cannot have on this hardware and does not need to fall back
+//! from here. [`audio_for`] therefore implements **only** that rule.
+//!
+//! It is emphatically not the containment rule. Anything else plugged into the dongle's own
+//! internal hub is contained by that hub exactly as the capture device is, and a USB sound card
+//! on a free port of it — `fixtures/sysfs/two-dongles` carries one — is a card that containment
+//! would pair and same-device rejects.
+//!
+//! The card is named to ALSA as `hw:<N>`, with `<N>` parsed back out of the `card<N>` directory
+//! name **at open time, never remembered** ([`SoundCard::number`]): card numbers renumber on
+//! replug exactly as `/dev` names do (C13). No ALSA call happens here; this module still reads
+//! `/sys` and runs one `QUERYCAP`, and nothing else.
+//!
+//! A missing, unpaired or ambiguous card is never an error. §4.1 rev 5 makes audio a side channel
+//! that must change nothing about video or input, so [`AudioPairing`] has a variant for each and
+//! all of them are printed rather than raised.
+//!
 //! ## Explicit overrides are not discovery's to veto
 //!
 //! §8: "Always honour explicit `--serial` and `--video` overrides, which also make the tool
@@ -86,7 +109,10 @@ pub mod sysfs;
 pub mod testing;
 
 pub use probe::{NoProbe, NodeProbe, RealProbe};
-pub use reopen::{DiscoveringLinkSource, DiscoveringOpener, Mode, NodeResolver};
+pub use reopen::{
+    CardResolver, DiscoveringCardOpener, DiscoveringLinkSource, DiscoveringOpener, Mode,
+    NodeResolver, ResolvedCard,
+};
 pub use sysfs::{RealSysfs, Sysfs};
 
 use std::fmt;
@@ -101,6 +127,12 @@ const TTY_CLASS: &str = "/class/tty";
 const TTY_PREFIX: &str = "ttyACM";
 /// Video nodes are `video*`; `v4l-subdev*` and `media*` live in other classes.
 const VIDEO_PREFIX: &str = "video";
+/// The class directory ALSA cards register under (§12 Stage 4a).
+const SOUND_CLASS: &str = "/class/sound";
+/// `/sys/class/sound` also holds `controlC8`, `pcmC8D0c`, `seq` and `timer`. Only `card<N>` is a
+/// card, and the `<N>` is the card number — which is why it is parsed back out of the name rather
+/// than remembered from anywhere (see [`SoundCard::number`]).
+const CARD_PREFIX: &str = "card";
 
 /// MACROSILICON "USB2 Video" / "USB3 Video" — the dongle's capture function (§8, `topology.md`).
 pub const VIDEO_ID: (u16, u16) = (0x345f, 0x2133);
@@ -229,6 +261,163 @@ pub struct SerialNode {
     pub usb: Option<UsbDevice>,
 }
 
+/// An ALSA card and the USB device it belongs to (§12 Stage 4a).
+///
+/// The dongle's `345f:2133` carries a USB Audio Class control/streaming pair on interfaces `1.2`
+/// and `1.3` alongside its two UVC interfaces, so `/sys/class/sound/cardN/device` resolves to an
+/// interface of the **same USB device** as the capture node's. That is §8's evidence 1 — the
+/// strongest kind, the one the video-and-serial pairing cannot have on this hardware — and it is
+/// the only rule [`audio_for`] implements. See the module docs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoundCard {
+    /// sysfs-absolute path of the card directory, e.g. `/devices/.../3-2.2.2:1.2/sound/card8`.
+    pub sysfs: PathBuf,
+    /// The kernel's name for it, e.g. `card8`. **This is where the card number comes from.**
+    pub name: String,
+    /// The card's ALSA id (`/sys/class/sound/cardN/id`), e.g. `Video`. Used only for the
+    /// `hw:CARD=` spelling and for the listing; nothing pairs on it.
+    pub id: Option<String>,
+    /// The USB device the class walk resolved this card to. `None` when it resolves to something
+    /// that is not a USB device at all — a PCI codec, an HDMI audio function — which is the
+    /// common case on any desk and is why this is an `Option` rather than a filter.
+    pub usb: Option<UsbDevice>,
+}
+
+impl SoundCard {
+    /// The card number, parsed back out of [`SoundCard::name`].
+    ///
+    /// **Derived at every call, never remembered.** Card numbers renumber on replug exactly as
+    /// `/dev/video*` and `/dev/ttyACM*` names do (C13): the kernel hands out the lowest free
+    /// index, so a card that was 8 comes back as 9 while something still holds 8. Anything that
+    /// stored the number would open a stranger's card after a replug, which is the whole point of
+    /// §8's "a node that was discovered is rediscovered on every attempt".
+    pub fn number(&self) -> Option<u32> {
+        self.name.strip_prefix(CARD_PREFIX)?.parse().ok()
+    }
+
+    /// The ALSA device string to open this card's first PCM with, e.g. `hw:8`.
+    ///
+    /// `None` for a card whose name is not `card<N>`, which cannot happen for a card the class
+    /// walk enumerated and is reported rather than asserted anyway: nothing here may panic on a
+    /// device path.
+    pub fn alsa_device(&self) -> Option<String> {
+        Some(format!("hw:{}", self.number()?))
+    }
+
+    /// The same card by its ALSA id, e.g. `hw:CARD=Video`. For logs: it is stable across a
+    /// renumber where [`SoundCard::alsa_device`] is not, but it is not unique — two identical
+    /// dongles produce two cards called `Video`, and ALSA then resolves this to the lower one. So
+    /// it is printed and never opened.
+    pub fn alsa_card_id(&self) -> Option<String> {
+        Some(format!("hw:CARD={}", self.id.as_ref()?))
+    }
+}
+
+impl fmt::Display for SoundCard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        if let Some(id) = &self.id {
+            write!(f, " \"{id}\"")?;
+        }
+        if let Some(dev) = self.alsa_device() {
+            write!(f, " ({dev})")?;
+        }
+        match &self.usb {
+            Some(u) => write!(f, " on {u}"),
+            // Not the `describe` wording the node listings use: a PCI codec is not a node
+            // discovery failed to enumerate, it is a card that could never pair, and saying so is
+            // the answer to "why is my card not listed against the dongle?".
+            None => write!(f, " — not a USB device"),
+        }
+    }
+}
+
+/// Which sound card, if any, belongs to a pair's capture device (§12 Stage 4a).
+///
+/// Audio is a side channel: §4.1 rev 5 requires a missing or ambiguous card to change nothing
+/// about video or input, so none of these variants is an error. They are all things
+/// `nanokvm devices` prints and the viewer's title surfaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioPairing {
+    /// Exactly one card is on the capture node's own USB device.
+    Paired(SoundCard),
+    /// No card is. An ordinary outcome: a dongle whose audio interface is unbound, a kernel
+    /// without `snd-usb-audio`, or a capture device that simply has no audio function.
+    NoCard,
+    /// More than one card is on that USB device. §8's policy — never silently pick one — applies
+    /// here too, so nothing is selected and the candidates are listed.
+    Ambiguous(Vec<SoundCard>),
+    /// The video node was named explicitly and discovery never enumerated it, so there is no USB
+    /// device to compare a card against. Not "no audio": "not asked".
+    Unknown,
+}
+
+impl AudioPairing {
+    /// The card to open, if there is exactly one.
+    pub fn card(&self) -> Option<&SoundCard> {
+        match self {
+            AudioPairing::Paired(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AudioPairing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AudioPairing::Paired(card) => write!(
+                f,
+                "{card} — same USB device as the capture node (busnum:devnum) — proof"
+            ),
+            AudioPairing::NoCard => write!(
+                f,
+                "no audio: no sound card belongs to the capture node's USB device"
+            ),
+            AudioPairing::Ambiguous(cards) => {
+                write!(
+                    f,
+                    "no audio: {} sound cards belong to the capture node's USB device, \
+                           refusing to guess between",
+                    cards.len()
+                )?;
+                for c in cards {
+                    write!(f, " {}", c.name)?;
+                }
+                Ok(())
+            }
+            AudioPairing::Unknown => write!(
+                f,
+                "no audio: the video node was given explicitly and discovery never enumerated \
+                 it, so there is no USB device to match a sound card against"
+            ),
+        }
+    }
+}
+
+/// The card on `video`'s own USB device, by §8's evidence 1 and nothing weaker.
+///
+/// **Deliberately not the containment rule.** The video-and-serial pairing has to fall back to
+/// "both are direct children of the dongle's own hub" because on a USB 2.0 link those really are
+/// two USB devices (§8). Audio needs no fallback: the sound card is an interface of the capture
+/// device itself, so the strongest rule is also the only one available — and the weaker one would
+/// be wrong, because anything else plugged into the dongle's internal hub is contained by it too
+/// (`fixtures/sysfs/two-dongles` carries exactly that case).
+fn audio_for(video: Option<&UsbDevice>, cards: &[SoundCard]) -> AudioPairing {
+    let Some(video) = video else {
+        return AudioPairing::Unknown;
+    };
+    let mut matched: Vec<SoundCard> = cards
+        .iter()
+        .filter(|c| c.usb.as_ref().is_some_and(|u| same_device(video, u)))
+        .cloned()
+        .collect();
+    match matched.len() {
+        0 => AudioPairing::NoCard,
+        1 => AudioPairing::Paired(matched.remove(0)),
+        _ => AudioPairing::Ambiguous(matched),
+    }
+}
+
 /// Why two nodes are believed to be one dongle (§8, strongest first).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evidence {
@@ -304,6 +493,9 @@ pub struct Pair {
     pub video: VideoNode,
     pub serial: SerialNode,
     pub evidence: Option<Evidence>,
+    /// The sound card on the capture node's own USB device (§12 Stage 4a). Never an error: audio
+    /// is a side channel and its absence changes nothing about this pair.
+    pub audio: AudioPairing,
 }
 
 impl fmt::Display for Pair {
@@ -317,7 +509,8 @@ impl fmt::Display for Pair {
                 Some(e) => e.to_string(),
                 None => "no evidence (both nodes given explicitly)".to_string(),
             }
-        )
+        )?;
+        write!(f, "\n      audio: {}", self.audio)
     }
 }
 
@@ -329,6 +522,10 @@ impl fmt::Display for Pair {
 pub struct Inventory {
     pub videos: Vec<VideoNode>,
     pub serials: Vec<SerialNode>,
+    /// Every `/sys/class/sound/card*` on the machine, including the ones that resolve to no USB
+    /// device at all. They are listed rather than filtered because a card the user expected to
+    /// pair and which did not is exactly what this listing exists to explain.
+    pub cards: Vec<SoundCard>,
     pub pairs: Vec<Pair>,
 }
 
@@ -347,6 +544,7 @@ impl Inventory {
         Inventory {
             videos: self.videos.clone(),
             serials: self.serials.clone(),
+            cards: self.cards.clone(),
             pairs: self.pairs.iter().filter(|p| keep(p)).cloned().collect(),
         }
     }
@@ -446,6 +644,13 @@ impl fmt::Display for Listing<'_> {
                 s.dev.display(),
                 describe(s.usb.as_ref())
             )?;
+        }
+        writeln!(f, "sound cards:")?;
+        if inv.cards.is_empty() {
+            writeln!(f, "  (none)")?;
+        }
+        for c in &inv.cards {
+            writeln!(f, "   {c}")?;
         }
         writeln!(f, "pairs:")?;
         if inv.pairs.is_empty() {
@@ -659,6 +864,9 @@ impl fmt::Display for DiscoveryError {
 pub fn inventory(sysfs: &dyn Sysfs, probe: &dyn NodeProbe) -> Inventory {
     let mut videos = collect_video_nodes(sysfs);
     let serials = collect_serial_nodes(sysfs);
+    // Read-only, and no ALSA: discovery's rule is `/sys` plus one `QUERYCAP` and nothing else
+    // (§8, module docs). Opening the card is `audio`'s business, at the moment it wants samples.
+    let cards = collect_sound_cards(sysfs);
 
     // Topology first, with no probe answers at all: a pair that no rule accepts can never be
     // selected, so its nodes never need opening.
@@ -703,6 +911,7 @@ pub fn inventory(sysfs: &dyn Sysfs, probe: &dyn NodeProbe) -> Inventory {
         .into_iter()
         .filter(|(vi, _, _)| videos[*vi].eligible(&snapshot))
         .map(|(vi, si, evidence)| Pair {
+            audio: audio_for(videos[vi].usb.as_ref(), &cards),
             video: videos[vi].clone(),
             serial: serials[si].clone(),
             evidence: Some(evidence),
@@ -712,6 +921,7 @@ pub fn inventory(sysfs: &dyn Sysfs, probe: &dyn NodeProbe) -> Inventory {
     Inventory {
         videos,
         serials,
+        cards,
         pairs,
     }
 }
@@ -794,10 +1004,14 @@ fn explicit_pair(sysfs: &dyn Sysfs, inv: &Inventory, video: &Path, serial: &Path
         .as_ref()
         .zip(serial.usb.as_ref())
         .and_then(|(v, s)| evidence_for(sysfs, v, s));
+    // The card is matched against whatever the *video* node resolved to, which for a node
+    // discovery never enumerated is nothing at all — `AudioPairing::Unknown`, not "no audio".
+    let audio = audio_for(video.usb.as_ref(), &inv.cards);
     Pair {
         video,
         serial,
         evidence,
+        audio,
     }
 }
 
@@ -865,6 +1079,34 @@ fn collect_serial_nodes(sysfs: &dyn Sysfs) -> Vec<SerialNode> {
         .map(|(dev, usb)| SerialNode {
             dev,
             usb: Some(usb),
+        })
+        .collect()
+}
+
+/// Every `/sys/class/sound/card<N>`, USB or not.
+///
+/// Unlike the video and tty walks this keeps the entries that do **not** resolve to a USB device.
+/// A desk has several — the HDMI codec, the motherboard's analogue output — and they are the
+/// negative control the pairing rule is checked against, as well as the answer to a user asking
+/// why their card did not pair. `controlC8`, `pcmC8D0c`, `seq` and `timer` share this directory
+/// and are not cards; the `card` prefix plus the number parse in [`SoundCard::number`] is what
+/// keeps them out.
+fn collect_sound_cards(sysfs: &dyn Sysfs) -> Vec<SoundCard> {
+    sysfs
+        .list_dir(Path::new(SOUND_CLASS))
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.file_name()?.to_str()?.to_string();
+            let card = SoundCard {
+                sysfs: sysfs.read_link(&entry).unwrap_or(entry.clone()),
+                name,
+                id: sysfs.read_attr(&entry, "id"),
+                usb: usb_device_of(sysfs, &entry),
+            };
+            // `card.number()` parses the name, so this is also the filter that drops `controlC8`
+            // and friends: nothing without a `card<N>` name gets in, and nothing that gets in can
+            // fail to produce an ALSA device string later.
+            card.number().map(|_| card)
         })
         .collect()
 }

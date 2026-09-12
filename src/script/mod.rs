@@ -46,6 +46,19 @@ pub use dry_run::render;
 pub use fixtures::{Fixture, FixtureError, Fixtures};
 pub use layout::{Layout, LayoutError};
 
+/// Milliseconds between two reports of a script, and the one authority for that number.
+///
+/// **40 ms, and it paces the *target*, not the chip.** A keyboard ack round trip measured
+/// 4.16–4.19 ms on this desk (`docs/STAGE1_FINDINGS.md` "hardware numbers", A11), so the link
+/// could take reports ten times faster; desktops drop keys delivered faster than a human types
+/// them. It is the default of `--delay-ms` on `key`, `type` and `macro` (`cli::keys`), and the
+/// rate the viewer's clipboard paste runs at (§12 Stage 4c: "at the paced rate Stage 3 measured").
+///
+/// It lives here, in the pure module both callers already depend on, so that "the paste runs at
+/// the rate `type` runs at" is a fact the compiler keeps rather than two literals that agree
+/// today.
+pub const REPORT_DELAY_MS: u64 = 40;
+
 /// The chord and macro grammar, as the user reads it.
 ///
 /// Lives here rather than in the CLI because the compiler is what enforces it: the two would

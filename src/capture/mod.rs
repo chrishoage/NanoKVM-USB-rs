@@ -254,6 +254,25 @@ pub trait SourceOpener: Send {
     /// A one-line description of *what would be opened*, for logs and the window title. Unlike
     /// [`FrameSource::describe`] this must work with no device present.
     fn describe(&self) -> String;
+
+    /// Change the mode the **next** [`SourceOpener::open`] will negotiate (§12 Stage 4b).
+    ///
+    /// This is the smallest runtime format switch the chrome's Video popover needs, and it is
+    /// deliberately shaped as "change what a reopen will ask for" rather than "change the format
+    /// of the open device". V4L2 refuses `S_FMT` on a streaming node, and the pipeline already
+    /// owns a reopen path that does `S_FMT`/`S_PARM`/`STREAMON` correctly and counts it
+    /// (`Step::Reopen`, C14's format watchdog); a second route into the driver would be a second
+    /// copy of the one negotiation this client does not want two of.
+    ///
+    /// Returns `false` for an opener that cannot renegotiate — every test double, and
+    /// [`super::pipeline::Pipeline::start`]'s one-shot wrapper, which has no device to reopen. A
+    /// `false` means the pipeline leaves the current mode alone and says so, rather than
+    /// destroying a working stream to reopen at the same size.
+    ///
+    /// The default is `false`: an opener that has not thought about this cannot renegotiate.
+    fn set_format(&mut self, _width: u32, _height: u32, _fps: u32) -> bool {
+        false
+    }
 }
 
 /// Lock-poisoning policy for this module.
