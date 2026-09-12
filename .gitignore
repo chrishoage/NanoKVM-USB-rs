@@ -3,15 +3,8 @@
 Cargo.lock
 !/Cargo.lock
 
-# Captured frames: the bulk corpora are not committed, curated evidence is.
-#
-# fixtures/frames/ holds the 120-frame decode-benchmark corpus (~32 MB) of an idle
-# desktop. It is reproducible by re-running the capture spike and is excluded.
-#
-# fixtures/frames/absrange/ is different and is deliberately KEPT: fifteen curated
-# frames that are the visual proof for the absolute-coordinate finding (§3.4), showing
-# where the cursor actually lands at full scale and past the wrap. Small, and not
-# reproducible if the target's screen changes. Do not "tidy" these away.
+# Bulk decode corpora are local recordings. Curated cursor evidence in absrange/
+# is committed because resampling or recapturing would change the measurements.
 /fixtures/frames/*.jpg
 /fixtures/frames/*.jpeg
 /fixtures/frames/*.raw
@@ -19,24 +12,16 @@ Cargo.lock
 /fixtures/traffic/*.pcap
 /fixtures/traffic/*.bin
 
-# Read-only upstream reference checkout, not part of this project.
+# Local upstream reference checkout.
 /reference/
 
-# sysfs fixture trees: build output, not source.
-#
-# The source is fixtures/sysfs/usb2-desk.sysfs — the 2026-09-10 recording of this desk,
-# serialised to one line-oriented file — plus fixtures/sysfs/synthesize.py, which expands it
-# and reconstructs the other trees from it. Expanded, they are ~1300 one-line files.
-# `cargo test` materialises them on demand (src/discovery/testing.rs), or run
-# `python3 fixtures/sysfs/synthesize.py` by hand. Every subdirectory is ignored, so a new
-# tree needs no entry here; only the top-level files are tracked.
+# Sysfs trees are generated from the recording and synthesize.py.
+# Only the top-level source files are committed.
 /fixtures/sysfs/*/
 /fixtures/sysfs/.synthesize.lock
 __pycache__/
 
-# egui_kittest snapshot scratch. The baseline `.png` under tests/snapshots/ IS committed — it is
-# the visual evidence for §12 Stage 4b — and these three are what a failing or updated comparison
-# leaves beside it.
+# Keep baseline PNGs; ignore comparison scratch images.
 /tests/snapshots/*.new.png
 /tests/snapshots/*.diff.png
 /tests/snapshots/*.old.png
