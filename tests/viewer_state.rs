@@ -1,15 +1,4 @@
-//! The viewer's pure surfaces: the capture reducer, the letterbox geometry and the cursor mapping
-//! (plan §2.6, §2.8, §3.4, §12 Stage 1).
-//!
-//! Everything here is a function of its arguments. There is no window, no GPU, no producer and no
-//! clock, so none of it needs a display and none of it is timing-dependent. The properties that
-//! matter — "a forwarded press always has a forwardable release", "leaving capture always runs the
-//! full release sequence", "a viewport is always inside its attachment" — are asserted over swept
-//! inputs rather than over one happy path, because each of them was broken by an input nobody had
-//! thought to try.
-//!
-//! The end-to-end half, where the actions are performed against a real writer thread, is
-//! `viewer_capture_session.rs`.
+//! Pure capture reducer, letterbox geometry, and pointer projection tests.
 
 use nanokvm::input::{Event, ReleaseOutcome, ReleaseReason, ReleaseRecord, SubmitError};
 use nanokvm::proto::report::{button, ABS_MAX};
@@ -97,7 +86,7 @@ fn apply(mask: &mut u8, actions: &[Action]) {
                     *mask &= !button;
                 }
             }
-            // §2.6: the writer synthesizes a full release and clears its own held masks.
+            // Mirror the writer’s release and held-state reset.
             Action::ReleaseAll(_) => *mask = 0,
             _ => {}
         }
@@ -218,7 +207,7 @@ fn h1_letterbox_sweep_never_escapes_the_window() {
 
 // ---------------------------------------------------------------------------------------------
 // H2 — an absolute coordinate outside 0..=4095 would jump the pointer somewhere arbitrary on a
-// live console (§3.4).
+// live console.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -313,7 +302,7 @@ fn m2_a_resize_changes_the_next_cursor_mapping() {
         old, new,
         "the mapping ignored the new window size: {old:?} both times"
     );
-    // And it agrees exactly with the rectangle for the size it was given.
+    // And it agrees with the rectangle for the size it was given.
     let rect = letterbox(after, frame).expect("rect");
     assert_eq!(
         new,
@@ -323,8 +312,7 @@ fn m2_a_resize_changes_the_next_cursor_mapping() {
 
 #[test]
 fn m2_a_degenerate_window_or_frame_maps_to_nothing() {
-    // §3.4: there is no defensible coordinate here, and inventing one moves a pointer on a live
-    // console.
+    // An invalid rectangle cannot yield a safe target coordinate.
     assert_eq!(
         input_map::map_cursor_in_window((0.0, 0.0), (0, 720), (1920, 1080)),
         None
@@ -335,10 +323,7 @@ fn m2_a_degenerate_window_or_frame_maps_to_nothing() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// H3 — every path out of capture runs the whole §2.6 sequence, and nothing is forwarded outside
-// `Captured`.
-// ---------------------------------------------------------------------------------------------
+// Every capture exit must release input; forwarding requires `Captured`.
 
 #[test]
 fn h3_leaving_capture_always_runs_the_full_release_sequence() {
@@ -452,18 +437,15 @@ fn n6_an_enter_pressed_while_captured_is_forwarded_both_ways() {
     assert!(t.keys_down.is_empty(), "and so should the release");
 }
 
-// ---------------------------------------------------------------------------------------------
-// B1 — a consumed press must not swallow a later, genuine release. The defect: a button-UP that
-// arrived while `Released`/`Engaging` left the consumed flag set, so the next real click had its
-// press forwarded and its release eaten, leaving LEFT held on the target.
-// ---------------------------------------------------------------------------------------------
+// A release received while disengaged must clear the consumed-press flag.
+// Otherwise the next real click can lose its release and leave LEFT held.
 
 #[test]
 fn b1_a_button_up_while_engaging_does_not_swallow_the_next_real_click() {
     let mut t = Target::new();
 
     // The user clicks to capture. The writer has not acknowledged the previous release-all yet, so
-    // this sits in `Engaging` (§2.6).
+    // this sits in `Engaging`.
     t.feed(left(true));
     assert_eq!(t.session.capture(), CaptureState::Engaging);
 
@@ -609,7 +591,7 @@ fn m1_an_unconsumed_button_up_while_engaging_also_retries() {
     assert_eq!(actions, vec![Action::TryEngage]);
 }
 
-/// The `Enter` that captured is the one input that must **not** retry on its way past: its key-up
+/// The `Enter` that captured is the one input that must not retry on its way past: its key-up
 /// is consumed, and consuming it is the whole action.
 #[test]
 fn m1_the_consumed_enter_up_is_consumed_rather_than_retried() {
@@ -706,7 +688,7 @@ fn n5_a_repeated_close_releases_once() {
 }
 
 /// And nothing re-captures behind a close. The writer's shutdown release-all is the last thing
-/// that may reach the target (§2.6), so a click arriving while the loop winds down must not arm
+/// that may reach the target, so a click arriving while the loop winds down must not arm
 /// anything.
 #[test]
 fn n5_nothing_re_captures_after_a_close() {
@@ -725,10 +707,7 @@ fn n5_nothing_re_captures_after_a_close() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// H6 — the client-side escape. §12 Stage 1 requires one that does not depend on the compositor's
-// configuration, and there must be exactly one.
-// ---------------------------------------------------------------------------------------------
+// The local release binding must work independently of compositor shortcuts.
 
 #[test]
 fn h6_only_keycode_pause_releases() {
@@ -743,9 +722,7 @@ fn h6_only_keycode_pause_releases() {
         ),
         KeyAction::Release
     );
-    // Everything else that is mapped is forwarded, including the keys a user might guess at —
-    // **in every modifier state**, which is what keeps §12 Stage 4c's paste chord from having
-    // quietly reserved a second key.
+    // All other mapped keys remain forwardable in every modifier state.
     for c in [KeyCode::ScrollLock, KeyCode::Escape, KeyCode::F12] {
         for modifiers in [
             ModifiersState::empty(),
@@ -767,7 +744,7 @@ fn h6_only_keycode_pause_releases() {
             );
         }
     }
-    // The one chord there is, on the one key already reserved (§12 Stage 4c).
+    // The one chord there is, on the one key already reserved.
     assert_eq!(
         input_map::map_key(
             PhysicalKey::Code(KeyCode::Pause),
@@ -779,13 +756,7 @@ fn h6_only_keycode_pause_releases() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// S2-notices — §2.8 says an overflow must be surfaced, "not a silent counter". Stage 1 released
-// the session, logged a warning and put the title back to `[click or Enter to capture]`, which is
-// what the title says when the *user* pressed Pause: the two failures a user cannot predict were
-// indistinguishable from the one they asked for. The reason now lives in the session, so it is on
-// screen until input is actually flowing again.
-// ---------------------------------------------------------------------------------------------
+// Failure notices must distinguish queue overflow and link loss from a user release.
 
 #[test]
 fn s2_a_refused_submission_leaves_a_notice_saying_why_input_stopped() {
@@ -895,11 +866,8 @@ fn s2_a_second_failure_replaces_the_notice_rather_than_stacking_on_it() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// S2-release-notice — §2.6.1: an `Unsent` release means the target may still be holding keys.
-// Across a §2.7 reconnect the writer sends a release-all on the replacement link, and *that* is
-// what makes the warning obsolete. Nothing else may clear it.
-// ---------------------------------------------------------------------------------------------
+// Keep an unsent-release warning until a replacement link submits cleanup.
+// Local state changes cannot prove the target’s keys were released.
 
 fn record(epoch: u64, reason: ReleaseReason, outcome: ReleaseOutcome) -> ReleaseRecord {
     ReleaseRecord {
@@ -936,9 +904,7 @@ fn s2_the_reconnects_release_clears_an_unsent_notice() {
     )));
     assert!(notice.raised());
 
-    // §2.7 step 3: the writer commissions the replacement link and releases everything on it.
-    // The keys really are up now, so the warning must go — this is the whole reason the notice
-    // is driven from `last_release` rather than latched when the link went down.
+    // A submitted release on the replacement link supersedes the old warning.
     let reconnected = record(5, ReleaseReason::Reconnected, ReleaseOutcome::Submitted);
     assert_eq!(notice.observe(Some(reconnected)), Some(reconnected));
     assert!(

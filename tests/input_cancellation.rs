@@ -1,14 +1,7 @@
-//! §9.2 item 4 — **cancellation synchronization** (§2.6). The race is the point.
+//! Concurrent cancellation and local epoch acknowledgement.
 //!
-//! **No test in this file asserts that the device received anything** (§9.2 item 4, last bullet;
-//! §2.6.1). Acknowledgment is a *local barrier*: an advanced `acked_epoch` means the writer
-//! discarded all stale work and either handed the release to the transport or recorded it as
-//! unsent. It never means the chip processed it or that the target's HID state changed. Every
-//! assertion below is therefore about the order and content of the frames the writer *submitted*
-//! to the link, and about the locally observable gating — never about delivery.
-//!
-//! Determinism comes from parking the writer inside a transact and releasing it explicitly. No
-//! test sleeps.
+//! A completed local barrier does not establish device receipt; assertions check
+//! report order and release outcomes separately.
 
 use std::sync::Arc;
 use std::thread;
@@ -38,9 +31,8 @@ fn config() -> Config {
     }
 }
 
-/// (a) The §2.6 race, in full: a key-down that was dequeued and passed its epoch check, then
-/// stalled inside the link, while cancellation is triggered during the stall. The release must
-/// land **after** that write, and no pre-cancellation event may be written after the release.
+/// Cancellation during an in-flight press must release after that report, with no
+/// old-session input delivered afterward.
 #[test]
 fn a_stale_key_down_is_never_written_after_the_release() {
     let (link, ctl) = fake_link();
@@ -93,7 +85,7 @@ fn a_stale_key_down_is_never_written_after_the_release() {
 }
 
 /// (b) A completely full queue still produces a release: the release is synthesized by the writer
-/// and never enqueued, so the flag always has room (§2.6, §2.8).
+/// and never enqueued, so the flag always has room.
 #[test]
 fn a_full_queue_still_produces_a_release() {
     let (link, ctl) = fake_link();
@@ -127,7 +119,7 @@ fn a_full_queue_still_produces_a_release() {
     let _ = writer.shutdown();
 }
 
-/// (c) Repeated and concurrent triggers coalesce into **one** sequence and one release (§2.6).
+/// (c) Repeated and concurrent triggers coalesce into one sequence and one release.
 #[test]
 fn fifty_concurrent_triggers_produce_one_release() {
     let (link, ctl) = fake_link();
@@ -168,9 +160,7 @@ fn fifty_concurrent_triggers_produce_one_release() {
     let _ = writer.shutdown();
 }
 
-/// (d) A new session cannot submit until `engage` succeeds, and `engage` fails with
-/// `NotYetAcked` while the writer is stalled before the ack (§2.6 "gating the next capture
-/// session").
+/// Recapture cannot engage until the pending release is acknowledged.
 #[test]
 fn a_new_session_waits_for_the_ack_before_it_may_submit() {
     let (link, ctl) = fake_link();
@@ -216,7 +206,7 @@ fn a_new_session_waits_for_the_ack_before_it_may_submit() {
 }
 
 /// (e) Transport down: the ack still advances, the outcome is `Unsent`, `link_down` is surfaced,
-/// and input is not wedged (§2.6.1). A submission afterwards is **reported**, not silently
+/// and input is not wedged. A submission afterwards is reported, not silently
 /// accepted: `SubmitError::LinkDown`.
 #[test]
 fn a_dead_transport_advances_the_ack_and_reports_unsent() {
@@ -262,10 +252,7 @@ fn a_dead_transport_advances_the_ack_and_reports_unsent() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Unsent);
 }
 
-/// §9.2 item 4: **no frame is ever split by cancellation**. The `Link` seam makes framing atomic
-/// by construction — one `transact` is one whole frame — so the property to check is that every
-/// frame the writer submitted, across a cancellation storm, is a complete well-formed report of
-/// the length its command implies (5 and 7 for the mouse, 8 for the keyboard).
+/// Cancellation between transactions must never split a report.
 #[test]
 fn every_frame_on_the_link_is_complete() {
     let (link, ctl) = fake_link();
@@ -304,7 +291,7 @@ fn every_frame_on_the_link_is_complete() {
 }
 
 /// In `Abs` mode the release also puts the absolute device's buttons up, at the last known
-/// position — the chip presents the two mice as separate HID devices (§2.6).
+/// position — the chip presents the two mice as separate HID devices.
 #[test]
 fn a_release_in_abs_mode_releases_the_absolute_device_too() {
     let (link, ctl) = fake_link();
@@ -336,8 +323,7 @@ fn a_release_in_abs_mode_releases_the_absolute_device_too() {
     let _ = writer.shutdown();
 }
 
-/// Clean shutdown is a §2.6 trigger: the handle waits for the release to finish and reports its
-/// outcome.
+/// Shutdown waits for release completion and reports its outcome.
 #[test]
 fn shutdown_releases_everything_and_reports_the_outcome() {
     let (link, ctl) = fake_link();
@@ -357,12 +343,7 @@ fn shutdown_releases_everything_and_reports_the_outcome() {
     assert_eq!(frames[frames.len() - 1], rel_frame(0, 0, 0, 0));
 }
 
-// ---------------------------------------------------------------------------------------------
-// §2.6 "the writer checks the flag *between* frames" — and the frame is one `transact`, not one
-// queue entry. The three tests below are the regression suite for the adversarial review's MAJOR
-// finding: `flush_motion` wrote every split report of one coalesced run in a loop without
-// re-reading the flag, so a release-all triggered mid-run waited for the whole run — hundreds of
-// reports, seconds of a live console with a key or button still held.
+// Cancellation must interrupt split motion runs between reports, not just queue entries.
 
 /// One entry, one enormous accumulated delta. The release-all must land at the first frame
 /// boundary after the trigger, not after the run.
@@ -408,7 +389,7 @@ fn a_release_all_is_not_delayed_behind_a_split_motion_run() {
 /// The realistic shape of the same defect: no single huge delta, just an ordinary 1 kHz pointer
 /// moving at ordinary speed while the writer is behind by one stalled transact. Uncapped and
 /// unchecked this delayed the release by 126 reports, about 1.4 s at the measured 91 relative
-/// reports per second (§5.1).
+/// reports per second.
 #[test]
 fn a_realistic_motion_flood_does_not_delay_the_release_all() {
     let (link, ctl) = fake_link();
@@ -444,7 +425,7 @@ fn a_realistic_motion_flood_does_not_delay_the_release_all() {
 }
 
 /// Ten thousand relative events behind a stalled writer — an accumulation far past anything the
-/// cap allows — and the release-all still costs at most the **one** report already in flight.
+/// cap allows — and the release-all still costs at most the one report already in flight.
 #[test]
 fn a_ten_thousand_report_run_yields_the_release_all_within_one_report() {
     let (link, ctl) = fake_link();
@@ -485,7 +466,7 @@ fn a_ten_thousand_report_run_yields_the_release_all_within_one_report() {
 }
 
 /// The MINOR finding: the pointer mode survived the release-all, so a new session whose first
-/// event was a `Button` with no preceding motion emitted an **absolute** report at the *previous*
+/// event was a `Button` with no preceding motion emitted an absolute report at the *previous*
 /// session's coordinates — a click at a stale position on a live console. With the mode reset,
 /// the click goes out as a zero-motion relative report, which lands wherever the pointer is.
 #[test]

@@ -1,8 +1,4 @@
-//! Adversarial review of the idle-loss slice (`Link::is_down` + the bounded `next_entry` wait).
-//!
-//! These are the reviewer's spec for the fixer, not the slice's own tests. Each one names the
-//! property of §2.6.1 / §2.7 / C1 / C10 it pins and, where it fails, the defect it demonstrates.
-//! Nothing here touches hardware.
+//! Idle transport-loss regressions: detect hang-up, acknowledge cancellation, and reconnect.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,8 +65,8 @@ fn rig(n: usize) -> (Producer, WriterHandle, FakeSourceControl, Vec<FakeControl>
 // 1. The fake cannot tell "the writer did not write" from "the writer wrote".
 // ---------------------------------------------------------------------------
 
-/// `FakeControl::hang_up` makes every later call **unrecorded**, so the two assertions the slice's
-/// own idle test rests on — `frame_count()` unchanged and `calls().len()` unchanged — hold whether
+/// `FakeControl::hang_up` makes every later call unrecorded, so the two assertions the slice's
+/// own idle test rests on — `frame_count` unchanged and `calls.len` unchanged — hold whether
 /// or not the writer wrote to the dead link. A call that was refused is still a call the writer
 /// made, and the claim "no write was needed to discover it" is only testable if the fake records
 /// the attempt.
@@ -89,18 +85,17 @@ fn a_call_the_writer_makes_to_a_hung_up_fake_link_is_still_observable() {
         ctl.calls().len(),
         before,
         "a hung-up FakeLink swallows the calls made to it without trace, so \
-         `calls().len() == calls_before` cannot distinguish a writer that stayed silent from one \
+         `calls.len == calls_before` cannot distinguish a writer that stayed silent from one \
          that wrote to the dead link; the fake needs a refused-call counter"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 2. C1: an outage the device never recovers from must not wedge input.
+// 2. an outage the device never recovers from must not wedge input.
 // ---------------------------------------------------------------------------
 
-/// The idle path's §2.6.1 obligation, with **no replacement link ever**: the release is recorded
-/// `LinkDown`/`Unsent`, the ack still advances, and `engage` still succeeds — otherwise a cable
-/// that never comes back has wedged input for good (C1).
+/// Idle link loss records an unsent release and advances the epoch even without
+/// a replacement, preventing a permanently closed recapture gate.
 #[test]
 fn an_idle_hang_up_that_never_recovers_records_unsent_and_never_wedges_input() {
     let (producer, writer, _sctl, links) = rig(1);
@@ -113,7 +108,7 @@ fn an_idle_hang_up_that_never_recovers_records_unsent_and_never_wedges_input() {
     assert_eq!(
         record.outcome,
         ReleaseOutcome::Unsent,
-        "nothing could be sent on a hung-up link, and §2.6.1 says so out loud"
+        "nothing could be sent on a hung-up link, and  says so out loud"
     );
 
     let stats = producer.stats();
@@ -148,8 +143,8 @@ fn an_idle_hang_up_that_never_recovers_records_unsent_and_never_wedges_input() {
 // ---------------------------------------------------------------------------
 
 /// The poll must not double-count against the write path: one idle hang-up that is repaired is
-/// exactly two cancellation sequences (the `LinkDown` release and the `Reconnected` one) and
-/// exactly one reconnect — the same as a write-driven failure.
+/// two cancellation sequences (the `LinkDown` release and the `Reconnected` one) and
+/// one reconnect — the same as a write-driven failure.
 #[test]
 fn an_idle_hang_up_costs_exactly_one_outage_of_bookkeeping() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -174,14 +169,14 @@ fn an_idle_hang_up_costs_exactly_one_outage_of_bookkeeping() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Stage 1 (`spawn`, no reconnect): reported once, and no spin.
+// 4. (`spawn`, no reconnect): reported once, and no spin.
 // ---------------------------------------------------------------------------
 
-/// A `spawn`ed (Stage 1) writer has no reconnect, so after the idle poll reports the loss it parks
-/// again with `link_down` set. It must report it **once** and then stay quiet: a writer that
+/// A `spawn`ed  writer has no reconnect, so after the idle poll reports the loss it parks
+/// again with `link_down` set. It must report it once and then stay quiet: a writer that
 /// re-triggered on every 100 ms wake would spin the epoch for the life of the process.
 #[test]
-fn a_stage_one_writer_reports_an_idle_hang_up_once_and_then_stays_quiet() {
+fn a_fixed_link_writer_reports_an_idle_hang_up_once_and_then_stays_quiet() {
     let (link, ctl) = fake_link();
     let (producer, writer) = spawn(link, config());
 
@@ -210,7 +205,7 @@ fn a_stage_one_writer_reports_an_idle_hang_up_once_and_then_stays_quiet() {
 // 5. Shutdown stays bounded on the idle path.
 // ---------------------------------------------------------------------------
 
-/// The bounded-shutdown guarantee, reached through the **idle** loss path: the link hangs up with
+/// The bounded-shutdown guarantee, reached through the idle loss path: the link hangs up with
 /// nothing queued, the writer drops it and goes looking for a replacement, and the shutdown that
 /// lands while that open is parked must still return promptly.
 #[test]
@@ -253,9 +248,7 @@ fn a_shutdown_during_the_reopen_the_idle_poll_provoked_returns_promptly() {
 // 6. A submission racing the health poll is never lost silently.
 // ---------------------------------------------------------------------------
 
-/// §2.6.1: input that is dropped because the transport went away is always accompanied by a
-/// release record saying so. Submit into the same window the hang-up lands in, repeatedly, and the
-/// invariant must hold however the two interleave.
+/// Input discarded during concurrent link loss must have a corresponding release record.
 #[test]
 fn a_submission_racing_the_health_poll_is_always_covered_by_a_release_record() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -290,7 +283,7 @@ fn a_submission_racing_the_health_poll_is_always_covered_by_a_release_record() {
         links[1].frames().len(),
         3,
         "the replacement link saw only the release-all pair and GET_INFO — never a replay of \
-         input produced against the session that died (§2.7 step 1)"
+         input produced against the session that died "
     );
 
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
@@ -336,7 +329,7 @@ fn an_idle_writer_on_a_healthy_link_never_triggers_anything() {
 // ---------------------------------------------------------------------------
 
 /// `link_down` and `down_since` are written in one critical section, and a reader hammering
-/// `stats()` across several idle-discovered outages must never catch them apart — nor see
+/// `stats` across several idle-discovered outages must never catch them apart — nor see
 /// `reconnects` credited while the link is still down.
 #[test]
 fn stats_never_straddle_a_transition_the_idle_poll_provoked() {
@@ -387,38 +380,12 @@ fn stats_never_straddle_a_transition_the_idle_poll_provoked() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-// ---------------------------------------------------------------------------
-// 9. H-A4 observes an edge with a level poll, started after the fact.
-// ---------------------------------------------------------------------------
-
-/// `tests/serial_reconnect_hardware.rs:549` is `within(5 s, || producer.stats().link_down)`, and it
-/// starts only **after** `usb-replug.py` has returned — which it does once the node is back, i.e.
-/// after the whole outage. `link_down` is an edge: the writer sets it and the reconnect clears it.
-/// Whenever the repair lands before that first sample, the level has gone and H-A4 fails at an
-/// assertion about a mechanism that worked perfectly.
-///
-/// The same construction is why the number H-A4 prints as "notice latency" cannot measure the
-/// 100 ms health poll: its clock starts when the script returns, seconds after the hang-up.
-///
-/// This reproduces the pattern with the in-memory rig: the outage is over before the first sample.
-///
-/// **Rewritten by the fixer** (the only reviewer test touched, and the review itself named the
-/// assumption): as submitted this asserted that the late level poll *does* see the outage, which
-/// is the defect and can never hold — test 3 above pins `link_down == false` and
-/// `down_since == None` once the reconnect has landed, so a `link_down` that survived its repair
-/// would contradict it. What the review actually specifies is in its failure message: observe the
-/// transition with a sampler started **before** the outage. So both halves are pinned here — the
-/// late poll misses it (deterministically: `wait_for_reconnects` has already returned, so the
-/// level is gone and nothing will raise it again), and a sampler started first catches both edges
-/// and can time them. That is the shape `h_a4_…` in `tests/serial_reconnect_hardware.rs` now
-/// follows, with `usb-replug.py` in place of `hang_up()`.
+/// Polling only after reset returns can miss an outage already repaired by the writer.
 #[test]
 fn the_h_a4_pattern_of_sampling_link_down_after_the_outage_is_a_race() {
     let (producer, writer, sctl, links) = rig(2);
 
-    // The shape H-A4 must follow: sampling starts before the outage is provoked, and records the
-    // two edges plus the `reconnects` count at each, so neither the latency nor the outage itself
-    // depends on winning a race against the repair.
+    // Observe before provoking the outage so both loss and recovery remain measurable.
     let stop = Arc::new(AtomicU64::new(0));
     let edges: Arc<std::sync::Mutex<Edges>> = Arc::new(std::sync::Mutex::new((None, None, 0)));
     let p = producer.clone();
@@ -481,8 +448,7 @@ fn the_h_a4_pattern_of_sampling_link_down_after_the_outage_is_a_race() {
         reconnects_at_up, 1,
         "the link came back up with the reconnect credited: {stats:?}"
     );
-    // Both numbers H-A4 exists to print, derived from a clock started before the outage rather
-    // than after it.
+    // Measure notice and recovery against the clock started before the outage.
     println!(
         "notice latency (bounded by a clock started before the outage): {:?}, down for {:?}",
         down_at.saturating_duration_since(provoked),

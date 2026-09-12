@@ -1,17 +1,7 @@
-//! Device pairing against recorded sysfs trees (plan §8, §9.1).
+//! USB pairing against recorded and reconstructed sysfs trees.
 //!
-//! Every test here runs the real [`nanokvm::discovery`] code over a real directory tree under
-//! `fixtures/sysfs/`. The trees are not committed: `fixtures/sysfs/usb2-desk.sysfs` is, being
-//! the recording `scripts/snapshot-sysfs.py` took of this desk serialised to one file, and
-//! `fixtures/sysfs/synthesize.py` expands it and reconstructs the other three trees from it.
-//! `nanokvm::discovery::testing::fixture` runs that script the first time a tree it was asked
-//! for is missing, so `cargo test` needs python3 on PATH. §9.1's rule holds: the recording is
-//! the authority. Nothing
-//! below retypes a topology into a hand-built fake, and the two mutation tests express "the same
-//! desk, with one attribute changed" as an override on the recording rather than as a second,
-//! hand-written tree that could differ from it in ways nobody notices.
-//!
-//! No hardware. The one test that needs the dongle is `tests/discovery_hardware.rs`.
+//! Capability maps avoid opening recorded device paths on the test host. Fixture
+//! provenance and synthetic changes are documented in `fixtures/sysfs/MANIFEST.md`.
 
 use std::path::{Path, PathBuf};
 
@@ -29,8 +19,7 @@ const DESK_HUB: &str = DESK;
 const DESK_VIDEO: &str = "/devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.2";
 const DESK_SERIAL: &str = "/devices/pci0000:00/0000:00:08.1/0000:0b:00.3/usb3/3-2/3-2.2/3-2.2.4";
 
-/// The bus-5 dock in the same recording: a generic hub with a webcam and an unrelated CDC-ACM
-/// device as its direct children. The negative control, and the shape §8's loose wording pairs.
+/// A webcam and unrelated serial device under a generic hub must not pair.
 const DOCK_HUB: &str =
     "/devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.4/5-1.4.4/5-1.4.4.4";
 const DOCK_VIDEO: &str =
@@ -38,13 +27,13 @@ const DOCK_VIDEO: &str =
 const DOCK_SERIAL: &str =
     "/devices/pci0000:00/0000:00:08.1/0000:0b:00.4/usb5/5-1/5-1.4/5-1.4.4/5-1.4.4.4/5-1.4.4.4.3";
 
-/// The probe answers measured on this desk with `v4l2-ctl --info` (see
+/// The probe answers measured on the recorded test setup with `v4l2-ctl --info` (see
 /// `src/discovery/probe.rs`).
 ///
 /// The user's webcam nodes default to `true`. They were never opened — `/dev/video0`–`3` are
 /// off limits — so `true` is the *conservative* stand-in: it makes every one of them an
 /// eligible capture node, so a pairing rule that were too loose would pair one of them and the
-/// negative-control test below would catch it. Which nodes discovery actually opens is pinned
+/// negative-control test below would catch it. Which nodes discovery opens is pinned
 /// separately, by [`a_node_no_rule_could_choose_is_never_opened`].
 fn desk_probe() -> MapProbe {
     MapProbe::new()
@@ -73,7 +62,7 @@ fn usb(usb: &Option<UsbDevice>) -> &UsbDevice {
         .expect("a node discovery enumerated always resolves to a USB device")
 }
 
-// ---- usb2-desk: the USB 2.0 fallback shape (§8 evidence 3) --------------------------------
+// ---- usb2-desk: the USB 2.0 fallback shape --------------------------------
 
 #[test]
 fn the_desk_pairs_video4_with_ttyacm1_through_the_dongles_own_hub() {
@@ -145,7 +134,7 @@ fn an_unrelated_webcam_and_serial_port_behind_one_generic_hub_do_not_pair() {
             .iter()
             .any(|p| p.serial.dev == acm0.dev || usb(&p.video.usb).name == "5-1.4.4.4.2"),
         "the webcam (046d:086b) and ttyACM0 (043e:9a8a) are direct children of one hub, exactly \
-         the shape §8's looser wording would have paired. Evidence 3 rejects them on their own \
+         the shape 's looser wording would have paired. Evidence 3 rejects them on their own \
          ids — 046d:086b is not 345f:2133 — which it checks before it ever reads the hub. The \
          hub-id half of the rule has its own negative control, \
          a_generic_hub_with_the_dongles_two_ids_under_it_still_does_not_pair:\n{inv}"
@@ -156,7 +145,7 @@ fn an_unrelated_webcam_and_serial_port_behind_one_generic_hub_do_not_pair() {
 ///
 /// The recording above is rejected on the video and serial ids, so it says nothing about whether
 /// the hub is checked at all. This is the same recording with the dock's two devices relabelled
-/// as the dongle's — leaving `5-1.4.4.4` `0bda:5411` as the **only** thing that can still reject
+/// as the dongle's — leaving `5-1.4.4.4` `0bda:5411` as the only thing that can still reject
 /// the pair. It is "a capture stick and a serial adapter in a cheap hub", which must not be
 /// mistaken for a NanoKVM.
 #[test]
@@ -233,7 +222,7 @@ fn a_definite_capture_sibling_wins_over_an_unprobeable_one() {
     );
 }
 
-// ---- usb3-stage0: the SuperSpeed shape (§8 evidence 2) -------------------------------------
+// SuperSpeed port-peer pairing.
 
 #[test]
 fn the_superspeed_shape_pairs_across_two_buses_by_the_kernels_port_peer() {
@@ -256,7 +245,7 @@ fn the_superspeed_shape_pairs_across_two_buses_by_the_kernels_port_peer() {
     assert_eq!(usb(&pair.serial.usb).busnum, 3);
 }
 
-// ---- two-dongles: ambiguity, and constraints resolving it (§8 policy) ----------------------
+// ---- two-dongles: ambiguity, and constraints resolving it ----------------------
 
 #[test]
 fn two_dongles_refuse_to_be_guessed_between() {
@@ -302,7 +291,7 @@ fn a_video_constraint_picks_the_dongle_it_belongs_to() {
     );
 }
 
-// ---- the narrowed evidence-3 rule (module docs, correcting §8's wording) -------------------
+// Internal-hub containment and vendor checks.
 
 #[test]
 fn a_hub_that_is_not_the_dongles_own_defeats_containment() {
@@ -329,7 +318,7 @@ fn a_serial_device_that_is_not_the_ch9329_defeats_containment() {
 /// Each of the three ids the containment rule checks, wrong on its own.
 ///
 /// The proptest below states the property; this states the *coverage*, deterministically.
-/// Deleting any one of the three id checks from `internal_hub` fails exactly one of these three
+/// Deleting any one of the three id checks from `internal_hub` fails one of these three
 /// cases, which is the whole claim the narrowed rule rests on. Randomised generation cannot make
 /// that claim on its own: a `u16` that has to miss one value while two others hit theirs is a
 /// coincidence a property test will not supply.
@@ -356,8 +345,8 @@ fn every_one_of_the_three_ids_is_required_for_containment() {
 /// `idProduct` values for the property below: the real one often, near misses and arbitrary
 /// values the rest of the time.
 ///
-/// Drawing all three from `any::<u16>()` — which is what this test used to do — makes the hub-id
-/// check unreachable: a case only gets past `video.id() != VIDEO_ID || serial.id() != SERIAL_ID`
+/// Drawing all three from `any::<u16>` — which is what this test used to do — makes the hub-id
+/// check unreachable: a case only gets past `video.id != VIDEO_ID || serial.id != SERIAL_ID`
 /// when two independent `u16` draws both land on their exact value, about 2⁻³². The property was
 /// then vacuous for two of the three ids, and deleting the hub check left it green.
 fn an_id(real: u16) -> impl Strategy<Value = u16> {
@@ -373,9 +362,7 @@ fn an_id(real: u16) -> impl Strategy<Value = u16> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// The whole justification for narrowing §8's evidence 3 is that the hub id alone is a
-    /// generic part number. Nothing may reach `InternalHub` unless all three ids are the
-    /// dongle's.
+    /// The hub ID is generic, so all three vendor/product pairs must match.
     #[test]
     fn internal_hub_evidence_never_appears_unless_all_three_ids_match(
         hub in an_id(0x0101), video in an_id(0x2133), serial in an_id(0x55d3),
@@ -424,7 +411,7 @@ fn the_containment_property_reaches_all_three_id_checks() {
     );
 }
 
-// ---- constraints (§8: honoured permanently, and never silently ignored) --------------------
+// ---- constraints --------------------
 
 #[test]
 fn a_constraint_naming_a_node_that_is_not_there_says_what_is() {
@@ -453,7 +440,7 @@ fn both_constraints_are_obeyed_even_with_no_evidence_at_all() {
         serial: Some(PathBuf::from("/dev/ttyACM0")),
     };
     let pair = discover(&sysfs, &desk_probe(), &constraints)
-        .expect("§8: an explicit override is what makes the tool usable when discovery is wrong");
+        .expect("an explicit override is what makes the tool usable when discovery is wrong");
     assert_eq!(pair.video.dev, Path::new("/dev/video4"));
     assert_eq!(pair.serial.dev, Path::new("/dev/ttyACM0"));
     assert_eq!(
@@ -484,7 +471,7 @@ fn a_lone_constraint_that_pairs_with_nothing_is_an_error_naming_the_candidates()
     );
 }
 
-// ---- the message the user actually reads (§8: fail with the candidates listed) -------------
+// ---- the message the user reads -------------
 
 #[test]
 fn a_no_pair_message_names_every_node_and_every_vid_pid() {
@@ -528,11 +515,9 @@ fn an_ambiguous_message_names_both_pairs_and_their_evidence() {
     );
 }
 
-// ---- overrides discovery may not veto (§8, review findings 1 and 2) ------------------------
+// ---- overrides discovery may not veto ------------------------
 
-/// A [`Sysfs`] that hides one class directory: `/sys` unreadable in a container, a class the walk
-/// does not know about, a driver that registers the node somewhere else. These are the cases §8's
-/// permanent override exists for.
+/// Hide one class directory to test explicit paths when enumeration is incomplete.
 struct HideClass<S: Sysfs> {
     inner: S,
     class: &'static str,
@@ -556,10 +541,8 @@ impl<S: Sysfs> Sysfs for HideClass<S> {
     }
 }
 
-/// The CH9329 binds to `cdc_acm` on this desk, but the same silicon binds to `ch341`/`ch343` on
-/// other kernels and appears as `/dev/ttyUSB0`. `TTY_PREFIX` is `ttyACM`, so such a node is never
-/// in the inventory — and §8 says naming it explicitly, with an explicit `--video`, is obeyed
-/// anyway. Discovery's opinion of a path the user typed is not a veto.
+/// Enumeration scans ttyACM nodes. An explicit ttyUSB path must still be honored
+/// when the bridge binds to another driver.
 #[test]
 fn a_serial_path_discovery_never_enumerated_is_still_obeyed() {
     let sysfs = fixture("usb2-desk");
@@ -569,7 +552,7 @@ fn a_serial_path_discovery_never_enumerated_is_still_obeyed() {
     };
     let pair = discover(&sysfs, &desk_probe(), &constraints).unwrap_or_else(|e| {
         panic!(
-            "§8: an explicit override is honoured permanently and is what makes the tool usable \
+            "an explicit override is honoured permanently and is what makes the tool usable \
              when discovery is wrong. Both halves were given and discovery refused them:\n{e}"
         )
     });
@@ -600,7 +583,7 @@ fn a_udev_stable_serial_path_is_still_obeyed() {
     assert_eq!(pair.serial.dev, Path::new(by_id));
 }
 
-/// Discovery finding nothing at all is exactly when the override matters most. `NoVideoNodes` and
+/// Discovery finding nothing at all is when the override matters most. `NoVideoNodes` and
 /// `NoSerialNodes` used to be returned before the constraints were read, so a user who supplied
 /// both paths was told the dongle was not plugged in and the process exited 1.
 #[test]
@@ -648,12 +631,12 @@ fn both_overrides_still_carry_whatever_evidence_exists() {
     assert!(matches!(pair.evidence, Some(Evidence::InternalHub { .. })));
 }
 
-// ---- how confidently the answer is reported (§8, review finding 3) -------------------------
+// ---- how confidently the answer is reported -------------------------
 
 /// `1a40:0101` is Terminus, `345f:2133` is a MacroSilicon capture part sold in dozens of
 /// unbranded sticks, and `1a86:55d3` is a QinHeng serial part sold in dozens of unbranded
 /// adapters. Nothing stops a user owning one of each and one cheap hub, and the rule accepts that
-/// arrangement — this desk needs it to, because it is the only rule that works on a USB 2.0 port.
+/// arrangement — the recorded test setup needs it to, because it is the only rule that works on a USB 2.0 port.
 /// What must not happen is calling it proof: that is what a user reads before this program opens
 /// the port and starts writing CH9329 frames into it.
 ///
@@ -683,7 +666,7 @@ fn containment_evidence_is_never_reported_as_proof() {
     let message = evidence.to_string();
     assert!(
         !message.contains("proof"),
-        "evidence 3 is a containment heuristic over three commodity vendor ids. §8 ranks items 1 \
+        "evidence 3 is a containment heuristic over three commodity vendor ids.  ranks items 1 \
          and 2 as proof and item 3 as a degraded common-ancestor test. The user is told:\n  \
          {message}"
     );
@@ -696,11 +679,11 @@ fn containment_evidence_is_never_reported_as_proof() {
                 peer_port: "3-2-port2".to_string(),
             }
             .is_proof(),
-        "§8's items 1 and 2 are the kernel's own assertions and stay proof"
+        "'s items 1 and 2 are the kernel's own assertions and stay proof"
     );
 }
 
-// ---- the root-hub port shape (§8 evidence 2, no external hub) -------------------------------
+// ---- the root-hub port shape -------------------------------
 
 /// The dongle plugged straight into a motherboard USB 3 port — the arrangement most users have.
 /// The port directory is spelled `usb4/4-0:1.0/usb4-port2`, a different branch of `port_dir_of`
@@ -773,9 +756,9 @@ fn a_mixed_probe_failure_is_still_reported_as_ambiguous() {
     );
 }
 
-// ---- `devices` honours the flags on its own command line (review finding 7) -----------------
+// Explicit command-line device selection.
 
-/// `devices --video X --serial Y` (Stage 1's `--list-devices`) used to print the unfiltered
+/// `devices --video X --serial Y` (`--list-devices`) used to print the unfiltered
 /// table and exit 0, so the flags looked ignored. The listing marks what they name and spells
 /// out the selection.
 #[test]
@@ -799,7 +782,7 @@ fn a_listing_marks_the_nodes_the_flags_name() {
     assert_eq!(
         inv.to_string(),
         inv.listing(&Constraints::default()).to_string(),
-        "with no flags the listing is the plain table Stage 1 printed"
+        "with no flags the listing is the default device table"
     );
     assert!(
         !inv.to_string().contains("->"),
@@ -807,8 +790,7 @@ fn a_listing_marks_the_nodes_the_flags_name() {
     );
 }
 
-/// A flag naming a node discovery never enumerated is the case §8's override exists for, so the
-/// listing must say it will still be used rather than leave the user thinking it was dropped.
+/// An explicit path absent from the inventory must still be shown as selected.
 #[test]
 fn a_listing_calls_out_a_flag_it_could_not_find() {
     let sysfs = fixture("usb2-desk");
@@ -822,13 +804,8 @@ fn a_listing_calls_out_a_flag_it_could_not_find() {
     assert!(text.contains("still be used"), "{text}");
 }
 
-// ---- the sound card (§8 evidence 1, §12 Stage 4a) -------------------------------------------
-//
-// The dongle's `345f:2133` carries a USB Audio Class control/streaming pair on interfaces `1.2`
-// and `1.3` alongside its two UVC interfaces, so `/sys/class/sound/card8/device` resolves to an
-// interface of the *same USB device* as `/dev/video4`'s. That is §8's evidence 1 — the proof the
-// video-and-serial pairing cannot have on this hardware — and `audio_for` implements only it.
-// The trees below are what stops that claim from quietly degrading into containment.
+// The sound card is an interface of the video USB device. It must pair by
+// same-device evidence without relying on the hub heuristic.
 
 /// The desk as recorded, plus the sound records merged into it on 2026-09-11: `card8` sits under
 /// `3-2.2.2:1.2`, which is an interface of `3-2.2.2` — the very device `/dev/video4` resolves to.
@@ -853,7 +830,7 @@ fn the_capture_node_pairs_with_the_sound_card_on_its_own_usb_device() {
 
 /// The number is parsed back out of the `cardN` directory name on every call, and the `number`
 /// attribute the recording also carries is the cross-check that the name really is the number.
-/// Card numbers renumber on replug exactly as `/dev` names do (C13), so anything that remembered
+/// Card numbers renumber on replug as `/dev` names do, so anything that remembered
 /// one would open a stranger's card after a reboot.
 #[test]
 fn every_cards_number_is_the_one_in_its_directory_name() {
@@ -940,10 +917,7 @@ fn the_recorded_bus_5_sound_card_belongs_to_its_own_device_and_never_to_the_dong
     );
 }
 
-/// The case that separates §8's evidence 1 from its evidence 3. `two-dongles` puts an ordinary
-/// USB sound card on a free port of the *second dongle's own internal hub*: contained by that
-/// hub exactly as the capture device is, and on a different USB device. Containment would pair
-/// it. Same-device does not, so that pair honestly reports no audio.
+/// A sound card under the internal hub but on another USB device must not pair.
 #[test]
 fn a_card_under_the_dongles_own_hub_but_on_another_device_does_not_pair() {
     let sysfs = fixture("two-dongles");
@@ -969,7 +943,7 @@ fn a_card_under_the_dongles_own_hub_but_on_another_device_does_not_pair() {
         "the control only works if the card really is under the dongle's own hub"
     );
     // Two cards are under that hub: `card9` on the sound device and `card10` on the capture
-    // device itself. Containment cannot tell them apart; same-device picks exactly one.
+    // device itself. Containment cannot tell them apart; same-device picks one.
     assert_eq!(
         second.audio.card().map(|c| c.name.as_str()),
         Some("card10"),
@@ -1028,7 +1002,7 @@ fn a_sound_card_that_is_not_a_usb_device_is_listed_and_never_paired() {
 /// `/sys/class/sound` is not a directory of cards: it also holds `controlC8`, `pcmC8D0c`, `seq`
 /// and `timer`. The recording carries only the `card*` entries — `snapshot-sysfs.py` records the
 /// prefix discovery reads — so the live directory's other entries are put back here, as they were
-/// read from this desk on 2026-09-11, and must be ignored without disturbing anything.
+/// read from the recorded test setup on 2026-09-11, and must be ignored without disturbing anything.
 #[test]
 fn the_other_entries_in_the_sound_class_are_not_cards() {
     struct ExtraEntries<S: Sysfs> {
@@ -1079,16 +1053,16 @@ fn the_other_entries_in_the_sound_class_are_not_cards() {
     );
 }
 
-/// Both SuperSpeed trees are reconstructions of Stage 0's `topology.md`, which recorded the two
+/// Both SuperSpeed trees are reconstructions of `topology.md`, which recorded the two
 /// device nodes and nothing else: the dongle has not been on a SuperSpeed port since, and no
-/// readout of its sound card exists for that shape. So the audio interface is **absent from the
-/// reconstruction**, and this test states that rather than inventing a card — the dongle
+/// readout of its sound card exists for that shape. So the audio interface is absent from the
+/// reconstruction, and this test states that rather than inventing a card — the dongle
 /// certainly still has one there, the same `345f:2133` with the same five interfaces, but nobody
 /// has read it and a fixture that claimed otherwise would be evidence of nothing.
 ///
-/// What it does pin is the property that matters more: **absent audio changes nothing.** Both
+/// What it does pin is the property that matters more: absent audio changes nothing. Both
 /// trees still pair their two nodes on the kernel's `peer` assertion, and both report no audio
-/// honestly rather than failing (§4.1 rev 5: audio is a side channel).
+/// honestly rather than failing.
 #[test]
 fn the_superspeed_reconstructions_carry_no_sound_card_and_still_pair() {
     for tree in ["usb3-stage0", "usb3-rootport"] {
@@ -1124,11 +1098,8 @@ fn an_unenumerated_video_override_reports_unknown_rather_than_no_audio() {
     assert!(text.contains("given explicitly"), "{text}");
 }
 
-/// Two cards on one USB device is §8's ambiguity rule applied to audio: nothing is selected and
-/// both are named. The desk has no such device, so this is the one audio case expressed as a
-/// mutation over the recording — the *webcam's* card relabelled onto the dongle's interface is
-/// not expressible as an attribute override, so instead the dongle's video device is made to look
-/// like the webcam's, which puts both cards on one `busnum:devnum`.
+/// Two cards on the same USB device are ambiguous. Mutate the recording to
+/// exercise this case without claiming it was observed on hardware.
 #[test]
 fn two_cards_on_one_usb_device_are_refused_rather_than_guessed_between() {
     let sysfs = OverrideSysfs::new(fixture("usb2-desk"))

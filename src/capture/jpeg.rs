@@ -1,13 +1,7 @@
-//! JPEG start-of-frame header parsing (§6, A6).
+//! JPEG header parsing without decoding the image.
 //!
-//! A6 is the whole reason this exists: after an idle gap the device reproducibly emits up to
-//! **eight consecutive frames at the previous resolution**, carrying the *new* `sizeimage`, with
-//! no `ERROR` flag and no reliable `sequence` tell. `G_FMT` and the buffer metadata therefore
-//! both lie about what is in the buffer, and only the frame's own SOF header tells the truth.
-//! Every frame gets parsed, every time.
-//!
-//! This module is pure and takes untrusted bytes straight off the wire, so it never panics and
-//! never indexes without a bounds check — see the proptest at the bottom of the file.
+//! The capture device can emit frames at an old resolution after format negotiation.
+//! Reading the start-of-frame marker provides dimensions for the bytes received.
 
 /// Why a JPEG header could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -40,25 +34,15 @@ const MARKER_JPG: u8 = 0xC8;
 const MARKER_DAC: u8 = 0xCC;
 const MARKER_TEM: u8 = 0x01;
 
-/// Read the image dimensions from a JPEG's start-of-frame header.
+/// Read `(width, height)` from the first JPEG start-of-frame marker.
 ///
-/// Walks the marker segments from SOI, skipping every length-prefixed segment (APPn, COM, DQT,
-/// DHT, DRI, whatever else the device emits) and every standalone marker (RSTn, TEM), and stops
-/// at the first start-of-frame. `SOF0`/`SOF1`/`SOF2` are the ones this device produces; every
-/// other `SOFn` — `0xC0..=0xCF` other than DHT, JPG and DAC, which share that range but are not
-/// frame headers — is treated the same way, because the segment layout is identical.
-///
-/// Fill bytes are handled per ITU-T T.81 §B.1.1.3: any number of `0xFF` bytes may precede a
-/// marker, including before the SOI, so a device that pads its frames parses correctly.
-///
-/// The returned pair is `(width, height)`, but note the segment stores **height first**.
+/// Skips length-prefixed segments and standalone markers, accepting fill bytes under
+/// ITU-T T.81 §B.1.1.3. The segment stores height before width.
 ///
 /// # Errors
 ///
-/// Returns a [`JpegHeaderError`] for truncated, garbage or SOF-less input. It never panics on
-/// any input whatsoever; the caller turns this into [`CaptureError::BadFrame`].
-///
-/// [`CaptureError::BadFrame`]: super::CaptureError::BadFrame
+/// Returns [`JpegHeaderError`] for malformed, truncated, or SOF-less input. Parsing the
+/// header alone does not establish that the image data is complete.
 pub fn dimensions(jpeg: &[u8]) -> Result<(u32, u32), JpegHeaderError> {
     let mut at = 0usize;
 
@@ -79,7 +63,7 @@ pub fn dimensions(jpeg: &[u8]) -> Result<(u32, u32), JpegHeaderError> {
             MARKER_DHT | MARKER_JPG | MARKER_DAC => {
                 skip_segment(jpeg, &mut at, marker)?;
             }
-            // Every remaining SOFn. Layout: Lf(2) P(1) Y(2) X(2) Nf(1) ...
+            // Every remaining SOFn. Layout: Lf(2) P(1) Y(2) X(2) Nf(1)...
             0xC0..=0xCF => {
                 let length = read_u16(jpeg, at).ok_or(JpegHeaderError::Truncated)?;
                 if length < 8 {
@@ -88,8 +72,7 @@ pub fn dimensions(jpeg: &[u8]) -> Result<(u32, u32), JpegHeaderError> {
                 let height = read_u16(jpeg, at + 3).ok_or(JpegHeaderError::Truncated)? as u32;
                 let width = read_u16(jpeg, at + 5).ok_or(JpegHeaderError::Truncated)? as u32;
                 if width == 0 || height == 0 {
-                    // A zero height is legal only with a later DNL marker, which no MJPEG
-                    // capture device emits. Refuse it rather than guess.
+                    // Zero height requires a later DNL marker, which this parser does not support.
                     return Err(JpegHeaderError::ZeroDimension { width, height });
                 }
                 return Ok((width, height));
@@ -188,8 +171,7 @@ mod tests {
 
     #[test]
     fn a_frame_truncated_after_the_header_still_parses() {
-        // Truncation past the SOF is exactly A6's stale-frame shape and the decoder's strict
-        // mode is what rejects it (§1.3) — the header parser must still report the size.
+        // Header dimensions remain readable when truncation occurs after the SOF marker.
         let bytes = fixture_bytes(&fixture_paths("absrange")[0]);
         let cut = bytes.len() * 6 / 10;
         assert_eq!(dimensions(&bytes[..cut]), Ok((1920, 1080)));
@@ -231,7 +213,7 @@ mod tests {
 
     #[test]
     fn a_segment_length_below_two_is_rejected_rather_than_looping() {
-        // length 0 would leave `at` unmoved and spin forever if it were not checked.
+        // A zero-length segment must fail rather than leave the cursor unchanged.
         assert!(matches!(
             dimensions(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x00, 0xFF, 0xD9]),
             Err(JpegHeaderError::BadSegmentLength { length: 0, .. })
@@ -323,8 +305,7 @@ mod tests {
         use proptest::prelude::*;
 
         proptest! {
-            /// Arbitrary bytes must never panic and must always terminate (§9.3: this parses
-            /// bytes straight off hardware).
+            /// Device bytes are untrusted; arbitrary input must terminate without panic.
             #[test]
             fn arbitrary_bytes_never_panic(data in vec(any::<u8>(), 0..4096)) {
                 let _ = dimensions(&data);
@@ -351,7 +332,7 @@ mod tests {
     #[test]
     fn every_prefix_of_a_real_frame_is_handled() {
         // Exhaustive over the header region of a real capture, which is where truncation
-        // actually lands when a USB transfer is cut short.
+        // lands when a USB transfer is cut short.
         let bytes = fixture_bytes(&fixture_paths("absrange")[0]);
         for cut in 0..bytes.len().min(2048) {
             let _ = dimensions(&bytes[..cut]);

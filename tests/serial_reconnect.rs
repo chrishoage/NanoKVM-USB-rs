@@ -1,21 +1,4 @@
-//! §2.7 and §5.1 against the pty fake (§9.3): the real [`SerialLink`], the real
-//! [`SerialLinkSource`] and the real input writer, with only the far end of the port synthetic.
-//!
-//! Two things are checked here that the in-memory fakes cannot check:
-//!
-//! - **The preamble reaches the wire, whole, first.** `FakeLink` records that `resync` was called;
-//!   the pty fake records the sixteen zero bytes themselves, in the byte stream, ahead of the
-//!   release-all — which is the property §5.1 actually needs.
-//! - **The torn-write repair works against a parser that behaves like the chip's.** The fake runs
-//!   the same `proto::Parser` as the host, so a header claiming `LEN 8` followed by two payload
-//!   bytes leaves it holding a partial frame and waiting — exactly the A15 behaviour, and enough
-//!   to reproduce both the failure and the repair without hardware. The hardware tests in
-//!   `tests/serial_reconnect_hardware.rs` then confirm it against the real chip, which is the only
-//!   thing that can settle it.
-//!
-//! Every request the fake sends or receives is checked against `fixtures/packets/ch9329.toml`
-//! where a byte-level claim is being made (§9.1); nothing here retypes protocol bytes except the
-//! deliberately malformed ones, which are the point.
+//! Real serial transport and input writer recovery against pseudo-terminal devices.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -34,7 +17,7 @@ use serde::Deserialize;
 const TIMEOUT: Duration = Duration::from_millis(500);
 const WAIT: Duration = Duration::from_secs(10);
 
-// -- fixtures, read exactly as tests/serial_pty.rs reads them ---------------
+// -- fixtures, read as tests/serial_pty.rs reads them ---------------
 
 #[derive(Debug, Deserialize)]
 struct Fixtures {
@@ -111,7 +94,7 @@ fn preamble() -> Vec<u8> {
 
 /// The bytes a torn keyboard write leaves behind: a header claiming `LEN 8` with only two payload
 /// bytes sent, which is what a `write_all` that failed after seven bytes puts on the wire. Read
-/// from the fixture that recorded the measurement (§9.1) rather than retyped, because retyping the
+/// from the fixture that recorded the measurement rather than retyped, because retyping the
 /// anomaly is how a test stops testing the anomaly.
 fn torn_frame() -> Vec<u8> {
     let name = "device_receive_parser_has_no_inter_byte_timeout";
@@ -160,7 +143,7 @@ fn the_preamble_is_sixteen_zero_bytes_in_one_write() {
     assert_eq!(link.is_down(), None);
 }
 
-/// H-A1's shape, without hardware: zeros in front of a healthy link change nothing. The device
+/// H-shape, without hardware: zeros in front of a healthy link change nothing. The device
 /// still answers `GET_INFO`, and the frame that follows the preamble is intact on the wire.
 #[test]
 fn zeros_in_front_of_a_healthy_link_are_harmless() {
@@ -188,8 +171,8 @@ fn zeros_in_front_of_a_healthy_link_are_harmless() {
     );
 }
 
-/// §5.1 reproduced, and then repaired. Without the preamble the torn frame swallows the next
-/// command and the request times out; with it, the same request is answered.
+/// A torn frame consumes the next request without padding; the preamble must
+/// restore framing so the same request receives a reply.
 #[test]
 fn a_torn_frame_eats_the_next_command_and_the_preamble_is_what_frees_it() {
     let fake = FakeCh9329::spawn(script()).expect("spawn the fake");
@@ -202,7 +185,7 @@ fn a_torn_frame_eats_the_next_command_and_the_preamble_is_what_frees_it() {
     let swallowed = link.transact(cmd::GET_INFO, &[], Duration::from_millis(200));
     assert!(
         matches!(swallowed, Err(LinkError::Timeout { .. })),
-        "a torn frame must eat the next command, or this test is not reproducing §5.1: \
+        "a torn frame must eat the next command, or this test is not reproducing : \
          {swallowed:?}"
     );
 
@@ -217,8 +200,7 @@ fn a_torn_frame_eats_the_next_command_and_the_preamble_is_what_frees_it() {
 
 // -- 2. the source, and the receiver that outlives its links ----------------
 
-/// The unsolicited channel belongs to the source, so the A12 lock-state evidence keeps arriving
-/// across a reconnect instead of stopping silently at the link that first carried it.
+/// The unsolicited channel must survive replacement links so lock updates continue.
 #[test]
 fn the_unsolicited_receiver_survives_a_reopen() {
     let fake = FakeCh9329::spawn(script()).expect("spawn the fake");
@@ -284,24 +266,8 @@ impl LinkSource for SwappablePty {
     }
 }
 
-/// The whole slice, over the real transport: a link dies, the writer reopens **without having been
-/// asked to write anything**, and the bytes the new device sees are the preamble, the keyboard
-/// release-all, the mouse release-all and `GET_INFO` — in that order, whole, and with nothing else.
-///
-/// The sequence is the same one a failed write provokes, because it is the same code: there is one
-/// reconnect path and the health check feeds it (§2.7). What differs is only what set it off.
-///
-/// **The write-driven variant is no longer expressible at this level, and its coverage did not
-/// move by accident.** This test used to submit a keystroke here, because a failed `transact` was
-/// the only thing that could set `link_down`; the health check made that unnecessary, and H-A4 is
-/// what proved it had to. To provoke the *write* path over a pty now, a write would have to fail
-/// on a link `is_down()` still calls healthy — and `FakeCh9329` has no knob for that: the only
-/// failure it can produce is `hang_up`, which vhangups the slave, so the reader's `BrokenPipe`
-/// verdict arrives on its own and races the write. Half-closing a pty is not a thing, and a knob
-/// that made writes fail while the read half stayed live would be a fiction no device performs.
-/// The write path is covered instead where a fake can be precise about it:
-/// `tests/input_reconnect.rs` drives it through `Behaviour::Fail` (`kill()`), and every reconnect
-/// test there uses it.
+/// Idle link loss must trigger the same commissioning sequence as a failed write:
+/// preamble, keyboard release, mouse release, then device information.
 #[test]
 fn the_writer_reconnects_over_a_real_port_and_the_new_device_sees_the_whole_sequence() {
     let first = FakeCh9329::spawn(script()).expect("spawn the first fake");
@@ -330,11 +296,7 @@ fn the_writer_reconnects_over_a_real_port_and_the_new_device_sees_the_whole_sequ
     first.hang_up();
     *path.lock().unwrap_or_else(|p| p.into_inner()) = Some(second.slave_path());
 
-    // Nothing is submitted: the writer notices the hang-up from the transport itself
-    // (`Link::is_down`, polled on its idle wait) and runs the whole sequence on its own. This used
-    // to read "the writer only learns the port is gone when it next writes to it", and a keystroke
-    // was submitted here to make it do so — which is what H-A4 then met on the dongle, where
-    // nobody was typing.
+    // Submit nothing: transport health alone must trigger recovery.
     wait_for_reconnects(&producer, 1);
 
     let expected: Vec<u8> = preamble()
@@ -389,23 +351,7 @@ fn the_writer_reconnects_over_a_real_port_and_the_new_device_sees_the_whole_sequ
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-/// **The idle case, which H-A4 met on the real dongle.** The link hangs up while nothing is
-/// queued, and the writer must still report it: `Stats::link_down` is what `wait_for_link`, the
-/// §2.8 title and every `submit` read, and a user who is not typing is the ordinary state of this
-/// program.
-///
-/// Until this test existed nothing set that flag but a failed `transact`, and an idle writer was
-/// parked in `next_entry`'s *unbounded* `Condvar::wait` where no timer, keepalive or `GET_INFO`
-/// ever woke it — so on the dongle the writer had still not noticed after 30 s, and because it
-/// kept the fd open the tty index was never freed and the device came back under another name.
-/// The mechanism that fixes it is `Link::is_down`: the reader thread's verdict, asked for on a
-/// bounded idle wait, with nothing written to the device.
-///
-/// **The pty is a faithful hang-up.** `FakeCh9329::hang_up` closes the master, which vhangups the
-/// slave exactly as `acm_disconnect` does: `POLLHUP`, and a `read` that returns 0. What reaches
-/// the host through `serialport` is `BrokenPipe` either way, because it checks `revents` before it
-/// reads (`serialport-4.10.1/src/posix/poll.rs:42-51`), so `serial::reader::run`'s error arm fires
-/// and marks the link down within a read timeout. This test is about what happens next.
+/// An empty input queue must not hide a hung-up link from status or producers.
 #[test]
 fn an_idle_writer_notices_a_link_that_hung_up_with_nothing_queued() {
     let fake = FakeCh9329::spawn(script()).expect("spawn the fake");
@@ -425,11 +371,10 @@ fn an_idle_writer_notices_a_link_that_hung_up_with_nothing_queued() {
     producer.wait_for_link(WAIT).expect("the link comes up");
     assert!(!producer.stats().link_down);
 
-    // The device goes away, and nothing is submitted: no keystroke, no motion, no release. This is
-    // exactly the H-A4 shape — the writer held the node across a replug with an empty queue.
+    // Remove the device while the input queue is empty.
     fake.hang_up();
 
-    // One second is the §2.8 budget, and the writer's health poll is 100 ms; 5 s is the failsafe.
+    // Allow one second for the 100 ms health poll; five seconds is the test failsafe.
     let limit = Duration::from_secs(5);
     let deadline = Instant::now() + limit;
     while !producer.stats().link_down {
@@ -441,10 +386,7 @@ fn an_idle_writer_notices_a_link_that_hung_up_with_nothing_queued() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // Shut the writer down rather than letting it fall out of scope mid-reconnect. `SerialLinkSource`
-    // is fixed-path, the pts minor has just been freed, and the other tests in this binary run in
-    // parallel and allocate ptys — so a writer left looping in `acquire` could open *their* slave and
-    // put a preamble, a release-all and a `GET_INFO` into its `raw_rx()`. It also asserts the §2.6.1
-    // outcome this test otherwise checks not at all: there is nothing left to send the release on.
+    // Stop the fixed-path writer before another parallel test can reuse this PTY
+    // number. Otherwise reconnect could send commissioning reports to that test.
     assert_eq!(writer.shutdown(), ReleaseOutcome::Unsent);
 }

@@ -1,20 +1,4 @@
-//! Audio is a side channel, checked against the source rather than trusted (§4.1 rev 5).
-//!
-//! §4.1 rev 5: the two audio threads "may [not] touch the video handoff, the input queue or the
-//! render thread: audio is a side channel, and a stalled or absent sound card must leave the KVM
-//! exactly as usable as it was in Stage 3."
-//!
-//! `tests/audio_path.rs` shows that each of §12 Stage 4a's four failures is absorbed. That is
-//! necessary and not sufficient: it proves the failures are *handled*, not that the module has no
-//! way to reach the subsystems it must not reach. A future change that gave the capture thread a
-//! `PipelineHandle` "just to stop the pipeline when the card goes" would pass every test in that
-//! file and break the rule outright.
-//!
-//! So this is the same shape as `tests/cli_keys.rs`'s mouse rule: **every** file under
-//! `src/audio/` is read from disk, the count is checked against the directory listing so a new
-//! file cannot be quietly exempt, and the names of the subsystems audio may not touch are
-//! searched for. Cheap, and it fails at exactly the moment the coupling is introduced rather than
-//! at the moment it first hurts someone.
+//! Structural checks that audio cannot control input, capture, or rendering.
 
 use std::path::Path;
 
@@ -79,15 +63,15 @@ fn no_file_under_src_audio_reaches_video_input_or_the_viewer() {
             assert_eq!(
                 source.matches(needle).count(),
                 0,
-                "{needle} must not appear in {path}: audio is a side channel (§4.1 rev 5)"
+                "{needle} must not appear in {path}: audio is a side channel ( rev 5)"
             );
         }
     }
 }
 
-/// The other direction of the same rule, and the one that actually decides whether a stalled card
+/// The other direction of the same rule, and the one that decides whether a stalled card
 /// can hurt anything: `src/viewer/app.rs` may *read* the audio handle for the title and may do
-/// nothing else with it. No `stop()`, no waiting, no branching the loop on it.
+/// nothing else with it. No `stop`, no waiting, no branching the loop on it.
 #[test]
 fn the_event_loop_only_reads_audio_for_the_title() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/viewer/app.rs");
@@ -96,7 +80,7 @@ fn the_event_loop_only_reads_audio_for_the_title() {
     // The only audio API the event loop is allowed to call. `snapshot`, `muted` and `config` are
     // all reads; anything that changes state, waits, or tears down is not the loop's to call.
     for forbidden in [
-        concat!("audio", ".stop()"),
+        concat!("audio", ".stop"),
         concat!("audio", ".set_muted"),
         concat!("AudioHandle::", "spawn"),
     ] {
@@ -109,7 +93,7 @@ fn the_event_loop_only_reads_audio_for_the_title() {
 }
 
 /// `--no-audio` must mean *nothing is opened*, and the only way that is true is if nothing is
-/// spawned. `main.rs` has exactly one `AudioHandle::spawn`, and it sits in an arm of the match on
+/// spawned. `main.rs` has one `AudioHandle::spawn`, and it sits in an arm of the match on
 /// the flag — so the flag cannot degrade into "spawned but muted", which would still open the
 /// card. The other `None` arm is a video node discovery never enumerated: no USB device, so no
 /// card can belong to it and there is nothing for a retry to find.

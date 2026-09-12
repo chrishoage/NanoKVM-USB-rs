@@ -1,39 +1,11 @@
-//! Input correctness: event classes, coalescing, held-state projection and release-all
-//! cancellation. Implements §2 of `docs/NATIVE_CLIENT_PLAN.md` in full.
+//! Non-blocking input submission with ordered delivery and cancellation.
 //!
-//! # Shape
+//! One writer owns the transport and held-key state. Producers coalesce adjacent motion
+//! while preserving key and button transitions. Release-all advances a cancellation epoch
+//! so queued input from an old capture session cannot reach the target afterward.
 //!
-//! ```text
-//!   viewer thread ──submit()──▶ [ one queue, one order ] ──▶ writer thread ──▶ Link
-//!         │                            §2.1–2.4                  §2.5, §2.6
-//!         └──request_release_all()──▶ 1-slot cancellation flag ──────┘
-//! ```
-//!
-//! - **One queue, one order** (§2.1). Keyboard and mouse share it, or ordering between a modifier
-//!   press and a click is lost and shift-click breaks.
-//! - **Coalescing is a correctness requirement, not an optimisation** (§5.1): the device
-//!   acknowledges roughly 83 absolute mouse reports per second and overload silently corrupts
-//!   rather than applying backpressure.
-//! - **The writer is the sole serialization point** (§2.6). It applies the epoch check in the same
-//!   loop iteration as the write, so there is no window in which a stale event can slip past a
-//!   cancellation.
-//! - **Cancellation invalidates, it does not merely outrank** (§2.6). Triggers never enqueue
-//!   anything, which is how a release stays schedulable when the queue is full.
-//! - **Overflow is an explicit failure** (§2.8), never a silent drop of a transition.
-//!
-//! # Reconnect (§2.7)
-//!
-//! A path started with [`spawn_with_source`] replaces its transport after a failure instead of
-//! staying down. The writer owns that: the §2.7 sequence — discard the queue, release-all,
-//! re-query device info — needs the queue and the epoch bookkeeping, so it runs **as a
-//! cancellation** on the writer thread, with the torn-write preamble (§5.1) in front of it. See
-//! [`writer::Writer::commission`]. [`spawn`] keeps Stage 1's behaviour: one link, and a failure is
-//! terminal.
-//!
-//! # Not implemented
-//!
-//! Blocking, paced admission for scripts (§2.9); [`Producer::submit`] is the viewer's
-//! non-blocking policy and [`Producer::wait_until_engageable`] the only blocking primitive.
+//! [`spawn`] uses one link. [`spawn_with_source`] supports reconnect, discards stale input,
+//! and leaves the producer disengaged until the user captures again.
 
 mod held;
 mod queue;
@@ -58,25 +30,25 @@ use crate::link::{Link, LinkError, LinkSource};
 use crate::proto::frame::DeviceInfo;
 use crate::proto::report::{HidKey, ABS_MAX};
 
-/// One input event as the viewer produces it (§2.2).
+/// One input event as the viewer produces it.
 ///
 /// The epoch an event was produced under is attached inside [`Producer::submit`], so callers
 /// cannot forge or stale one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// A key transition. **Barrier**: never dropped, never merged, never reordered (§2.2). Host
-    /// auto-repeat must be discarded by the caller (§2.5); a repeat that slips through is
+    /// A key transition. Barrier: never dropped, never merged, never reordered. Host
+    /// auto-repeat must be discarded by the caller; a repeat that slips through is
     /// absorbed as a no-op by the held-state tracker.
     Key { key: HidKey, down: bool },
-    /// A mouse button transition — one bit from [`crate::proto::button`]. **Barrier.**
+    /// A mouse button transition — one bit from [`crate::proto::button`]. Barrier.
     Button { button: u8, down: bool },
     /// Absolute pointer state, already in `0..=4095`; the viewer maps pixels through
-    /// [`crate::proto::abs_coord`] (§3.4). May be **replaced** by a newer value (§2.2). Values
+    /// [`crate::proto::abs_coord`]. May be replaced by a newer value. Values
     /// above [`ABS_MAX`] are clamped here as well, because an overshoot past 8191 silently jumps
     /// the pointer to the top-left corner of a live console.
     PointerAbs { x: u16, y: u16 },
-    /// Relative pointer motion. An accumulating delta: **summed**, never replaced (§2.2), and
-    /// split across reports at flush rather than clamped (§2.3).
+    /// Relative pointer motion. An accumulating delta: summed, never replaced, and
+    /// split across reports at flush rather than clamped.
     PointerRel { dx: i32, dy: i32 },
     /// Wheel delta. An accumulating delta, same rules as [`Event::PointerRel`].
     Wheel { delta: i32 },
@@ -85,14 +57,14 @@ pub enum Event {
 /// Tuning for the input path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// The queue bound, counted in **barrier entries** (§2.8). Motion entries are bounded
+    /// The queue bound, counted in barrier entries. Motion entries are bounded
     /// implicitly: at most one coalesced run can sit between two barriers, so the whole queue is
     /// bounded by `2 * max_barriers + 1`. A value of 0 is treated as 1.
     pub max_barriers: usize,
     /// How long each [`Link::transact`] waits for its reply. The measured ack round trip is
-    /// 17 ms for a mouse report and 4.15 ms for a keyboard report (§5.1).
+    /// 17 ms for a mouse report and 4.15 ms for a keyboard report.
     pub transact_timeout: Duration,
-    /// Reconnect tuning (§2.7). Ignored by [`spawn`], which has nothing to reconnect to.
+    /// Reconnect tuning. Ignored by [`spawn`], which has nothing to reconnect to.
     pub reconnect: ReconnectConfig,
 }
 
@@ -106,7 +78,7 @@ impl Default for Config {
     }
 }
 
-/// How hard, and how often, the writer tries to replace a failed transport (§2.7).
+/// How hard, and how often, the writer tries to replace a failed transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconnectConfig {
     /// The wait before the first attempt after a failure, doubling on each rejection.
@@ -118,29 +90,18 @@ pub struct ReconnectConfig {
     /// The ceiling the doubling stops at. It is also the worst case for how long a link that came
     /// back stays unnoticed, which is why it is seconds rather than minutes.
     pub max_backoff: Duration,
-    /// How long the `GET_INFO` that proves a new link is real may take (§2.7 step 3).
+    /// How long the `GET_INFO` that proves a new link is real may take.
     ///
-    /// The measured round trip is 3.98 ms (A11), so this is three orders of magnitude of slack —
+    /// The measured round trip is 3.98 ms, so this is three orders of magnitude of slack —
     /// it exists to bound a chip that is enumerated but not answering, not to pace anything.
     pub get_info_timeout: Duration,
 }
 
 impl Default for ReconnectConfig {
-    /// 250 ms doubling to 4 s, with a 500 ms `GET_INFO` deadline.
+    /// Reconnect delays start at 250 ms and double to 4 s; commissioning has a 500 ms deadline.
     ///
-    /// **Measured, 2026-09-11** (`docs/STAGE2_FINDINGS.md` §6 item 1): a `USBDEVFS_RESET` of the
-    /// serial device takes the node away for 404–430 ms, and a reset of the dongle's internal hub
-    /// for 1416 ms. The writer attempts immediately on noticing the loss and then waits 250 ms,
-    /// 500 ms, 1 s, 2 s, 4 s, …, so attempts land at t ≈ 0, 0.25, 0.75, 1.75 s: a device reset is
-    /// caught by attempt 3 and a hub reset by attempt 4, each within about a third of a second of
-    /// the node being back. H-A4 measured 781.6 ms end to end for a 414 ms outage over 3 attempts,
-    /// which is that ladder exactly.
-    ///
-    /// So both numbers stay. A smaller initial backoff buys nothing — attempt 1 already fires at
-    /// once and fails, because the node is not there yet — and a larger one would miss the 0.75 s
-    /// slot and turn a 414 ms outage into a 1.75 s one. The 4 s ceiling is never reached by any
-    /// outage this hardware produces; it first binds beyond 3.75 s, where it is the longest a user
-    /// sits looking at "serial DOWN" after the device is back.
+    /// Recorded resets took about 0.4 s for serial and 1.4 s for the hub. This schedule
+    /// retries near both recovery times without polling continuously during longer outages.
     fn default() -> Self {
         Self {
             initial_backoff: Duration::from_millis(250),
@@ -154,20 +115,18 @@ impl Default for ReconnectConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     /// Input is disengaged after a cancellation and stays that way until the user deliberately
-    /// re-grabs and [`Producer::engage`] succeeds (§2.6, §2.8).
+    /// re-grabs and [`Producer::engage`] succeeds.
     #[error("input is disengaged; re-engage after the release-all is acknowledged")]
     Disengaged,
     /// Coalescing could not make room for a transition. The session has failed: a cancellation
-    /// has been triggered, and input is disengaged until deliberate recapture (§2.8).
+    /// has been triggered, and input is disengaged until deliberate recapture.
     #[error("input queue overflowed; the session was cancelled and must be re-engaged")]
     Overflow,
-    /// The transport is gone (§2.6.1). Submissions are refused rather than queued into a link
-    /// that may never drain — reported rather than silently accepted, so input cannot wedge
-    /// invisibly. On a path started with [`spawn_with_source`] this clears when a replacement
-    /// link is commissioned (§2.7); on one started with [`spawn`] it is permanent.
+    /// The transport is unavailable. Submissions are refused. A source-backed writer
+    /// clears this condition after commissioning a replacement; a single-link writer cannot.
     #[error("link is down; input cannot be delivered")]
     LinkDown,
-    /// The writer is shutting down (§2.6). The final release-all is the last thing that will be
+    /// The writer is shutting down. The final release-all is the last thing that will be
     /// written, so anything submitted from here on could only land after it; and once the writer
     /// has exited nobody drains the queue at all. Permanent: there is no recapture after a
     /// shutdown.
@@ -179,34 +138,34 @@ pub enum SubmitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EngageError {
     /// The writer has not yet acknowledged the requested epoch. A new session must not emit
-    /// input until it observes `acked_epoch >= requested_epoch` (§2.6).
+    /// input until it observes `acked_epoch >= requested_epoch`.
     #[error("release-all not acknowledged yet (requested {requested}, acked {acked})")]
     NotYetAcked { requested: u64, acked: u64 },
-    /// A shutdown has begun (§2.6). Recapture is closed for good: the shutdown's own release-all
+    /// A shutdown has begun. Recapture is closed for good: the shutdown's own release-all
     /// is the last thing the writer will write, and re-engaging behind it is what would let a
     /// key-down be written after it.
     #[error("the input path is shutting down; it cannot be re-engaged")]
     ShuttingDown,
 }
 
-/// The producer half: cloneable, `Send + Sync`, non-blocking (§2.9, viewer policy).
+/// The producer half: cloneable, `Send + Sync`, non-blocking.
 #[derive(Debug, Clone)]
 pub struct Producer {
     shared: Arc<Shared>,
 }
 
-/// Owns the writer thread. Dropping it stops the writer; [`WriterHandle::shutdown`] stops it
-/// cleanly, which is a §2.6 release-all trigger.
+/// Owns the writer thread. Drop stops it; [`WriterHandle::shutdown`] also returns
+/// the final release outcome.
 #[derive(Debug)]
 pub struct WriterHandle {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
 }
 
-/// Start the input path: one queue, one writer thread, one link (§2.1, §4.1).
+/// Start the input path: one queue, one writer thread, one link.
 ///
 /// The writer is a dedicated `std::thread` because every report is a blocking acknowledged round
-/// trip and nothing else in the program may wait on it (§5.1, §2.9).
+/// trip and nothing else in the program may wait on it.
 pub fn spawn<L: Link + 'static>(link: L, config: Config) -> (Producer, WriterHandle) {
     let source = OneLink {
         link: Some(Box::new(link) as Box<dyn Link>),
@@ -214,18 +173,12 @@ pub fn spawn<L: Link + 'static>(link: L, config: Config) -> (Producer, WriterHan
     start(Box::new(source), false, config)
 }
 
-/// Start the input path with a **source** of transports rather than one transport (§2.7).
+/// Start input with a reopenable transport source.
 ///
-/// The difference from [`spawn`] is entirely in what happens after a transport failure: the writer
-/// completes the `LinkDown` release as before, and then reopens, resynchronises the chip's parser
-/// (§5.1), discards the queue, re-sends release-all and re-queries device info, retrying with an
-/// exponential backoff until it works. The producer stays **disengaged** across all of it (§2.8:
-/// deliberate recapture), so input resumes on the user's next grab and not before.
-///
-/// The **initial** open runs the same sequence on this thread, so a device that is not there at
-/// startup is a reported condition rather than a panic: [`Stats::link_down`],
-/// [`Stats::device_info`] and [`Producer::wait_for_link`] are how a caller that wants to fail fast
-/// finds out.
+/// Every new link is resynchronised, stale work discarded, held input released, and
+/// device information refreshed. Failures retry with exponential backoff. The producer
+/// remains disengaged until recapture. Startup uses the same commissioning sequence;
+/// [`Producer::wait_for_link`] lets callers wait for its result.
 pub fn spawn_with_source(source: Box<dyn LinkSource>, config: Config) -> (Producer, WriterHandle) {
     start(source, true, config)
 }
@@ -239,9 +192,6 @@ fn start(source: Box<dyn LinkSource>, reconnect: bool, config: Config) -> (Produ
         shared.mark_link_down();
     }
     let writer = writer::Writer::new(Arc::clone(&shared), source, reconnect, config);
-    // `std::thread::spawn` rather than `Builder::spawn`: the only failure is the OS refusing a
-    // thread, which is not a condition this API can meaningfully report, and the signature is
-    // fixed as infallible.
     let join = std::thread::spawn(move || writer.run());
     (
         Producer {
@@ -259,7 +209,7 @@ fn start(source: Box<dyn LinkSource>, reconnect: bool, config: Config) -> (Produ
 ///
 /// It exists so both entry points build the same writer over the same seam. The writer is told
 /// separately not to reconnect, because retrying against a source that can never succeed would
-/// spin a thread for the life of the process and would not be the Stage 1 behaviour `spawn`
+/// spin a thread for the life of the process and would not be the behaviour `spawn`
 /// promises — after a failure the link stays down and entries are discarded, and
 /// `Stats::reconnect_attempts` stays 0.
 struct OneLink {
@@ -278,10 +228,10 @@ impl LinkSource for OneLink {
 }
 
 impl Producer {
-    /// Submit one event. Never blocks on the writer and never waits on the device (§2.9).
+    /// Submit one event. Never blocks on the writer and never waits on the device.
     ///
-    /// Motion coalesces into the pending run (§2.2); a transition is enqueued as a barrier, which
-    /// flushes everything ahead of it and starts a fresh accumulation (§2.3).
+    /// Motion coalesces into the pending run; a transition is enqueued as a barrier, which
+    /// flushes everything ahead of it and starts a fresh accumulation.
     ///
     /// Errors are the four ways input can be refused, and all of them are visible rather than
     /// silent: see [`SubmitError`].
@@ -332,8 +282,7 @@ impl Producer {
         };
 
         if overflowed {
-            // §2.8: the session has failed. Do not drop the transition and continue — trigger
-            // cancellation, surface it, and require deliberate recapture.
+            // Losing a transition could leave input held, so overflow cancels the whole session.
             Counters::bump(&counters.overflows);
             self.shared.trigger(ReleaseReason::Overflow);
             return Err(SubmitError::Overflow);
@@ -342,44 +291,33 @@ impl Producer {
         Ok(())
     }
 
-    /// Ask the writer for a fresh `GET_INFO` (§12 Stage 4c), and return the
-    /// [`Stats::device_info_generation`] the request is against.
+    /// Request fresh device information without blocking or enqueuing input.
     ///
-    /// **Non-blocking, and it enqueues nothing.** Like the cancellation flag it is one slot, so
-    /// repeated requests coalesce; the writer services it between frames and then advances the
-    /// generation, whether or not the device answered. A caller that needs the answer waits for
-    /// the snapshot's generation to pass **the number returned here** and then reads
-    /// [`Stats::device_info`].
-    ///
-    /// The generation comes back from this call rather than from a following `stats()` because a
-    /// writer that answers in between would otherwise hand the caller a baseline that has already
-    /// moved, and the caller would wait out its whole deadline for an answer it already had. It is
-    /// read in the same critical section the request is made in (`Shared::request_info_refresh`).
-    ///
-    /// The caller that needs this is the viewer's clipboard paste: the target's CapsLock decides
-    /// whether the letters it is about to type arrive inverted (D2), and the reading it must not
-    /// decide from is the one the link happened to be commissioned with.
+    /// Returns the generation observed atomically with the request. Wait for
+    /// [`Stats::device_info_generation`] to advance, then check [`Stats::device_info_stale`]
+    /// before using [`Stats::device_info`]. The generation advances on failure too.
+    /// Concurrent requests coalesce and are serviced by the writer between reports.
     #[must_use = "the returned generation is the baseline a caller waits on"]
     pub fn refresh_device_info(&self) -> u64 {
         self.shared.request_info_refresh()
     }
 
-    /// Request a release-all (§2.6): focus loss, capture release, an explicit binding, or
+    /// Request a release-all: focus loss, capture release, an explicit binding, or
     /// shutdown. Bumps `requested_epoch`, sets the 1-slot cancellation flag, disengages input and
     /// wakes the writer. It enqueues nothing and it never blocks on the writer or the device,
-    /// which is what keeps a release schedulable when the queue is full (§2.8).
+    /// which is what keeps a release schedulable when the queue is full.
     ///
     /// Repeated or concurrent calls coalesce into one release sequence.
     pub fn request_release_all(&self, reason: ReleaseReason) {
         self.shared.trigger(reason);
     }
 
-    /// Re-enable submission after a cancellation — the user's deliberate re-grab (§2.6, §2.8).
+    /// Re-enable submission after a cancellation — the user's deliberate re-grab.
     ///
     /// Succeeds only once `acked_epoch >= requested_epoch`, and never after a shutdown has begun.
-    /// That acknowledgement is a **local
-    /// barrier**: it means the writer discarded all stale work and either submitted the release
-    /// or recorded it as unsent. It does not mean the device received anything (§2.6.1) — check
+    /// That acknowledgement is a local
+    /// barrier: it means the writer discarded all stale work and either submitted the release
+    /// or recorded it as unsent. It does not mean the device received anything — check
     /// [`Stats::last_release`] for the outcome and surface an [`ReleaseOutcome::Unsent`] to the
     /// user, since the target may still be holding keys.
     pub fn engage(&self) -> Result<(), EngageError> {
@@ -402,11 +340,10 @@ impl Producer {
         self.shared.engaged.load(Ordering::SeqCst)
     }
 
-    /// Block until the epoch gate [`Producer::engage`] applies is satisfied — `acked_epoch >=
-    /// requested_epoch` — or `timeout` elapses; returns whether it is. For scripts, which use
-    /// blocking admission (§2.9), and for tests, which use it as a rendezvous rather than
-    /// sleeping. A shutdown satisfies the gate too, and `engage` then fails with
-    /// [`EngageError::ShuttingDown`]: this waits for the release, it does not promise a session.
+    /// Wait for `acked_epoch >= requested_epoch`, returning `false` on timeout.
+    ///
+    /// This only waits for the release barrier. Shutdown can satisfy it while
+    /// [`Producer::engage`] still returns [`EngageError::ShuttingDown`].
     pub fn wait_until_engageable(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut q = lock(&self.shared.queue);
@@ -429,7 +366,7 @@ impl Producer {
         }
     }
 
-    /// Block until a link has been commissioned (§2.7), returning what its `GET_INFO` reported.
+    /// Block until a link has been commissioned, returning what its `GET_INFO` reported.
     ///
     /// This is how a caller keeps "fail fast when the device is not there" while the writer owns
     /// the opening: [`spawn_with_source`] reports a startup failure through [`Stats`] instead of
@@ -470,15 +407,10 @@ impl Producer {
         }
     }
 
-    /// A snapshot of the instrumentation §2.8 requires: queue depth, time-in-queue, coalescing
-    /// rate, overflow events, and the release-all outcome (§2.6.1). Cheap: atomics plus one small
-    /// mutex.
+    /// Snapshot queue, delivery, cancellation, and link state.
     ///
-    /// The counters are sampled independently and may be a beat apart from each other, which is
-    /// what an instrumentation snapshot is. The **link** fields are not: `link_down`, `down_since`
-    /// and `device_info` all come out of the one `link_state` critical section the writer updates
-    /// them in, so a snapshot can never show a live link that is still timing an outage, or an
-    /// outage with no start (see `shared::LinkState`).
+    /// Counters are sampled independently. Link status, outage time, and device information
+    /// are sampled under one lock so their relationships remain consistent.
     pub fn stats(&self) -> Stats {
         let c = &self.shared.counters;
         let load = |a: &AtomicU64| a.load(Ordering::SeqCst);
@@ -528,20 +460,11 @@ impl Producer {
 }
 
 impl WriterHandle {
-    /// Clean shutdown, which is a §2.6 release-all trigger — and the **last** one: nothing may be
-    /// written after its release, so [`Producer::engage`] and [`Producer::submit`] fail from the
-    /// moment it begins and keep failing afterwards, when nobody is draining the queue at all.
+    /// Close input admission, finish the final release, and join the writer.
     ///
-    /// Closes the path, waits for the writer to finish the release for the epoch **this call**
-    /// requested, joins the thread and returns that release's outcome.
-    /// [`ReleaseOutcome::Unsent`] means the frames never reached the transport and **the target
-    /// may still be holding keys** (§2.6.1) — say so rather than hiding it behind cleared local
-    /// state.
-    ///
-    /// The wait is the join: the writer exits only once it has run the sequence that clears the
-    /// flag this call set, so a returned join is `acked_epoch >= E`. Joining rather than waiting on
-    /// the epoch directly is deliberate — a writer that panicked mid-sequence would never advance
-    /// the epoch, and this must report `Unsent` rather than hang. Both facts are checked below.
+    /// Returns the release outcome for this shutdown epoch or a later coalesced epoch.
+    /// [`ReleaseOutcome::Unsent`] means the target may still hold keys. Joining also detects
+    /// a writer panic, which otherwise could leave a wait for acknowledgement blocked.
     pub fn shutdown(mut self) -> ReleaseOutcome {
         let epoch = self.shared.begin_shutdown();
         let joined = match self.join.take() {
@@ -550,9 +473,7 @@ impl WriterHandle {
         };
         let acked = self.shared.acked_epoch.load(Ordering::SeqCst);
         match (joined, *lock(&self.shared.last_release)) {
-            // A later trigger can coalesce into this sequence, or follow it before the writer
-            // exits; either way a record at `>= epoch` describes a release-all written after this
-            // call asked for one, which is the fact §2.6.1 asks to be reported.
+            // A later coalesced epoch still represents a release requested after shutdown began.
             (true, Some(record)) if acked >= epoch && record.epoch >= epoch => record.outcome,
             // A writer that panicked or never ran wrote nothing.
             _ => ReleaseOutcome::Unsent,
@@ -571,7 +492,7 @@ impl WriterHandle {
 impl Drop for WriterHandle {
     /// A handle dropped without [`WriterHandle::shutdown`] still asks for a release-all and stops
     /// the writer, but does not join: a drop must not block on a wedged transport. It closes the
-    /// path exactly as `shutdown` does, so a producer that survives the handle cannot re-engage
+    /// path as `shutdown` does, so a producer that survives the handle cannot re-engage
     /// behind the release either.
     fn drop(&mut self) {
         if self.join.is_some() {

@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 r"""Record the slice of sysfs that device discovery reads, as a relocatable directory tree.
 
-`src/discovery` pairs the dongle's two device nodes from the USB device tree alone (plan §8, no
-libudev per §7.2). The two shapes it has to handle -- the SuperSpeed `peer` link and the USB 2.0
-fallback behind the dongle's internal hub -- are two different physical arrangements of the same
-hardware, and no desk shows both at once. A snapshot is how each one stays under test after the
-cable moves.
+Snapshots keep both SuperSpeed port-peer and USB 2.0 internal-hub topologies
+under test without moving the hardware between test runs.
 
 The output is laid out exactly like `/sys`, so `RealSysfs::new(OUTDIR)` reads it with no special
 casing:
@@ -58,7 +55,7 @@ import tempfile
 # What discovery reads, plus enough identification for a human reading the fixture.
 # `id` and `number` are the ALSA card's: discovery reads `id` for the `hw:CARD=` spelling, and
 # `number` is recorded so a reader can check it against the `cardN` directory name that the card
-# number is actually derived from (plan §12 Stage 4a).
+# number is derived from.
 ATTRS = [
     "idVendor", "idProduct", "product", "manufacturer", "serial",
     "busnum", "devnum", "speed", "bDeviceClass",
@@ -125,7 +122,7 @@ class Snapshot:
             self.capture(real)
             self.link(os.path.join(self.out, "bus", "usb", "devices", name), real)
             # Hub-port directories live under the hub's interface 0. They carry the `peer`
-            # symlink that is §8's evidence 2, and a `device` symlink naming what is plugged in.
+            # symlink used for port-peer pairing, and a `device` symlink naming what is plugged in.
             for child in sorted(os.listdir(real)):
                 child_real = os.path.join(real, child)
                 if "-port" not in child or not os.path.isdir(child_real):

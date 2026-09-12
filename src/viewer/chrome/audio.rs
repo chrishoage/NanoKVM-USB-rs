@@ -1,20 +1,7 @@
-//! What the chrome needs to know about audio, and nothing more (plan §12 Stage 4a, 4b).
+//! Audio status and controls derived from worker snapshots.
 //!
-//! 4a owns the ALSA threads, the ring and the counters; 4b owns the section of the Mouse-and-Audio
-//! popover that shows them and the mute toggle that drives them. This is the seam between the two,
-//! and it is deliberately a **snapshot of plain data plus one shared flag**:
-//!
-//! - the chrome must never block on the audio threads, exactly as it must never block on the
-//!   writer (§2.9), so everything it reads is copied out under 4a's own lock and handed over as
-//!   [`ChromeAudio`];
-//! - the one thing that goes the other way is the mute flag, which is an `AtomicBool` the playback
-//!   thread reads per period — a channel for a boolean the user toggles twice a session would be
-//!   ceremony.
-//!
-//! **4b was built against this rather than against 4a's real `audio::Status`, which is in another
-//! tree.** The merge replaces the one place [`ChromeAudio`] is *constructed* — `App::audio` in
-//! `viewer::app`, which today returns the default — with a read of 4a's real `audio::Status`.
-//! Nothing in `ui.rs` changes, because nothing in `ui.rs` knows where the numbers came from.
+//! Opening and unavailable states remain distinct from playback. Buffer depth is configured
+//! capacity, not a measurement of sound latency.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,20 +17,12 @@ pub enum AudioState {
     /// Running, but the user has muted it. Distinct from [`AudioState::Off`]: the stream is still
     /// open and the counters still move, which is why the counters stay visible when muted.
     Muted,
-    /// Deliberately not started — `--no-audio`.
+    /// Disabled by `--no-audio`.
     Off,
-    /// A side is between "about to open its device" and "moved its first period" (4a's hardware
-    /// defect D2). Carries the side's own name, `capture` or `playback`.
-    ///
-    /// It exists because the alternative is worse than useless: an open that never returns logs
-    /// nothing, raises no condition and leaves the counters at zero, so the popover would say
-    /// "on" about a stream that has never existed. Past 4a's supervision limit this state turns
-    /// itself into an [`AudioState::Absent`] with 4a's own wording.
+    /// Capture or playback has not transferred its first period. Overdue opening
+    /// becomes unavailable through snapshot supervision.
     Opening { side: String },
-    /// It should be running and is not. The reason is 4a's own words: `EBUSY` (another client
-    /// holds the card), a card that is not there, a card that went away, a playback sink that
-    /// vanished. Shown verbatim, because "audio unavailable" without the cause is the kind of
-    /// message that sends someone to the wrong place.
+    /// Unavailable audio with the capture or playback failure reason.
     Absent { reason: String },
 }
 
@@ -72,11 +51,7 @@ impl AudioState {
         }
     }
 
-    /// Whether the mute toggle can do anything. Muting a stream that is not running would be a
-    /// control with no effect, and §12 Stage 4b requires a disabled control's tooltip to say why.
-    ///
-    /// [`AudioState::Opening`] is **not** running: there is no stream yet, and a checkbox that
-    /// took effect on a device that may never open is a control that lies about what it did.
+    /// Whether playback is running and the mute control can affect it.
     pub fn is_running(&self) -> bool {
         matches!(self, AudioState::On | AudioState::Muted)
     }
@@ -87,15 +62,13 @@ impl AudioState {
 pub struct ChromeAudio {
     /// What it is doing.
     pub state: AudioState,
-    /// Periods dropped because the ring was full — the capture clock is ahead of playback (4a).
+    /// Periods dropped because the ring was full.
     pub overruns: u64,
     /// Periods of silence played because the ring was empty — playback is ahead of capture.
     pub underruns: u64,
-    /// Periods inserted or dropped at the ring's bounds to absorb the two crystals' drift. 4a
-    /// counts this separately from the two above because it is the *expected* correction rather
-    /// than a failure, and a number that mixes them cannot be read.
+    /// Periods inserted or dropped to correct sustained clock drift, separate from xruns.
     pub drift_corrections: u64,
-    /// Periods of real audio written to the sink (4a's `periods_played`).
+    /// Real audio periods written to the sink.
     pub played: u64,
     /// Periods written as silence because the ring had nothing to give. Shown beside `played`
     /// rather than folded into it: a session that "played" 30 000 periods of which 29 000 were
@@ -104,8 +77,7 @@ pub struct ChromeAudio {
     /// Periods written as silence because the user muted it. Not a failure and not audio, so it
     /// is neither of the two above.
     pub muted_periods: u64,
-    /// The **configured** buffer depth, as periods. §5.5: report the configured depth with its
-    /// provenance, never an end-to-end latency this desk cannot measure.
+    /// Configured ring capacity in periods; not measured latency.
     pub periods: u32,
     /// Frames per period, the other half of the depth.
     pub frames_per_period: u32,
@@ -115,7 +87,7 @@ pub struct ChromeAudio {
 }
 
 impl Default for ChromeAudio {
-    /// Absent, with the reason a viewer built before 4a landed would truthfully give.
+    /// Unavailable audio before an audio handle exists.
     fn default() -> Self {
         ChromeAudio {
             state: AudioState::Absent {
@@ -135,20 +107,7 @@ impl Default for ChromeAudio {
 }
 
 impl ChromeAudio {
-    /// Build the chrome's reading from 4a's own [`AudioSnapshot`] — **the seam, and the one
-    /// place a `ChromeAudio` describing a running path is made.**
-    ///
-    /// A free function rather than a method on `App` so that it can be tested against a snapshot
-    /// taken from a real [`crate::audio::AudioHandle`] rather than against a hand-written struct:
-    /// the thing worth pinning is that 4a's counters arrive in the fields 4b renders, and a test
-    /// that fills both sides in by hand pins nothing.
-    ///
-    /// The state is decided in the order a reader needs it:
-    /// 1. **a condition** — 4a's own wording, verbatim, including the one the D2 supervisor
-    ///    raises for an open that never returned;
-    /// 2. **opening** — a side between "about to open" and "its first period" (D2);
-    /// 3. **muted / on** — read from the shared flag, which is the live truth, not from the
-    ///    persisted setting.
+    /// Build UI audio state from a worker snapshot and its live mute flag.
     pub fn from_snapshot(
         snapshot: &AudioSnapshot,
         ring: RingConfig,
@@ -168,9 +127,8 @@ impl ChromeAudio {
             state,
             overruns: snapshot.counts.overruns,
             underruns: snapshot.counts.underruns,
-            // One number, because to a reader the two directions are one thing: how much the
-            // policy had to do to keep the two clocks together. 4a keeps them apart in its own
-            // counters and in the `stats audio:` line, which is where a drift *rate* is read off.
+            // The menu combines correction directions; detailed statistics retain each
+            // direction for drift-rate measurements.
             drift_corrections: snapshot.counts.drift_drops + snapshot.counts.drift_inserts,
             played: snapshot.periods_played,
             silent: snapshot.periods_silent,
@@ -224,7 +182,7 @@ mod tests {
         assert!(depth.contains("1920"), "{depth}");
         assert!(
             depth.contains("configured"),
-            "§5.5: say what it is: {depth}"
+            "label the configured capacity: {depth}"
         );
     }
 
@@ -246,7 +204,7 @@ mod tests {
         a.set_muted(true);
         assert!(
             a.mute.load(Ordering::Relaxed),
-            "the flag the 4a thread reads"
+            "the playback worker’s mute flag"
         );
         assert!(a.is_muted());
     }
@@ -264,8 +222,7 @@ mod tests {
         .is_running());
     }
 
-    /// D2: while a side is opening the popover says so and names which side, and the mute
-    /// toggle stays disabled — there is no stream to mute yet.
+    /// Identify the opening side and disable mute until playback is available.
     #[test]
     fn an_opening_side_is_named_and_is_not_mutable() {
         let state = AudioState::Opening {
@@ -279,11 +236,11 @@ mod tests {
         assert_ne!(
             state.label(),
             AudioState::On.label(),
-            "\"opening\" and \"on\" must not read the same: that is the whole of D2"
+            "\"opening\" and \"on\" must not read the same: unfinished opens need a distinct status"
         );
     }
 
-    /// An absent stream shows 4a's own words, not a generic phrase.
+    /// Preserve the audio subsystem’s failure reason in the menu.
     #[test]
     fn an_absent_stream_shows_the_reason_verbatim() {
         let state = AudioState::Absent {

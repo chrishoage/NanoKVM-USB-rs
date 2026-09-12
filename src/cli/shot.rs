@@ -1,32 +1,9 @@
-//! `nanokvm shot` — one frame to a file (§12 Stage 3).
+//! Single-frame screenshots as JPEG, PNG, or JPEG on stdout.
 //!
-//! Opens the video node and nothing else: a screenshot needs no serial link, and the serial node
-//! is a separate USB device whose fd, once opened, keeps its tty index across a replug (C13).
-//!
-//! The two flags that look like fussiness are both measured behaviour. `--skip` exists because
-//! the device emits up to eight frames at the *previous* resolution after an idle period (A6),
-//! and `--any-size` because the size that matters is the one in the frame's own JPEG header,
-//! never `G_FMT` — after a USB reset the driver reports the negotiated mode while the device
-//! streams 640x480 (C14).
-//!
-//! # The policy is a pure function, and the counters are printed
-//!
-//! Choosing which frame to keep is [`pick_frame`], which sees a [`FrameSource`] and a
-//! [`ShotPolicy`] and nothing else, so every rule below is tested against
-//! [`SyntheticSource`](crate::capture::SyntheticSource) rather than against the dongle. What it
-//! discarded on the way is carried out in [`Shot`] and printed on the success line: a shot that
-//! threw away 8 stale frames and restarted the stream is a different event from one that took
-//! the first frame it saw, and §3.4's rule — never claim an effect the code did not observe —
-//! cuts both ways. The counters are the evidence that the policy did anything at all.
-//!
-//! # What is written
-//!
-//! A `.jpg`/`.jpeg` shot is **the device's own bytes, byte for byte** — not a re-encode — so it
-//! is exactly the frame whose SOF header the size came from. A `.png` one is that frame decoded
-//! by the pipeline's own [`Decoder`] (RGBA, strict mode: a truncated frame is an error, not a
-//! half image) and re-encoded. Either way the file appears atomically, written to a `.tmp` in
-//! the same directory and renamed, so a reader that is watching the path never sees half a
-//! frame.
+//! Discard startup frames because the device can retain frames at its previous resolution.
+//! Reject incomplete JPEGs and compare their header dimensions with the negotiated size.
+//! Persistent mismatches allow one stream restart before failure; `--any-size` bypasses
+//! that size check. Files are written through a temporary file and renamed on success.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,8 +17,8 @@ use crate::cli::{install_signal_handlers, interrupted, out};
 
 /// How many *consecutive* frames at a size other than the negotiated one buy one stream restart.
 ///
-/// C14's watchdog in [`PipelineConfig`](crate::capture::PipelineConfig) fires on two gates,
-/// `format_mismatch_frames` (12 consecutive frames, chosen to sit above A6's eight-frame benign
+/// watchdog in [`PipelineConfig`](crate::capture::PipelineConfig) fires on two gates,
+/// `format_mismatch_frames` (12 consecutive frames, chosen to sit above eight-frame benign
 /// transient at any frame rate) and `format_mismatch_grace` (500 ms of patience with a device
 /// that is settling). A single shot has no second gate to offer — `--timeout` is the only clock
 /// here — so the frame count does both jobs and is set where 500 ms puts it at the 60 fps this
@@ -51,9 +28,9 @@ const RESTART_AFTER: u32 = 30;
 
 /// How many mismatched frames in total end the attempt with an error naming both sizes.
 ///
-/// Three times [`RESTART_AFTER`], ≈1.5 s at 60 fps. The restart is the whole remedy a shot can
+/// Three times `RESTART_AFTER`, ≈1.5 s at 60 fps. The restart is the whole remedy a shot can
 /// afford — the pipeline's ladder of three restarts, one escalation reopen and then acceptance
-/// (C14) is for a session that goes on running — so once one restart has had 60 further frames
+/// is for a session that goes on running — so once one restart has had 60 further frames
 /// to take effect, the honest answer is the error and `--any-size`, not a silently wrong-sized
 /// screenshot.
 const GIVE_UP_AFTER: u32 = 90;
@@ -67,7 +44,7 @@ const ERROR_PAUSE: Duration = Duration::from_millis(1);
 
 /// Longest `--timeout` this accepts, in seconds.
 ///
-/// An hour, and checked **before the node is opened**, for the same reason a macro's `wait` is
+/// An hour, and checked before the node is opened, for the same reason a macro's `wait` is
 /// bounded at compile time: `Instant::now() + Duration::from_secs(u64::MAX)` overflows and panics,
 /// and here it would do so with the video node already open. A screenshot that is worth waiting
 /// more than an hour for is a stream, not a shot.
@@ -80,7 +57,7 @@ pub struct ShotArgs {
     pub path: Option<PathBuf>,
 
     /// Frames to discard after streaming starts — the device can emit up to eight frames at the
-    /// previous resolution after an idle period (A6).
+    /// previous resolution after an idle period.
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub skip: u32,
 
@@ -97,20 +74,20 @@ pub struct ShotArgs {
 /// What [`pick_frame`] will and will not accept.
 #[derive(Debug, Clone)]
 pub struct ShotPolicy {
-    /// Frames to discard before looking at any of them (A6).
+    /// Frames to discard before looking at any of them.
     pub skip: u32,
     /// Take the first well-formed frame whatever its header says, and never restart the stream.
     pub any_size: bool,
     /// Consecutive mismatched frames that buy one [`FrameSource::restart`]. See
-    /// [`RESTART_AFTER`].
+    /// `RESTART_AFTER`.
     pub restart_after: u32,
-    /// Mismatched frames in total before giving up. See [`GIVE_UP_AFTER`].
+    /// Mismatched frames in total before giving up. See `GIVE_UP_AFTER`.
     pub give_up_after: u32,
 }
 
 impl ShotPolicy {
     /// The policy a command line asks for. Only `skip` and `any_size` are the user's; the two
-    /// mismatch bounds are C14's, and are constants because a screenshot that needs them tuned
+    /// mismatch bounds are, and are constants because a screenshot that needs them tuned
     /// is a bug report, not a flag.
     pub fn from_args(args: &ShotArgs) -> ShotPolicy {
         ShotPolicy {
@@ -137,11 +114,11 @@ impl Default for ShotPolicy {
 pub struct Shot {
     /// The complete JPEG as the device sent it.
     pub jpeg: Vec<u8>,
-    /// Width from *this frame's* start-of-frame header (§6, A6), never from `G_FMT`.
+    /// Width from *this frame's* start-of-frame header, never from `G_FMT`.
     pub width: u32,
     /// Height from this frame's start-of-frame header.
     pub height: u32,
-    /// Every frame **delivered** before this one that was not a size mismatch: the `--skip`
+    /// Every frame delivered before this one that was not a size mismatch: the `--skip`
     /// frames, the truncated ones, and the ones whose header could not be read. One counter
     /// because the success line reports one number; a mismatch is counted separately below
     /// because it is the only one that carries a remedy.
@@ -149,7 +126,7 @@ pub struct Shot {
     /// Frames the *source* refused before they got here ([`CaptureError::BadFrame`]).
     ///
     /// Separate from `skipped` because `--skip` is a budget of frames to *look at and throw away*
-    /// (A6's stale ones), and a frame that never arrived is not one of them. Sharing a counter
+    /// (stale ones), and a frame that never arrived is not one of them. Sharing a counter
     /// made three bad frames eat three of the eight skips, so the shot was a stale frame the
     /// policy had been told to discard.
     pub discarded: u32,
@@ -160,7 +137,7 @@ pub struct Shot {
 }
 
 impl std::fmt::Debug for Shot {
-    /// Prints the byte count rather than the bytes; a 1080p frame is ~170 KB (§6).
+    /// Prints the byte count rather than the bytes; a 1080p frame is ~170 KB.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Shot")
             .field("jpeg_len", &self.jpeg.len())
@@ -190,16 +167,16 @@ pub enum ShotError {
         discarded: u32,
         mismatched: u32,
     },
-    /// The node went away mid-shot. Fatal here: Stage 2's rediscovery belongs to a session that
+    /// The node went away mid-shot. Fatal here: rediscovery belongs to a session that
     /// keeps running, and a screenshot has nothing to keep running for.
     #[error("the capture device disconnected after {skipped} frame(s)")]
     Disconnected { skipped: u32 },
-    /// Frames kept arriving at a size the device never committed to (C14) and one restart did
+    /// Frames kept arriving at a size the device never committed to and one restart did
     /// not fix it.
     #[error(
         "the device is streaming {saw_width}x{saw_height} but {want_width}x{want_height} was \
-         negotiated; {mismatched} frames at the wrong size{}. The stream is stuck, not the \
-         device (C14) — replug the dongle, or pass --any-size to keep the frame as it is",
+         negotiated; {mismatched} frames at the wrong size{}. Pass --any-size to save the \
+         received dimensions, or reconnect the dongle and retry",
         if *restarted { ", and restarting the stream did not fix it" } else { "" }
     )]
     WrongSize {
@@ -219,43 +196,11 @@ pub enum ShotError {
     Interrupted,
 }
 
-/// Take frames until one is worth keeping, or until `deadline`.
+/// Select a frame before `deadline` under the supplied policy.
 ///
-/// The rules, in the order they are applied to each frame, and why each one is here:
-///
-/// 1. The first `policy.skip` frames go straight in the bin. A6: after an idle gap the device
-///    emits **up to eight frames at the previous resolution**, with the new `sizeimage` and no
-///    error flag, and a stream that has just been started is exactly that case.
-/// 2. A frame that does not end in the end-of-image marker is truncated and is dropped. C12 saw
-///    four of these at the signal transitions of a target reboot; strict decoding would refuse
-///    them anyway, and a truncated JPEG written to a file is a corrupt screenshot that nothing
-///    downstream can tell from a real one. See [`ends_in_eoi`].
-/// 3. The dimensions come from *this frame's* SOF header (§6, A6). A header that will not parse
-///    is the frame's problem, not the run's: drop it and count it.
-/// 4. Unless `policy.any_size`, the header size is compared with
-///    [`FrameSource::negotiated_dimensions`] — **not** as a source of dimensions, which A6
-///    forbids, but as the other half of C14's comparison. A run of mismatches buys one
-///    `restart()`, because `STREAMON` is what re-commits the format on a device whose commit was
-///    lost; a source that negotiated nothing (`None`) leaves this inert, exactly as it leaves the
-///    pipeline's watchdog inert.
-///
-/// A [`CaptureError::Timeout`] or [`CaptureError::Io`] from the source is retried until the
-/// deadline — the deadline, not a retry count, is what bounds this — while
-/// [`CaptureError::Disconnected`] and [`CaptureError::Config`] end it at once, since no amount of
-/// asking again fixes either. A [`CaptureError::BadFrame`] is a frame the source itself refused;
-/// it is counted as `discarded` and **does not spend the `--skip` budget**, which is a budget of
-/// frames to look at (A6's stale ones) and not of frames that failed to arrive.
-///
-/// **A frame already in hand is examined before the deadline is consulted again.** The check used
-/// to come first, so a good frame returned a millisecond past the deadline was thrown away
-/// unlooked-at — having already cost the wait — and the real bound was the deadline plus the
-/// source's dequeue timeout either way. So the order is: ask, judge what came back, and only then
-/// let the clock end the attempt.
-///
-/// # Errors
-///
-/// Every [`ShotError`]; see its variants. Nothing here writes anything or touches the serial
-/// side.
+/// Discard startup frames, reject missing EOI or invalid dimensions, then compare
+/// with the negotiated size unless `any_size` is set. Persistent mismatches allow
+/// one restart before failure. Device errors and cancellation terminate the attempt.
 pub fn pick_frame(
     source: &mut dyn FrameSource,
     policy: &ShotPolicy,
@@ -313,8 +258,7 @@ pub fn pick_frame(
                 break 'frame;
             }
 
-            // A6: the frame's own header, parsed here rather than taken from `frame.width`, so
-            // this function's rule holds whatever a source chose to put in those fields.
+            // Parse SOF here so this check does not trust a source’s dimension metadata.
             let (width, height) = match jpeg::dimensions(&frame.jpeg) {
                 Ok(dims) => dims,
                 Err(e) => {
@@ -347,12 +291,11 @@ pub fn pick_frame(
                         });
                     }
                     if !restarted && consecutive >= policy.restart_after {
-                        // C14: the stream is stuck, not the device, and a fresh `STREAMON` is what
-                        // re-commits the format. Once only — a shot that has to do this twice has
-                        // already answered the question.
+                        // A fresh STREAMON can re-commit the requested mode. Bound the screenshot
+                        // to one such attempt instead of retrying indefinitely.
                         log::warn!(
                             "shot: {consecutive} consecutive frames at {width}x{height} rather \
-                             than the negotiated {want_w}x{want_h}; restarting the stream (C14)"
+                             than the negotiated {want_w}x{want_h}; restarting the stream"
                         );
                         restarted = true;
                         consecutive = 0;
@@ -394,12 +337,8 @@ pub fn pick_frame(
     }
 }
 
-/// Whether a frame carries the end-of-image marker `FF D9` at its end.
-///
-/// Trailing zero bytes are ignored before the check. Every one of the frames under
-/// `fixtures/frames/` — the whole Stage 0 corpus, 640x480 to 3840x2160 — ends in `FF D9` with no
-/// padding at all, so the tolerance costs nothing on this unit and covers only the driver that
-/// rounds `bytesused` up to a boundary. Anything else is a truncated frame (C12).
+/// Check for JPEG EOI (`FF D9`) after ignoring trailing zero padding.
+/// This checks the ending only; it does not validate the complete compressed image.
 pub fn ends_in_eoi(jpeg: &[u8]) -> bool {
     let end = jpeg
         .iter()
@@ -417,11 +356,7 @@ fn pause(deadline: Instant) {
     }
 }
 
-/// Where the shot goes and in what format.
-///
-/// Parsed from the command line **before the video node is opened**, so a typo in the extension
-/// costs nothing and opens nothing (§2.8 item 3 applied to this command: resolve the whole
-/// request first, or do nothing).
+/// Output destination and format, validated before opening video.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShotTarget {
     /// `-`: the JPEG bytes on stdout, and the success line on stderr so the two do not mix.
@@ -489,7 +424,7 @@ impl ShotTarget {
     ///
     /// Anything the filesystem says, naming both the target and the temporary; or a decode
     /// failure for a PNG, which with strict mode on is what a truncated or corrupt frame gives
-    /// (§1.3, A19).
+    /// .
     pub fn write(&self, shot: &Shot) -> Result<usize> {
         match self {
             // The one place a broken stdout is an error rather than "stop printing": stdout *is*
@@ -546,11 +481,7 @@ fn utc_parts(unix_secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     (year, month, day, rem / 3_600, (rem / 60) % 60, rem % 60)
 }
 
-/// Decode the shot and re-encode it as 8-bit RGBA PNG.
-///
-/// The decoder is the pipeline's own (§1.3, A19: RGBA out, strict mode, the
-/// [`MAX_WIDTH`]x[`MAX_HEIGHT`] ceiling), so a frame this refuses is a frame the viewer would
-/// also have refused — a PNG is never a second opinion on a JPEG the client could not read.
+/// Encode PNG through the viewer's strict, size-bounded RGBA decoder.
 fn encode_png(shot: &Shot) -> Result<Vec<u8>> {
     let frame = CompressedFrame {
         jpeg: shot.jpeg.clone(),
@@ -665,7 +596,7 @@ fn write_atomically(
 ///
 /// The counters are not decoration: they are the only account of what the policy did, and a
 /// screenshot that silently threw away 40 frames at the wrong size is a different thing from one
-/// that took the first frame it was offered (§3.4 — report what was observed, and nothing else).
+/// that took the first frame it was offered.
 pub fn summary_line(target: &str, bytes: usize, shot: &Shot) -> String {
     format!(
         "wrote {target}: {}x{}, {bytes} bytes, skipped {} frames, {} at another size{}{}",
@@ -687,18 +618,11 @@ pub fn summary_line(target: &str, bytes: usize, shot: &Shot) -> String {
     )
 }
 
-/// Open the video node, keep one frame, write it, and say what it cost.
-///
-/// The node is opened with the viewer's own negotiation — `S_FMT` verified and `S_PARM` called
-/// explicitly, or 1080p silently runs at the driver's default rate (§6, A7) — so the frame is
-/// the frame the viewer would have shown. It is **dropped before the file is written** and
-/// before this returns on every path: an open fd keeps a video index, and a node whose index is
-/// held renumbers on the next replug (CLAUDE.md, C13).
-///
-/// Nothing here opens, or needs, the serial node.
+/// Open video, select one frame, release the node, then write output and statistics.
+/// Uses the viewer's format negotiation and never opens serial.
 pub fn run(args: &ShotArgs, video: &Path, width: u32, height: u32, fps: u32) -> Result<()> {
     // First, and before the node is touched: a request that cannot be written, or waited for, is
-    // not worth opening a device for (§2.8 item 3).
+    // not worth opening a device for.
     let target = ShotTarget::parse(args.path.as_deref(), SystemTime::now())?;
     let timeout = wait_limit(args.timeout)?;
 
@@ -752,7 +676,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The corpus is the authority on what a frame from this device ends with (§9.1), so the
+    /// The corpus is the authority on what a frame from this device ends with, so the
     /// rule is checked against it rather than against a retyped tail.
     #[test]
     fn every_fixture_frame_ends_in_the_end_of_image_marker() {
@@ -848,8 +772,7 @@ mod tests {
         }
     }
 
-    /// C4: the bound is a usage error before anything is opened, not a panic after. `Instant`
-    /// arithmetic with `u64::MAX` seconds overflows, and it used to do so with the node open.
+    /// Reject unrepresentable deadlines before opening a device.
     #[test]
     fn a_timeout_that_cannot_be_waited_for_is_refused_before_anything_opens() {
         for secs in [u64::MAX, MAX_TIMEOUT_SECS + 1] {
@@ -922,7 +845,7 @@ mod tests {
         );
     }
 
-    /// The case the `Drop` guard is actually for: an unwind between `create` and `rename`. A
+    /// The case the `Drop` guard is for: an unwind between `create` and `rename`. A
     /// panic used to leave a `.tmp` in the user's directory looking like a half-written shot —
     /// and so does a SIGTERM, which is the same unwind by a different route (`install_signal_handlers`).
     #[test]
@@ -966,7 +889,7 @@ mod tests {
         assert_eq!(policy.give_up_after, GIVE_UP_AFTER);
         assert!(
             policy.restart_after > 8,
-            "A6's eight-frame transient must not be able to trigger a restart"
+            "an eight-frame transient must not be able to trigger a restart"
         );
         assert!(policy.give_up_after > policy.restart_after);
     }

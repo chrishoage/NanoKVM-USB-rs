@@ -1,60 +1,8 @@
-//! Audio from the dongle to the host's speakers (plan §4.1 rev 5, §7.2, §12 Stage 4a).
+//! Independent audio capture and playback workers.
 //!
-//! The dongle's `345f:2133` is not only a capture device. It carries a USB Audio Class
-//! control/streaming pair on interfaces `1.2` and `1.3`, bound to `snd-usb-audio`, offering
-//! **one capture stream: S16_LE, 2 channels, 48 000 Hz, asynchronous IN endpoint, 1 ms packets,
-//! and no playback stream** (measured on this desk 2026-09-11 from `/proc/asound/card8/stream0`).
-//! That is the target's sound, and the reference client plays it. This module reads it and writes
-//! it to ALSA `default`.
-//!
-//! ```text
-//!   ┌────────────────────────┐   bounded ring of whole   ┌──────────────────────────┐
-//!   │ nanokvm-audio-capture  │   periods, drop-oldest    │ nanokvm-audio-play       │
-//!   │ ALSA hw:N, non-blocking│ ────────────────────────▶ │ ALSA default,non-blocking│
-//!   │ reads one period       │   silence on underrun     │ writes one period        │
-//!   └────────────────────────┘        (ring.rs)          └──────────────────────────┘
-//! ```
-//!
-//! # Audio is a side channel, and that is enforced rather than intended
-//!
-//! §4.1 rev 5: "Neither may touch the video handoff, the input queue or the render thread: audio
-//! is a side channel, and a stalled or absent sound card must leave the KVM exactly as usable as
-//! it was in Stage 3." So:
-//!
-//! - **Nothing in `src/audio/` refers to `capture`, `input`, `viewer`, `serial` or `proto`.** That
-//!   is not a convention, it is a test — `tests/audio_isolation.rs` reads every file in this
-//!   directory and fails if one of them names another subsystem, the same way `tests/cli_keys.rs`
-//!   keeps a mouse report out of the CLI.
-//! - **Every failure is a condition, never an error that propagates.** A missing card, an
-//!   `EBUSY`, a card that disappears mid-session and a playback sink that vanishes each log
-//!   **once**, set a surfaced condition on [`AudioStats`], and leave both threads retrying. The
-//!   viewer reads the condition for its title and does nothing else about it. The two sides keep
-//!   **separate** conditions, and a condition clears on the first period that moves rather than
-//!   on an open that succeeded — both because "once" has to stay once on a desk where two things
-//!   are wrong, or where one thing is half wrong.
-//! - **Nothing about audio can delay shutdown.** The PCMs are opened non-blocking and every
-//!   device call is bounded by a wait of one period, and on top of that
-//!   [`AudioHandle::stop`] gives a thread [`AudioConfig::stop_deadline`] and then detaches it
-//!   with a warning. `main.rs` drops audio after the release-all (§2.6).
-//! - **`--no-audio` opens nothing.** Not the card, not `default`; no thread is spawned at all.
-//!
-//! # Latency is reported as *configured* and nothing else (§5.5)
-//!
-//! What this module knows is the ring's depth: periods × period size, a number it chose. It does
-//! not know how long a sample took to get from the target's HDMI output to the user's speakers —
-//! that would need the dongle's own buffering, the USB transfer, ALSA's device buffers on both
-//! sides and whatever PipeWire does afterwards, none of which is measurable here. §5.5's rule is
-//! that a measurement is named for what it actually is, so [`RingConfig::depth`] is labelled
-//! *configured* everywhere it is surfaced and no end-to-end figure is claimed.
-//!
-//! # Layout
-//!
-//! - [`ring`]  — the bounded period ring and the drift policy. Pure; unit- and property-tested.
-//! - [`pcm`]   — the [`PcmSource`]/[`PcmSink`] seam and the fakes the failure tests drive.
-//! - [`alsa`]  — the only file that mentions ALSA. Thin, and untested off hardware.
-//! - [`tone`]  — a Goertzel tone detector, for asserting on a *consequence* rather than on an
-//!   open stream (A17). Pure, and tested against synthetic signals here so the hardware test
-//!   only has to wire it up.
+//! A bounded period ring separates the device and host clocks. Each side reports opening,
+//! failure, and recovery independently; audio failure does not stop keyboard or video.
+//! Stop waits for a bounded interval and detaches an unresponsive worker.
 
 pub mod alsa;
 pub mod pcm;
@@ -150,7 +98,7 @@ impl AudioSide {
     ///
     /// The order is part of the contract rather than an accident of iteration. Both sides can be
     /// in a condition at once — an unplugged dongle and a restarted PipeWire are one event on
-    /// this desk — and a title that alternated between the two four times a second would be
+    /// the recorded test setup — and a title that alternated between the two four times a second would be
     /// unreadable. Capture first because it is the one the user can usually do something about.
     pub const ALL: [AudioSide; 2] = [AudioSide::Capture, AudioSide::Playback];
 
@@ -207,30 +155,20 @@ pub struct AudioStats {
     drift_inserts: AtomicU64,
     capture_opens: AtomicU64,
     playback_opens: AtomicU64,
-    /// How many conditions were *newly* reported, which is exactly how many times one was logged.
-    /// §12 Stage 4a's "each log once" is a claim about this number, and a test can assert on it
-    /// where it cannot assert on `log::warn!`.
+    /// Count of newly reported conditions, excluding repeated identical failures.
     conditions_logged: AtomicU64,
-    /// How many times a side went from "in a condition" back to working, which is exactly how
+    /// How many times a side went from "in a condition" back to working, which is how
     /// many "recovered" lines were logged. A test can assert there was no recovery where the
     /// log would only show one.
     recoveries_logged: AtomicU64,
-    /// **One slot per side**, not one between them. Both sides can be failing at once — a dongle
-    /// that was unplugged and a `default` whose daemon restarted are one event on this desk — and
+    /// One slot per side, not one between them. Both sides can be failing at once — a dongle
+    /// that was unplugged and a `default` whose daemon restarted are one event on the recorded test setup — and
     /// a single slot makes each side's retry overwrite the other's condition, so every retry
     /// looks new, every retry logs, and `conditions_logged` counts retries rather than
-    /// conditions. Keyed by [`AudioSide::index`].
+    /// conditions. Keyed by `AudioSide::index`.
     conditions: Mutex<[Option<AudioCondition>; 2]>,
-    /// **When each side's current open attempt began, if one is in flight** (hardware defect D2).
-    ///
-    /// D2: the playback thread once sat inside `snd_pcm_open` for ever. It logged nothing, raised
-    /// no condition, and `playback_opens` stayed at 0 — so "never opened" and "working" looked
-    /// identical in the title, in the popover and in the stats line. A side channel that fails
-    /// silently is the one failure mode §2.8 exists to forbid.
-    ///
-    /// Set immediately **before** the opener is called and cleared on the **first period that
-    /// actually moves**, so it also covers the other half of the same gap: a device that opens
-    /// and then never produces anything. Keyed by [`AudioSide::index`].
+    /// Start time of each side's current open, cleared when its first period moves.
+    /// Snapshot readers use this to expose a worker stuck in open or first I/O.
     opening: Mutex<[Option<Instant>; 2]>,
     /// How long a side may stay in [`AudioStats::opening`] before it is surfaced as a condition,
     /// in milliseconds; `0` disables the supervision.
@@ -243,7 +181,7 @@ pub struct AudioStats {
 }
 
 impl AudioStats {
-    /// Record a condition on `side`. Returns `true` if it is new **for that side** — which is the
+    /// Record a condition on `side`. Returns `true` if it is new for that side — which is the
     /// caller's cue to log it, and the only time it ever does.
     ///
     /// "New" is by kind and message, against that side's own entry. A card that is absent stays
@@ -272,9 +210,9 @@ impl AudioStats {
     }
 
     /// Clear one side's condition because it is working again. Returns `true` if there was one to
-    /// clear, so recovery is logged exactly once too.
+    /// clear, so recovery is logged once too.
     ///
-    /// **Called after the first period that actually moved, never after a successful open.** An
+    /// Called after the first period that moved, never after a successful open. An
     /// open that succeeds and then fails on its first read is not a recovery: on a card that does
     /// that every cycle — which is what a half-dead USB device looks like — treating the open as
     /// the recovery produces a "recovered" line and a warning twice a second for the rest of the
@@ -288,7 +226,7 @@ impl AudioStats {
         false
     }
 
-    /// The condition to show, if any: **capture's if both sides have one**, per
+    /// The condition to show, if any: capture's if both sides have one, per
     /// [`AudioSide::ALL`], so the title is a function of the state and not of which thread
     /// retried last.
     pub fn condition(&self) -> Option<AudioCondition> {
@@ -314,7 +252,7 @@ impl AudioStats {
         );
     }
 
-    /// Mark that `side` is about to call into its opener (D2).
+    /// Mark that `side` is about to call into its opener.
     ///
     /// Called on the thread, immediately before the call that can block for ever. That is the
     /// point of it: the thread that is stuck cannot report itself, so it leaves a timestamp
@@ -332,20 +270,20 @@ impl AudioStats {
     }
 
     /// Which sides are currently between "about to open" and "moved a period", keyed by
-    /// [`AudioSide::index`].
+    /// `AudioSide::index`.
     pub fn opening_sides(&self) -> [bool; 2] {
         let held = self.opening.lock().unwrap_or_else(|e| e.into_inner());
         [held[0].is_some(), held[1].is_some()]
     }
 
-    /// Turn an open that has not come back within the limit into an ordinary condition (D2).
+    /// Turn an open that has not come back within the limit into an ordinary condition.
     ///
     /// Called from [`AudioStats::snapshot`], which is to say from whoever is surfacing audio —
     /// the title four times a second, or the stats line. That is deliberate: the only thread that
     /// knows an open is outstanding is the one blocked inside it.
     ///
-    /// The message names the limit and **never the elapsed time**, so it is the same string on
-    /// every call and [`AudioStats::report`]'s dedup logs it exactly once.
+    /// The message names the limit and never the elapsed time, so it is the same string on
+    /// every call and [`AudioStats::report`]'s dedup logs it once.
     fn supervise_opening(&self) {
         let limit = self.opening_limit_ms.load(Ordering::Relaxed);
         if limit == 0 {
@@ -400,14 +338,9 @@ impl AudioStats {
         }
     }
 
-    /// Publish the ring's counters, which are the authority for all six.
-    ///
-    /// **`fetch_max`, not `store`.** Each thread takes its copy of [`RingCounts`] under the ring's
-    /// lock and publishes it here without it, so two threads can arrive in the opposite order to
-    /// the one they read in and a `store` would then walk a counter backwards — a reader would
-    /// see `overruns 7` and then `overruns 6`, which in a §2.8 surface is worse than a number
-    /// that is one behind. The counters only ever increase, so taking the larger of the two is
-    /// both correct and monotone.
+    /// Publish ring counters monotonically. Both workers snapshot under the ring lock
+    /// then publish outside it; `fetch_max` prevents reversed publication order from
+    /// moving a counter backward.
     fn absorb(&self, counts: RingCounts) {
         for (slot, value) in [
             (&self.pushed, counts.pushed),
@@ -443,7 +376,7 @@ pub struct AudioSnapshot {
     pub recoveries_logged: u64,
     pub condition: Option<AudioCondition>,
     /// Which sides are between "about to open" and "moved their first period", keyed by
-    /// [`AudioSide::index`] (D2). See [`AudioSnapshot::opening_side`].
+    /// `AudioSide::index`. See [`AudioSnapshot::opening_side`].
     pub opening: [bool; 2],
 }
 
@@ -488,39 +421,15 @@ pub struct AudioConfig {
     /// How long [`AudioHandle::stop`] waits for a thread before detaching it.
     ///
     /// A bound, not an expectation: both threads normally stop within one slice of
-    /// [`sleep_until_stopped`]. It exists because the thing on the other side of a device call is
-    /// a driver, and `main.rs` drops audio on **every** shutdown path — including the one after
-    /// the release-all, which must not be delayed by a wedged sound card (§2.6).
+    /// `sleep_until_stopped`. It exists because the thing on the other side of a device call is
+    /// a driver, and `main.rs` drops audio on every shutdown path — including the one after
+    /// the release-all, which must not be delayed by a wedged sound card.
     pub stop_deadline: Duration,
-    /// Periods the playback side waits for before it writes anything, each time it opens.
+    /// Periods to accumulate before playback begins, on every open.
     ///
-    /// **Without this the drift policy has nothing to measure.** Playback blocks inside the sink,
-    /// so a ring that is never primed sits at zero or one period for the whole session: the level
-    /// is then a fact about scheduling phase rather than about the two clocks, and a low-water
-    /// mark placed anywhere useful would fire constantly. Priming puts the level at a known
-    /// cushion, after which it only walks away from that cushion if the clocks really do differ —
-    /// which is exactly the signal [`DriftPolicy`] exists to act on.
-    ///
-    /// It is also the buffer the listener actually hears.
-    ///
-    /// **It must be deeper than [`AudioConfig::device_periods`], and that is a measurement rather
-    /// than a preference.** The first writes of a session do not block: they go straight into the
-    /// sound card's own buffer, which is `device_periods` periods deep and empty at that point. So
-    /// a prefill of `n` periods leaves `n - device_periods` in the ring once the device buffer is
-    /// full, and only then does the sink start pacing. With the two equal the ring is drained to
-    /// zero by its own prefill, sits on the low-water mark, and the drift policy fires
-    /// [`DriftAction::InsertOne`] for a clock difference that has not happened.
-    ///
-    /// Measured on this desk 2026-09-11 over 20 s runs against the real card and a null sink:
-    ///
-    /// | `device_periods` | `prefill_periods` | drift inserts | silent periods |
-    /// | --- | --- | --- | --- |
-    /// | 4 | 4 | **2** | **2** |
-    /// | 4 | 6 | 0 | 0 |
-    /// | 2 | 4 | 0 | 0 |
-    ///
-    /// Two periods of silence injected into the first second is minor on its own; polluting the
-    /// counters §12 Stage 4a asks to be read as a drift rate is not.
+    /// Must exceed [`AudioConfig::device_periods`], whose initial writes do not block.
+    /// The default six-period prefill leaves two periods after the four-period device
+    /// buffer fills, preventing startup from being miscounted as clock drift.
     pub prefill_periods: usize,
 }
 
@@ -660,20 +569,16 @@ pub struct AudioHandle {
 }
 
 impl AudioHandle {
-    /// Start the two threads.
-    ///
-    /// Neither opener is called on this thread: a card that is not there must not delay the
-    /// viewer's startup by one backoff, and §6.1's rule — startup is fail-fast for video, and
-    /// everything after it recovers — does not extend to a side channel that was never load
-    /// bearing. Audio starts in the "not open yet" state and reports what it finds.
+    /// Start capture and playback workers without opening devices on the caller's thread.
+    /// Each worker reports its own opening, failure, and recovery state.
     pub fn spawn(
         mut source: Box<dyn PcmSourceOpener>,
         mut sink: Box<dyn PcmSinkOpener>,
         config: AudioConfig,
     ) -> AudioHandle {
         let stats = Arc::new(AudioStats::default());
-        // D2: an open that never returns is otherwise invisible. The limit is the longest this
-        // module ever waits for anything, so past it the open is stuck by our own standard.
+        // A blocked opener cannot report its own delay. Use the maximum retry delay
+        // as the supervision limit.
         stats.set_opening_limit(config.reopen_backoff_cap);
         let muted = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
@@ -685,9 +590,7 @@ impl AudioHandle {
         source.on_stop_flag(Arc::clone(&stop));
         sink.on_stop_flag(Arc::clone(&stop));
 
-        // `flatten` below drops whichever of the two would not start: a thread that cannot be
-        // spawned is reported by `spawn_named` and the other one carries on, because §4.1 rev 5
-        // will not have audio stop anything.
+        // A failed audio thread start must not prevent the other side or viewer from running.
         let threads = vec![
             spawn_named(
                 "nanokvm-audio-capture",
@@ -734,12 +637,7 @@ impl AudioHandle {
         self.stats.snapshot()
     }
 
-    /// The mute flag, for whatever ends up flipping it.
-    ///
-    /// Stage 4a exposes the API and binds nothing to it: §12 puts the mute control in the chrome,
-    /// which is 4b's, and this client's rule is that it steals no key the target was going to get
-    /// (§12 Stage 4b's routing rule). So the flag exists, the playback thread honours it on the
-    /// next period, and nothing sets it yet.
+    /// Shared mute flag, applied by playback at the next period.
     pub fn mute_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.muted)
     }
@@ -752,18 +650,10 @@ impl AudioHandle {
         self.muted.store(muted, Ordering::Relaxed);
     }
 
-    /// Stop both threads and wait for them, for at most [`AudioConfig::stop_deadline`].
+    /// Stop audio and wait at most [`AudioConfig::stop_deadline`]. Idempotent.
     ///
-    /// Idempotent. Both threads normally stop within one 20 ms slice: the capture thread checks
-    /// the flag between periods and inside [`PcmSource::read_period`], and the playback thread is
-    /// woken out of its wait by [`SharedRing::close`].
-    ///
-    /// **But the wait is bounded, and a thread that overruns it is detached with a warning.** The
-    /// thing on the other side of a device call is a driver: an ALSA PCM whose card has been
-    /// yanked can sit in the kernel, and `main.rs` drops audio on every shutdown path, after the
-    /// release-all (§2.6). A side channel that could hold the process open past a release-all
-    /// would be exactly the coupling §4.1 rev 5 forbids — so audio gives up on itself rather than
-    /// on the shutdown, and says so where a user can see it.
+    /// Close wakes ring waiters. Workers normally stop within a polling slice; a driver
+    /// call that exceeds the deadline is detached with a warning.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.shared.close();
@@ -812,9 +702,7 @@ fn spawn_named(
         .spawn(body)
     {
         Ok(handle) => Some((name, handle)),
-        // A thread that will not start is reported and dropped rather than propagated: §4.1 rev 5
-        // makes audio a side channel, and a process that refused to show video because it could
-        // not spawn a sound thread would be exactly the coupling this module exists to avoid.
+        // Report thread-start failure locally so audio cannot abort the viewer.
         Err(e) => {
             log::warn!("audio: cannot spawn {name} ({e}); continuing without audio");
             None
@@ -834,8 +722,7 @@ fn capture_loop(
         let samples = config.ring.period_samples();
         let mut absences = 0u32;
         while !stop.load(Ordering::SeqCst) {
-            // D2: the timestamp goes down *before* the call that can block for ever, because the
-            // thread inside it cannot report itself. Cleared on the first period that moves.
+            // Record the start before entering a blocking open; clear it when a period moves.
             stats.opening(AudioSide::Capture);
             let mut source = match opener.open() {
                 Ok(source) => {
@@ -866,7 +753,7 @@ fn capture_loop(
 
             // The open is not the recovery: a card that opens and then fails its first read is a
             // half-dead device, and calling the open a recovery would log one twice a second for
-            // the rest of the session. The first period that actually arrives is the recovery
+            // the rest of the session. The first period that arrives is the recovery
             // (`AudioStats::recovered`).
             let mut working = false;
             while !stop.load(Ordering::SeqCst) {
@@ -921,7 +808,7 @@ fn playback_loop(
     config: AudioConfig,
 ) -> impl FnOnce() + Send + 'static {
     move || {
-        // **One period** of patience before falling back to silence, not one ring depth. The
+        // One period of patience before falling back to silence, not one ring depth. The
         // device's own buffer is `device_periods` periods (40 ms at the default), so a thread
         // that waited the ring's 80 ms for a period that is not coming would let the sound card
         // run dry first — an XRUN, which is a click and an ALSA state to recover from, in place
@@ -931,8 +818,7 @@ fn playback_loop(
             (config.ring.depth() / config.ring.periods.max(1) as u32).max(Duration::from_millis(3));
         let mut absences = 0u32;
         while !stop.load(Ordering::SeqCst) {
-            // D2 again, and this is the side it was observed on: one run sat inside
-            // `snd_pcm_open` on ALSA `default` for six seconds and logged nothing at all.
+            // Record opening before the driver call so a blocked open remains visible.
             stats.opening(AudioSide::Playback);
             let mut sink = match opener.open() {
                 Ok(sink) => {
@@ -1104,9 +990,7 @@ mod tests {
         assert_eq!(stats.snapshot().recoveries_logged, 1);
     }
 
-    /// The counters are published without the ring's lock, so two threads can arrive in the
-    /// opposite order to the one they read in. A reader must never see a counter go backwards:
-    /// in a §2.8 surface that is worse than a number one update behind.
+    /// Out-of-order counter publication must remain monotonic.
     #[test]
     fn interleaved_publications_never_walk_a_counter_backwards() {
         let stats = Arc::new(AudioStats::default());
@@ -1161,8 +1045,7 @@ mod tests {
             .expect("the reader saw a counter go backwards");
     }
 
-    /// The schedule §12 Stage 4a's retry loop runs on: the first retry is prompt, an absence that
-    /// persists is retried less and less often, and it never grows past the cap.
+    /// Absent-device retries grow to the configured cap.
     #[test]
     fn the_retry_schedule_doubles_while_a_device_stays_absent_and_stops_at_the_cap() {
         let base = Duration::from_millis(500);
@@ -1254,7 +1137,7 @@ mod tests {
         }
     }
 
-    /// Measured 2026-09-11 on this desk: with `prefill_periods == device_periods` the prefill is
+    /// Measured 2026-09-11 on the recorded test setup: with `prefill_periods == device_periods` the prefill is
     /// consumed entirely by the sound card's own buffer, the ring is left empty on the low-water
     /// mark, and the drift policy inserts periods of silence for a clock difference that has not
     /// happened — two of them in the first second, every run. The relation, not the two numbers,

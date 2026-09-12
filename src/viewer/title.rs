@@ -1,35 +1,7 @@
-//! The window title, as a pure function of what is currently true (plan §2.6.1, §2.8, §6.1,
-//! §12 Stage 1).
+//! Window-title status for input, capture, release delivery, and audio.
 //!
-//! The title is this client's whole user interface for everything that is not a pixel: whether
-//! input is being forwarded, how to get out, whether frames stopped, whether the transport is
-//! gone, and whether a release-all failed to reach the target. §2.8 requires those conditions to
-//! be *surfaced* rather than counted, and §6.1 requires them to be told apart — which means the
-//! wording is behaviour, not decoration, and it needs tests that fail when it regresses.
-//!
-//! So the composition lives here, with no window, no clock and no handle in scope: `App` measures
-//! the facts and this turns them into a string. Every elapsed time arrives as a [`Duration`]
-//! already, because a function that read the clock could not be asserted against.
-//!
-//! # The distinctions the wording has to keep
-//!
-//! - **A stall is not a disconnection (§6.1 S2-1).** Frames stopping while the device is still
-//!   there is "frames stopped N s ago"; the device going away is "capture device gone,
-//!   reconnecting". Different faults, different remedies — one is the target's output or the
-//!   capture chip, the other is a cable — and a title that said "no video" to both would be
-//!   exactly the conflation §6.1 forbids.
-//! - **Neither ever claims the signal is gone.** This hardware cannot report that, and pixel
-//!   content is never evidence of it (A5).
-//! - **"Down" is not "gone" any more (§2.7).** A serial link that went away is being reopened,
-//!   and the title says so, with how long it has been trying — the number that tells a user
-//!   whether to go and look at the cable.
-//! - **A session that ended by failure says why (§2.8).** See [`super::state::Notice`].
-//! - **An accepted format mismatch is a condition, not a counter (C5).** When the capture
-//!   watchdog has given up on getting the device into the mode `S_FMT` negotiated, the window is
-//!   showing a 640x480 image on a 1080p session for the rest of the run. That is more visible to
-//!   the user than to the log, so it belongs here, next to everything else that is wrong — and
-//!   it goes away by itself the moment a frame at the negotiated size arrives, because the
-//!   fragment is a function of the two sizes rather than of the counter that got them compared.
+//! The title remains visible when the menu is collapsed. Stalls, disconnections, and size
+//! mismatches have distinct messages because they require different recovery actions.
 
 use std::time::Duration;
 
@@ -41,7 +13,7 @@ use crate::viewer::RELEASE_KEY;
 /// The title's fixed part.
 pub const APP_TITLE: &str = "NanoKVM-USB";
 
-/// What the title says about audio (§12 Stage 4a).
+/// What the title says about audio.
 ///
 /// Three states, because those are the three things a user can do something about: it is off
 /// because they asked for it to be off, it is on (possibly muted), or it is unavailable and the
@@ -56,34 +28,29 @@ pub enum AudioTitle<'a> {
     On {
         muted: bool,
         counts: RingCounts,
-        /// For the *configured* depth. §5.5: named for what it is, never as a latency.
+        /// Configured buffer capacity, not measured audio latency.
         ring: RingConfig,
     },
     /// Not running, and why. The reason is a borrowed condition message, so the wording comes
     /// from [`crate::audio::AudioError`] and this function invents none of it.
     Unavailable(&'a str),
-    /// A side is between "about to open its device" and "moved its first period" (hardware
-    /// defect D2). Carries the side's own name, `capture` or `playback`.
-    ///
-    /// D2: an open that never returns logs nothing and raises no condition, so "has not started"
-    /// and "working" read identically. This is the state that tells them apart while it lasts;
-    /// past [`crate::audio::AudioConfig::reopen_backoff_cap`] it becomes an ordinary
-    /// [`AudioTitle::Unavailable`], because by then it is not opening, it is stuck.
+    /// Audio open or first transfer is pending. Overdue attempts become unavailable
+    /// through audio snapshot supervision.
     Opening(&'a str),
 }
 
-/// How long frames must be absent before the title says so (§6.1 S1-2). Matches the pipeline's
+/// How long frames must be absent before the title says so. Matches the pipeline's
 /// own stall threshold, so the title and [`PipelineState::Stalled`] change together.
 pub const STALL_NOTICE: Duration = Duration::from_millis(500);
 
 /// Everything the title is a function of, measured by the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct TitleFacts<'a> {
-    /// The wgpu present mode, for the §5.4 measurement it belongs to.
+    /// Selected presentation mode for diagnostics.
     pub present_mode: &'a str,
-    /// The capture session: its phase, and why the last one ended (§2.8).
+    /// The capture session: its phase, and why the last one ended.
     pub session: Session,
-    /// What the capture pipeline is doing (§6.1).
+    /// What the capture pipeline is doing.
     pub pipeline: PipelineState,
     /// How long the capture device has been gone, while it is being reopened.
     pub disconnected_for: Option<Duration>,
@@ -95,17 +62,17 @@ pub struct TitleFacts<'a> {
     pub link_down_for: Option<Duration>,
     /// [`crate::input::Stats::reconnect_attempts`].
     pub reconnect_attempts: u64,
-    /// Whether the last release-all failed to reach the target (§2.6.1).
+    /// Whether the last release-all failed to reach the target.
     pub release_unsent: bool,
     /// [`crate::capture::PipelineStats::format_mismatch_accepted`] is nonzero: the capture
     /// watchdog has, at least once, given up on establishing the negotiated mode.
     pub format_mismatch_accepted: bool,
     /// [`crate::capture::PipelineStats::last_resolution`] — the size of the last frame, from its
-    /// own SOF header (A6).
+    /// own SOF header.
     pub video_size: Option<(u32, u32)>,
     /// [`crate::capture::PipelineStats::negotiated_dimensions`] — what `S_FMT` committed to.
     pub negotiated_size: Option<(u32, u32)>,
-    /// What audio is doing (§12 Stage 4a).
+    /// What audio is doing.
     pub audio: AudioTitle<'a>,
 }
 
@@ -118,7 +85,7 @@ pub fn compose(f: &TitleFacts) -> String {
     );
 
     match f.pipeline {
-        // §6.1 S2-4: the client is doing something about it, and for how long.
+        // Report capture recovery and outage duration.
         PipelineState::Reconnecting => {
             title.push_str(" — capture device gone, reconnecting");
             if let Some(since) = f.disconnected_for {
@@ -157,9 +124,8 @@ pub fn compose(f: &TitleFacts) -> String {
         title.push_str(notice.title_fragment());
     }
 
-    // C5: the watchdog gave up *and* the frames are still the wrong size. Both halves matter —
-    // the counter alone would keep saying so long after the device came right, and the sizes
-    // alone would flag A6's benign transient on every reopen.
+    // Require both exhausted recovery and a current mismatch. A cumulative
+    // counter alone would keep the warning after the size recovered.
     if f.format_mismatch_accepted {
         if let (Some(video), Some(negotiated)) = (f.video_size, f.negotiated_size) {
             if video != negotiated {
@@ -180,12 +146,8 @@ pub fn compose(f: &TitleFacts) -> String {
     title
 }
 
-/// The audio segment, as its own function because §12 Stage 4a states exactly what it has to
-/// carry: the state, the counters, and the buffer depth **labelled as configured**.
-///
-/// `--no-audio` produces `— audio off` and nothing else, ever. That is the whole of what §12
-/// Stage 4a allows the title to say when audio was not asked for: "with it, the viewer must be
-/// exactly Stage 3 (no card opened, nothing about audio in the title beyond 'off')".
+/// Format audio state, nonzero counters, and configured capacity. Disabled audio
+/// shows only the off state.
 fn audio_fragment(audio: &AudioTitle) -> String {
     match audio {
         AudioTitle::Off => " — audio off".to_string(),
@@ -197,15 +159,12 @@ fn audio_fragment(audio: &AudioTitle) -> String {
             ring,
         } => {
             let state = if *muted { "audio muted" } else { "audio on" };
-            // §5.5: the number is what was *configured*, not what any sample experienced. The
-            // word is in the title rather than only in the documentation because this is the
-            // only place a user sees it, and an unqualified "80 ms" would be read as latency.
+            // Label buffer capacity as configured so it cannot be mistaken for measured latency.
             let mut fragment = format!(
                 " — {state} (buffer {}x{} frames configured)",
                 ring.periods, ring.period_frames
             );
-            // §2.8: surfaced, never silently absorbed — but a healthy session says nothing, the
-            // same rule the rest of this title follows.
+            // Include nonzero failure counters without cluttering healthy status.
             if counts.any() {
                 fragment.push_str(&format!(
                     ", overruns {}, underruns {}, drift {}/{}",

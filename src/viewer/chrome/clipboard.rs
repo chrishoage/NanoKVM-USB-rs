@@ -1,61 +1,8 @@
-//! The clipboard source for §12 Stage 4c: `wl-clipboard-rs` over the data-control protocol.
+//! Bounded Wayland clipboard reads on a separate connection.
 //!
-//! # Why data-control, and why a crate of its own
-//!
-//! §12 Stage 4c: *"`wl-clipboard-rs` over the data-control protocol, which needs no focus and
-//! which niri supports."* Needing no focus is the point — the viewer asks for the clipboard the
-//! moment the user triggers a paste, which is also the moment its own window is focused and the
-//! keyboard is grabbed, and a focus-based clipboard protocol (`wl_data_device`) would be asking
-//! the compositor for a selection it is in no position to serve.
-//!
-//! This is deliberately **not** `egui-winit`'s `clipboard` feature. That one pulls `arboard` and
-//! `smithay-clipboard`, and with them a second SCTK/calloop and a second `wayland-backend` build —
-//! which `crate::viewer::wayland`'s module docs record as exactly what makes winit's foreign
-//! `wl_surface` proxy unrecognisable and silently kills shortcut inhibition (§1.5). `Cargo.toml`
-//! says so where the feature is turned off.
-//!
-//! Measured on this desk (a `wl_registry` roundtrip against the live niri session, 4b's research
-//! spike): niri advertises **both** `ext_data_control_manager_v1 v1` and
-//! `zwlr_data_control_manager_v1 v2`. `wl-clipboard-rs` 0.9.2 added `ext-data-control` and prefers
-//! it when present, so this desk takes the newer path; the fallback is the one the crate started
-//! with. A compositor with neither answers [`Error::MissingProtocol`], which becomes
-//! [`Availability::Unsupported`] and a disabled menu item whose tooltip is the reason (§12 Stage
-//! 4b: every disabled control says why).
-//!
-//! # The clipboard is never logged, printed or persisted
-//!
-//! Nothing in this module — or anywhere else in this crate — writes clipboard text to a log, a
-//! file or the terminal, and nothing writes a value **derived** from it either. What may be said
-//! about it is its **length**, the number of key transitions it compiled to, and how the paste
-//! ended; no digest, no hash, no excerpt. A digest is a content-derived value in a durable,
-//! shareable file, and the reason it was here — correlating a hardware run's log with an `md5sum`
-//! taken by hand — is not a reason to ship one. The one place the text exists is the compiled key
-//! transitions, in memory, for the duration of the paste.
-//!
-//! The same rule covers the refusals: [`super::paste::Refusal::offenders`] names characters out of
-//! the clipboard for the *popover*, and [`super::paste::Refusal::log_line`] is what the log gets —
-//! a count and a pointer to the window.
-//!
-//! # Fetched at trigger time, on a thread, with a deadline
-//!
-//! [`get_contents`] does a Wayland roundtrip and then reads a pipe the *other* application writes
-//! to; how long that takes is up to a program this one does not control. The event loop must not
-//! block (§5.4), so [`Fetch::spawn`] does it on a short-lived thread and delivers the answer
-//! through a channel the loop polls.
-//!
-//! **A thread whose peer never writes is not left to its own devices.** Three rules keep a hung
-//! clipboard owner from costing this process anything for the rest of its life, which is what it
-//! would do under a menu item a user can click again every few seconds:
-//!
-//! 1. **One fetch at a time.** [`FetchGate`] admits one reader thread; while one is outstanding a
-//!    new paste is refused, by name, rather than spawning a second thread onto the same pipe-less
-//!    peer.
-//! 2. **The read has its own deadline** — [`READ_DEADLINE`], the same one the event loop gives the
-//!    whole preparation. The pipe fd is polled rather than read blindly, so the thread returns at
-//!    the deadline whatever the peer is doing, and dropping the reader closes the fd.
-//! 3. **An abandoned fetch is counted and logged once.** The [`std::thread::JoinHandle`] is kept:
-//!    a [`Fetch`] dropped after its answer arrived joins its thread, and one dropped before that
-//!    says so, once, with the running total.
+//! Data-control access does not depend on keyboard focus. A single outstanding fetch,
+//! read deadline, and byte limit bound work from a slow or oversized clipboard owner.
+//! Clipboard content is never logged.
 
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -66,18 +13,8 @@ use std::time::{Duration, Instant};
 
 use wl_clipboard_rs::paste::{get_contents, get_mime_types, ClipboardType, Error, MimeType, Seat};
 
-/// The largest clipboard this will read into memory, in bytes.
-///
-/// **This is a memory bound and not a pacing cap.** §12 Stage 4c has no length cap on a paste —
-/// "the rate and the cancel are the cap" — and this does not add one that any human could reach:
-/// at [`crate::script::REPORT_DELAY_MS`] per transition, 16 MiB of text is over **two weeks** of
-/// uninterrupted typing (measured in [`tests::the_read_bound_is_far_past_any_paste`]), so
-/// the thing that ends a long paste is still the rate and the release key. What it does bound is a
-/// read from a pipe an **unrelated process** is writing, which without a bound is an allocation
-/// this program does not control the size of.
-///
-/// It is a stated deviation from the plan's "no length cap" and it is stated where a user meets
-/// it: the refusal names the limit and what had arrived, and the Paste tooltip names it too.
+/// Maximum clipboard bytes accepted. Bounds allocation from another process
+/// before text compilation and paced delivery.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long the clipboard's owner is given to write it.
@@ -102,7 +39,7 @@ pub enum Availability {
 impl Availability {
     /// Probe the compositor once, at startup.
     ///
-    /// Asks for the **MIME types** on the clipboard, not its contents: that is one roundtrip, it
+    /// Asks for the MIME types on the clipboard, not its contents: that is one roundtrip, it
     /// reads no user data, and it fails with [`Error::MissingProtocol`] on precisely the
     /// compositors the menu item must be disabled for.
     ///
@@ -135,15 +72,13 @@ impl Availability {
 fn unsupported_reason(e: &Error) -> String {
     match e {
         Error::MissingProtocol { name, version } => format!(
-            "this compositor does not implement {name} version {version}, so the clipboard cannot \
-             be read without keyboard focus. Paste needs wlr-data-control or ext-data-control; \
-             niri, sway and river have it."
+            "clipboard access requires {name} version {version}. The compositor does not provide it; paste is unavailable."
         ),
         other => format!("the clipboard could not be read: {other}"),
     }
 }
 
-/// What a fetch produced. The `Ok` side is the clipboard text and is **never** logged (module
+/// What a fetch produced. The `Ok` side is the clipboard text and is never logged (module
 /// docs); the `Err` side is a sentence for the chrome.
 pub type Fetched = Result<String, String>;
 
@@ -199,12 +134,8 @@ pub struct Fetch {
 }
 
 impl Fetch {
-    /// Start reading the regular clipboard as UTF-8 text, or say why one cannot be started.
-    ///
-    /// [`MimeType::Text`] is the crate's own preference order and is exactly the one §12 Stage 4c
-    /// asks for: `text/plain;charset=utf-8` first, then `UTF8_STRING`, then any other `text/*`
-    /// (`wl-clipboard-rs` 0.9.3 `paste.rs`, `get_contents_internal`). Asking for
-    /// `MimeType::Specific` three times in a row would be three connections and the same answer.
+    /// Start an asynchronous UTF-8 clipboard read. Uses [`MimeType::Text`] selection
+    /// within one connection; refuses when another fetch is still outstanding.
     pub fn spawn() -> Result<Fetch, String> {
         Fetch::start(&GATE, read_clipboard)
     }
@@ -220,8 +151,7 @@ impl Fetch {
             .is_err()
         {
             return Err(format!(
-                "the previous clipboard read has not answered yet — the application that owns the \
-                 clipboard is not writing it. It gives up {} s after it started; try again then",
+                "a clipboard read is still pending. It times out after {} s; try again when it finishes",
                 READ_DEADLINE.as_secs()
             ));
         }
@@ -234,7 +164,7 @@ impl Fetch {
                 // window closed. Nothing to report to and nothing to clean up.
                 let _ = tx.send(read());
                 // Released last, and only here: while this is set no second reader may start, and
-                // that is exactly the window in which one would pile up behind a hung peer.
+                // that is the window in which one would pile up behind a hung peer.
                 gate.outstanding.store(false, Ordering::SeqCst);
             });
         match spawned {
@@ -285,8 +215,7 @@ impl Drop for Fetch {
         }
         let n = self.gate.abandoned.fetch_add(1, Ordering::SeqCst) + 1;
         log::warn!(
-            "a clipboard read was abandoned before it answered; it exits at its own {} s deadline \
-             and no paste can start until it does ({n} abandoned since start)",
+            "clipboard read canceled; waiting for its {} s deadline before another paste can start ({n} canceled reads)",
             READ_DEADLINE.as_secs()
         );
     }
@@ -306,7 +235,7 @@ fn read_clipboard() -> Fetched {
     let bytes = read_bounded(pipe, READ_DEADLINE, MAX_BYTES)?;
     // The MIME type is a type name, not content, so it may be reported. `MimeType::Text` only ever
     // selects a text type, and a text type that is not valid UTF-8 is a source's mistake rather
-    // than something to approximate around (§10.2: never approximate).
+    // than something to approximate around.
     String::from_utf8(bytes).map_err(|_| {
         format!("the clipboard's {mime} is not valid UTF-8, so it cannot be typed as characters")
     })
@@ -314,7 +243,7 @@ fn read_clipboard() -> Fetched {
 
 /// Read `src` to EOF, giving up at `deadline` and refusing past `max` bytes.
 ///
-/// The fd is **polled** before every read rather than read blindly, because `read_to_end` on a
+/// The fd is polled before every read rather than read blindly, because `read_to_end` on a
 /// pipe whose peer writes a chunk and then stops blocks for as long as the peer is alive — which,
 /// for a clipboard, is another application's whole lifetime. On either refusal `src` is dropped by
 /// returning, which closes this end of the pipe and is what lets the thread finish.
@@ -334,8 +263,7 @@ fn read_bounded<R: Read + AsFd>(
             Ok(true) => {}
             Ok(false) => {
                 return Err(format!(
-                    "the application that owns the clipboard did not finish writing it within \
-                     {} s ({} bytes arrived); the read was given up",
+                    "clipboard read timed out after {} s ({} bytes received)",
                     deadline.as_secs(),
                     bytes.len()
                 ))
@@ -347,8 +275,7 @@ fn read_bounded<R: Read + AsFd>(
             Ok(n) => {
                 if bytes.len() + n > max {
                     return Err(format!(
-                        "the clipboard is larger than the {} this reads into memory — a bound on \
-                         memory, not a limit on how much may be pasted ({} bytes had arrived)",
+                        "clipboard exceeds the {} size limit ({} bytes received)",
                         human_bytes(max),
                         bytes.len() + n
                     ));
@@ -364,7 +291,7 @@ fn read_bounded<R: Read + AsFd>(
 /// Wait for `fd` to become readable, until `deadline`. `Ok(false)` is the deadline.
 ///
 /// The same shape as `serial::fake::poll_readable`, minus its hangup handling: a clipboard pipe
-/// whose writer has closed is an **end of file**, not an error — that is how a short clipboard
+/// whose writer has closed is an end of file, not an error — that is how a short clipboard
 /// arrives — so every ready revent goes on to the read, which reports 0 for EOF. A signal is not a
 /// timeout either, so `EINTR` waits out the rest of the deadline here rather than being reported
 /// as a peer that did not answer.
@@ -380,7 +307,7 @@ fn poll_readable(fd: BorrowedFd<'_>, deadline: Instant) -> std::io::Result<bool>
             revents: 0,
         };
         let millis = left.as_millis().min(i32::MAX as u128) as libc::c_int;
-        // SAFETY: `&mut pfd` is a live array of exactly the one `pollfd` the count claims.
+        // SAFETY: `&mut pfd` is a live array of the one `pollfd` the count claims.
         let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
         if rc < 0 {
             let e = std::io::Error::last_os_error();
@@ -411,7 +338,7 @@ mod tests {
     use std::io::Write as _;
 
     /// The reason a compositor without data-control gets is the crate's fact plus somewhere to go.
-    /// Every disabled control must say why it is disabled (§12 Stage 4b), and "a required Wayland
+    /// Every disabled control must say why it is disabled, and "a required Wayland
     /// protocol is not supported" on its own does not.
     #[test]
     fn a_missing_protocol_reads_as_a_reason_and_a_remedy() {
@@ -421,8 +348,11 @@ mod tests {
         });
         assert!(reason.contains("zwlr_data_control_manager_v1"), "{reason}");
         assert!(reason.contains("version 1"), "{reason}");
-        assert!(reason.contains("data-control"), "{reason}");
-        assert!(reason.contains("niri"), "{reason}");
+        assert!(reason.contains("clipboard access requires"), "{reason}");
+        assert!(
+            reason.contains("compositor does not provide it"),
+            "{reason}"
+        );
     }
 
     /// Anything else is the crate's own sentence, prefixed so the reader knows what failed.
@@ -437,11 +367,11 @@ mod tests {
     }
 
     /// The bound exists to stop an unrelated process driving an unbounded allocation here; it is
-    /// not the plan's "no length cap", which is about how much a user may paste.
+    /// not "no length cap", which is about how much a user may paste.
     #[test]
     fn the_read_bound_is_far_past_any_paste() {
         // At 40 ms a key and two keys a character, 16 MiB of ASCII is over two weeks of typing —
-        // so the cap that binds a real paste is the plan's ("the rate and the cancel are the
+        // so the cap that binds a real paste is ("the rate and the cancel are the
         // cap"), never this one.
         let seconds = (MAX_BYTES as f64) * 2.0 * (crate::script::REPORT_DELAY_MS as f64) / 1000.0;
         assert!(seconds > 14.0 * 24.0 * 3600.0, "{seconds} s");
@@ -452,9 +382,7 @@ mod tests {
         );
     }
 
-    /// **The refusal states the limit and what it saw**, because a paste that stops without a
-    /// number leaves the user guessing at which of the two bounds they met (§12 Stage 4c: the
-    /// 16 MiB is a stated deviation from "no length cap", stated where it is met).
+    /// Oversize refusal must identify the limit and received byte count.
     #[test]
     fn a_clipboard_past_the_bound_is_refused_by_the_numbers() {
         let (reader, writer) = std::io::pipe().expect("a pipe");
@@ -462,11 +390,8 @@ mod tests {
         drop(writer);
         let e = read_bounded(reader, Duration::from_secs(5), 8).expect_err("past the bound");
         assert!(e.contains("8 bytes"), "the limit it met: {e}");
-        assert!(e.contains("32 bytes had arrived"), "what it saw: {e}");
-        assert!(
-            e.contains("not a limit on how much may be pasted"),
-            "a memory bound, said as one: {e}"
-        );
+        assert!(e.contains("32 bytes received"), "what it saw: {e}");
+        assert!(e.contains("size limit"), "a memory bound, said as one: {e}");
     }
 
     /// A clipboard that fits is read whole, and a peer that closes without writing is an empty
@@ -489,7 +414,7 @@ mod tests {
         );
     }
 
-    /// **A peer that never writes costs a deadline and nothing more.** The writer end is held open
+    /// A peer that never writes costs a deadline and nothing more. The writer end is held open
     /// for the whole test, which is what a hung clipboard owner looks like: `read_to_end` would
     /// block on it for that application's lifetime.
     #[test]
@@ -498,8 +423,8 @@ mod tests {
         let started = Instant::now();
         let e = read_bounded(reader, Duration::from_millis(120), MAX_BYTES).expect_err("timeout");
         let took = started.elapsed();
-        assert!(e.contains("did not finish writing"), "{e}");
-        assert!(e.contains("0 bytes arrived"), "{e}");
+        assert!(e.contains("read timed out"), "{e}");
+        assert!(e.contains("0 bytes received"), "{e}");
         assert!(
             took >= Duration::from_millis(100),
             "gave up early: {took:?}"
@@ -507,7 +432,7 @@ mod tests {
         assert!(took < Duration::from_secs(5), "did not give up: {took:?}");
     }
 
-    /// **One fetch at a time, and the thread ends at its deadline.** Without the gate every
+    /// One fetch at a time, and the thread ends at its deadline. Without the gate every
     /// trigger against a hung clipboard owner would leave another thread and another pipe behind
     /// for the life of the process; without the deadline they would never exit at all.
     #[test]
@@ -521,12 +446,12 @@ mod tests {
         .expect("the first fetch starts");
 
         let refusal = Fetch::start(&GATE, || Ok(String::new())).expect_err("one at a time");
-        assert!(refusal.contains("has not answered yet"), "{refusal}");
+        assert!(refusal.contains("read is still pending"), "{refusal}");
         assert!(refusal.contains("try again"), "somewhere to go: {refusal}");
 
         let answer = spin_for(Duration::from_secs(5), || first.poll()).expect("it answers");
         let reason = answer.expect_err("the peer never wrote");
-        assert!(reason.contains("did not finish writing"), "{reason}");
+        assert!(reason.contains("read timed out"), "{reason}");
 
         // The thread is on its way out, and the gate is free again once it is gone — which is what
         // "no thread is leaked" means here.

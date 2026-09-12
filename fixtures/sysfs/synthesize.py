@@ -6,7 +6,7 @@ serialised by `scripts/snapshot-sysfs.py` (its own header comment says which is 
 the captured part and nothing else. This script expands it into `usb2-desk/`, writes back the
 bus-5 negative control the dock took with it when it unplugged itself mid-session, and builds
 the three trees that are not on this desk and cannot be: the SuperSpeed shape needs the dongle
-on a USB 3 port (Stage 0 had it, Stage 1 lost it), and the two-dongle ambiguity needs a second
+on a USB 3 port during the USB 2.0 recording, and the two-dongle ambiguity needs a second
 dongle. Every device it writes is listed in MANIFEST.md with
 the source of its attribute values, so the trees stay auditable.
 
@@ -128,7 +128,7 @@ def port(root, hub_path, hub_name, n, device_path=None, peer_path=None):
 #
 # The dock carrying the user's webcam and an unrelated CDC-ACM device disconnected between the
 # readout that opened this session and the snapshot run. Its attribute values below are that
-# readout verbatim; MANIFEST.md reproduces it. The subtree matters because it is the shape §8's
+# readout verbatim; MANIFEST.md reproduces it. The subtree matters because it is the shape a loose
 # loose common-ancestor wording would have paired by accident: a video device and a serial device
 # that are direct children of one generic hub.
 # --------------------------------------------------------------------------------------------
@@ -167,7 +167,7 @@ def bus5_negative_control(root=DESK):
         class_node(root, "video4linux", f"video{i}", f"{cam}/5-1.4.4.4.2:1.0",
                    name="Logi 4K Stream Edition", index=str(i), dev=f"81:{i}")
     # The webcam's microphone: a USB Audio Class interface on the *same* USB device as its video
-    # interface, which is exactly the shape §8's evidence 1 pairs on. It is here so that the
+    # interface, which is exactly the shape a loose evidence 1 pairs on. It is here so that the
     # audio rule has a reconstructed negative control: the card pairs with the *webcam*, and must
     # never be offered to the dongle. (The measured version of the same control is `card0` on
     # `5-1.1.1`, which is in the recording itself.) **Reconstructed, and further from measurement
@@ -196,7 +196,7 @@ def bus5_negative_control(root=DESK):
 
 
 # --------------------------------------------------------------------------------------------
-# 2. usb3-stage0: the SuperSpeed shape, from docs/stage0/topology.md.
+# SuperSpeed reconstruction; see MANIFEST.md for historical provenance.
 # --------------------------------------------------------------------------------------------
 def usb3_stage0():
     final = os.path.join(HERE, "usb3-stage0")
@@ -357,7 +357,7 @@ def two_dongles():
     # An ordinary USB sound card on port 3 of the *second dongle's own internal hub*. It is the
     # negative control the audio rule needs and nothing else in the fixture set provides: a sound
     # card contained under the dongle's hub, alongside its capture node, on a different USB
-    # device. §8's evidence-3 containment would pair it; evidence 1 -- identical busnum:devnum,
+    # device. hub containment would pair it; evidence 1 -- identical busnum:devnum,
     # which is the only rule `discovery::audio_for` implements -- must not. The hub has four
     # ports and two of them are free, so nothing about the arrangement is exotic. The ids,
     # product string and ALSA `id` are this desk's own `5-1.1.1` (0d8c:0016, card0 "Device",
@@ -402,9 +402,9 @@ def main():
 
     print(f"usb2-desk     {usb2_desk(args.force)}")
     usb3_stage0()
-    print("usb3-stage0   built from docs/stage0/topology.md")
+    print("usb3-stage0   built from historical SuperSpeed topology (see MANIFEST.md)")
     usb3_rootport()
-    print("usb3-rootport built from docs/stage0/topology.md, dongle straight into a root port")
+    print("usb3-rootport built from historical SuperSpeed topology (see MANIFEST.md), dongle straight into a root port")
     two_dongles()
     print("two-dongles   built from usb2-desk + a second dongle on 3-2.3")
     return 0

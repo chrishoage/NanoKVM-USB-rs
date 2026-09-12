@@ -1,25 +1,7 @@
-//! What crosses from the event loop to the render thread, and how several of them become one
-//! (plan §4.1, §5.4, §12 Stage 4b).
+//! UI frame handoff with accumulated texture updates.
 //!
-//! # Why this is not a [`crate::capture::Slot`]
-//!
-//! The video handoff is drop-oldest by design: a frame is a complete picture, so keeping the
-//! newest and discarding the rest is exactly right (§5.2). **A chrome frame is not.**
-//! [`egui::TexturesDelta`] is a *delta*: its `set` entries are the font-atlas pages egui grew this
-//! frame — the glyphs a tooltip needed the first time it rendered — and its `free` entries are
-//! pages to release after painting. Drop one and the atlas is permanently missing a page, which
-//! shows up much later as blank or wrong glyphs in an unrelated widget.
-//!
-//! So the channel is an `mpsc` and the render thread **drains** it, appending every delta in
-//! arrival order with [`egui::TexturesDelta::append`] while keeping only the newest tessellated
-//! primitives. Primitives *are* a complete picture and may be dropped; deltas are not and may not.
-//!
-//! # What does not cross
-//!
-//! `egui::Context` never crosses. It is `Send + Sync`, but the routing rule needs
-//! `popover_open` synchronously on the event loop while deciding where the key in hand goes
-//! (§5.4: input handling must not be coupled to render timing), so the whole UI build and
-//! tessellation stay on the event loop and only plain data goes over the wire.
+//! Geometry can be replaced, but texture deltas must survive skipped frames: dropping an
+//! atlas update would leave later geometry referencing a texture that was never uploaded.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
@@ -29,7 +11,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 pub struct ChromeFrame {
     /// The tessellated output of `egui::Context::tessellate`.
     pub primitives: Vec<egui::ClippedPrimitive>,
-    /// Textures to upload before painting and to free after it. **Never dropped**; see the module
+    /// Textures to upload before painting and to free after it. Never dropped; see the module
     /// docs.
     pub textures_delta: egui::TexturesDelta,
     /// The scale the primitives were tessellated at, straight from `egui::FullOutput`. The render
@@ -94,10 +76,10 @@ pub struct ChromeReceiver(Receiver<ChromeFrame>);
 impl ChromeReceiver {
     /// Take everything queued and coalesce it into one frame, or `None` if nothing is queued.
     ///
-    /// Never blocks. The render thread already waits on the video slot for [`FRAME_WAIT`]; a
+    /// Never blocks. The render thread already waits on the video slot for `FRAME_WAIT`; a
     /// second blocking wait here would make the chrome's clock the video's.
     ///
-    /// [`FRAME_WAIT`]: crate::viewer::render
+    /// `FRAME_WAIT`: crate::viewer::render
     pub fn drain(&self) -> Option<ChromeFrame> {
         let mut out: Option<ChromeFrame> = None;
         loop {
@@ -158,7 +140,7 @@ mod tests {
         }
     }
 
-    /// The invariant the whole module exists for: appending two frames keeps **both** `set` maps,
+    /// The invariant the whole module exists for: appending two frames keeps both `set` maps,
     /// and only the newest primitives survive. A drop-oldest slot would keep only the second `set`
     /// and lose a font-atlas page for good.
     #[test]

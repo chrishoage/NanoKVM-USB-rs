@@ -1,12 +1,4 @@
-//! The check on `script` that has to be made from outside the module: the compiler against the
-//! packet authority.
-//!
-//! Everything else about `script` is pure resolution with no I/O, and is tested in-module next to
-//! the table it exercises. What is here needs the crate as a consumer sees it — the public
-//! functions and `fixtures/packets/ch9329.toml`. The no-mouse rule is checked in
-//! `tests/cli_keys.rs`, over `src/cli/` and `src/script/` together.
-//!
-//! No device is opened by anything in this file. `script` cannot open one: it has no I/O.
+//! Compiled keyboard reports checked against independently recorded packet fixtures.
 
 use nanokvm::proto::report::KeyboardReport;
 use nanokvm::proto::{cmd, encode};
@@ -41,12 +33,8 @@ fn frame_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// §9.1: the fixture file is the authority for bytes, so the compiler is checked against it and
-/// the bytes are never retyped here.
-///
-/// Every keyboard packet in the file is produced by one of these three scripts, and the test
-/// asserts that all of them were covered — otherwise a rename or a payload change could leave
-/// this passing vacuously with nothing matched.
+/// Cover every keyboard packet fixture with compiled scripts so fixture changes
+/// cannot silently leave an expected report untested.
 #[test]
 fn every_keyboard_fixture_is_produced_by_a_script_and_encodes_to_its_frame() {
     let fixtures = Fixtures::load().expect("fixtures/packets/ch9329.toml");
@@ -95,7 +83,7 @@ fn every_keyboard_fixture_is_produced_by_a_script_and_encodes_to_its_frame() {
 }
 
 /// A compiled script's last report is a release-all, whatever it compiled from. The sender's
-/// guard is what guarantees a release on an *abnormal* exit (§2.6); this is the ordinary path,
+/// guard is what guarantees a release on an *abnormal* exit; this is the ordinary path,
 /// where the script itself must not leave a key standing.
 #[test]
 fn a_compiled_script_always_ends_in_a_release_all() {
@@ -110,6 +98,6 @@ fn a_compiled_script_always_ends_in_a_release_all() {
     }
 }
 
-// The no-mouse rule is checked in `tests/cli_keys.rs`, over `src/cli/` **and** `src/script/` in
+// The no-mouse rule is checked in `tests/cli_keys.rs`, over `src/cli/` and `src/script/` in
 // one test: the version that lived here read `src/script/` alone, which left the commands that
 // use it — `shot.rs`, `devices.rs` — unsearched. One test, both directories, every file.

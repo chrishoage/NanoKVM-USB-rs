@@ -1,20 +1,7 @@
-//! Printing that survives a closed pipe.
+//! Fallible command output with graceful handling of closed pipes.
 //!
-//! `nanokvm key capslock | head -1` used to end in `failed printing to stdout: Broken pipe`: the
-//! `println!` macros panic on any write error, and `head` closing the pipe is an ordinary thing
-//! for a user to do. The panic itself was not the worst of it — a panic unwinds through
-//! [`keys::Released`](crate::cli::keys), so the release-all still went out — but a CLI that
-//! aborts because its reader left is a CLI that cannot be piped.
-//!
-//! **The fix is not `SIG_DFL` for `SIGPIPE`.** Restoring the default disposition would kill the
-//! process at the write, past the release-all guard, leaving a key held on a live console —
-//! exactly what §2.6 and CLAUDE.md forbid. So the signal stays ignored (as Rust's runtime sets it)
-//! and the `EPIPE` it turns into is handled here: a broken pipe means *stop printing and keep
-//! going*, and the command still runs to its own end, releases, and exits on its own terms.
-//!
-//! The one place a broken stdout is a real error is `shot -`, where stdout **is** the output: a
-//! JPEG that did not get through is a failed screenshot, not a quiet one. That path writes
-//! directly and keeps its `Err` (see [`shot::ShotTarget::write`](crate::cli::shot::ShotTarget)).
+//! A closed diagnostic pipe must not terminate the process before held keys are released.
+//! Screenshot bytes use a separate path where a failed write is a failed screenshot.
 
 use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +25,7 @@ pub fn block(text: &str) {
 /// One line on stderr: a note about the run rather than part of what the run produced.
 ///
 /// Stderr gets the same treatment as stdout because the `Drop` guard's release-all report goes
-/// there (§2.6.1), and a panic while unwinding out of a `Drop` aborts the process — taking the
+/// there, and a panic while unwinding out of a `Drop` aborts the process — taking the
 /// message the failure was about to print with it.
 pub fn note(text: &str) {
     write_to(&STDERR_GONE, &mut std::io::stderr().lock(), text, true);

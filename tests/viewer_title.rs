@@ -1,15 +1,4 @@
-//! The window title (plan §2.6.1, §2.8, §6.1 S1-2 and S2-1, §12 Stage 1).
-//!
-//! The title is the only place most of this client's conditions are ever reported: a user who
-//! never reads a log still sees it. §2.8 says an overflow must be surfaced rather than counted,
-//! §6.1 S2-1 says a stall and a disconnection must be distinguishable, and §2.6.1 says an
-//! undelivered release-all must be said out loud. Those are behaviours, so the wording is
-//! asserted here rather than eyeballed on a live run — and `viewer::title::compose` is pure
-//! precisely so it can be.
-//!
-//! Each test states the fault it describes and asserts on the *distinction*, not just on the
-//! presence of some text: several of these strings are only useful because they differ from
-//! another string the same window shows in a different situation.
+//! Visible connection, capture, release, and audio status in the window title.
 
 use std::time::Duration;
 
@@ -39,8 +28,7 @@ fn healthy<'a>(session: Session) -> TitleFacts<'a> {
     }
 }
 
-/// Audio running with nothing dropped, which is the state every pre-Stage-4a test in this file
-/// implicitly assumes: the audio segment must not disturb anything they assert on.
+/// Healthy audio fixture for tests of unrelated title segments.
 fn healthy_audio<'a>() -> AudioTitle<'a> {
     AudioTitle::On {
         muted: false,
@@ -79,8 +67,7 @@ fn a_healthy_session_says_only_what_it_is_doing() {
 
 #[test]
 fn the_release_binding_is_on_screen_while_captured() {
-    // §12 Stage 1: the viewer's own way out must be shown, because the compositor's is
-    // configuration this client does not control.
+    // Show the local release key because compositor shortcuts are user-configurable.
     let title = compose(&healthy(captured()));
     assert!(title.contains("Pause"), "{title}");
 }
@@ -99,7 +86,7 @@ fn a_stall_says_frames_stopped_and_never_that_the_device_is_gone() {
         !title.contains("gone") && !title.contains("disconnected"),
         "the device is still there; only the frames stopped: {title}"
     );
-    // A5: the signal is not reportable on this hardware and must never be inferred.
+    // the signal is not reportable on this hardware and must never be inferred.
     assert!(!title.to_lowercase().contains("signal"), "{title}");
 }
 
@@ -129,7 +116,7 @@ fn a_stall_and_a_disconnection_never_produce_the_same_words() {
     assert_ne!(
         compose(&stalled),
         compose(&gone),
-        "§6.1 S2-1: the two conditions must be distinguishable on screen"
+        "the two conditions must be distinguishable on screen"
     );
 }
 
@@ -162,10 +149,7 @@ fn a_stopped_pipeline_is_not_called_a_reconnecting_one() {
     assert!(!title.contains("reconnecting"), "{title}");
 }
 
-// ---------------------------------------------------------------------------------------------
-// §2.7 — "serial DOWN" used to be permanent. It is not any more, and the title says what is
-// happening about it.
-// ---------------------------------------------------------------------------------------------
+// Serial reconnect progress.
 
 #[test]
 fn a_down_link_says_how_long_and_how_many_attempts() {
@@ -196,7 +180,7 @@ fn a_link_that_was_never_up_still_reports_its_attempts() {
 
 #[test]
 fn a_serial_failure_and_a_capture_failure_are_both_shown_at_once() {
-    // They are independent subsystems (§6.1 S1-1) and can fail together; a title that showed
+    // They are independent subsystems and can fail together; a title that showed
     // only the first would hide half of what is wrong.
     let mut f = healthy(captured());
     f.pipeline = PipelineState::Reconnecting;
@@ -208,11 +192,7 @@ fn a_serial_failure_and_a_capture_failure_are_both_shown_at_once() {
     assert!(title.contains("serial DOWN"), "{title}");
 }
 
-// ---------------------------------------------------------------------------------------------
-// §2.8 — the session ended for a reason, and the reason is on screen until input is flowing
-// again. Stage 1 showed the same "[click or Enter to capture]" for a queue overflow as for the
-// user pressing Pause.
-// ---------------------------------------------------------------------------------------------
+// Retain the capture-exit reason until input resumes.
 
 #[test]
 fn an_overflow_is_named_in_the_title_and_not_only_in_a_counter() {
@@ -240,14 +220,11 @@ fn a_failed_session_does_not_look_like_a_deliberate_release() {
     assert_ne!(
         compose(&healthy(failed)),
         compose(&healthy(asked)),
-        "§2.8: an overflow is a failed session, and must not read like the user asking to stop"
+        "an overflow is a failed session, and must not read like the user asking to stop"
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// §2.6.1 — an undelivered release-all means the target may still be holding keys, and nothing
-// local can fix it. It outranks tidiness.
-// ---------------------------------------------------------------------------------------------
+// An unsent release must remain visible because target keys may still be held.
 
 #[test]
 fn an_unsent_release_warns_that_the_target_may_still_hold_keys() {
@@ -292,9 +269,9 @@ fn every_condition_can_be_shown_together() {
     }
 }
 
-/// **An accepted format mismatch is surfaced, not counted (C5).** When the capture watchdog has
+/// An accepted format mismatch is surfaced, not counted. When the capture watchdog has
 /// spent its restarts *and* its one escalation reopen and given up, the window shows a 640x480
-/// image on a 1080p session for the rest of the run. C5's argument about the input side applies
+/// image on a 1080p session for the rest of the run. argument about the input side applies
 /// unchanged here: a counter in a five-second log line is "a silent counter by another name", and
 /// what the user sees is the picture.
 ///
@@ -309,7 +286,7 @@ fn an_accepted_format_mismatch_is_in_the_title_and_a_negotiated_frame_clears_it(
     f.negotiated_size = Some((1920, 1080));
     let title = compose(&f);
     assert!(
-        title.contains("— video 640x480, negotiated 1920x1080 not established"),
+        title.contains("video 640x480, negotiated 1920x1080 not established"),
         "an accepted mismatch was left to the log: {title}"
     );
 
@@ -323,7 +300,7 @@ fn an_accepted_format_mismatch_is_in_the_title_and_a_negotiated_frame_clears_it(
     );
     assert_eq!(recovered, compose(&healthy(captured())));
 
-    // And the sizes alone are not enough: A6's benign transient puts a 640x480 frame on screen
+    // And the sizes alone are not enough: benign transient puts a 640x480 frame on screen
     // after every reopen, and the watchdog sits it out. Saying "not established" then would
     // train the user to ignore the words.
     let mut transient = healthy(captured());
@@ -336,17 +313,17 @@ fn an_accepted_format_mismatch_is_in_the_title_and_a_negotiated_frame_clears_it(
     );
 }
 
-// ---- audio (§12 Stage 4a) --------------------------------------------------------------------
+// ---- audio --------------------------------------------------------------------
 
-/// `--no-audio` must leave the viewer *exactly* as Stage 3 left it. The title is the only surface
-/// a Stage 3 viewer had, so "exactly Stage 3" is checkable here: two words, no counters, no
+/// `--no-audio` must leave the viewer *exactly* as left it. The title is the only surface
+/// a viewer had, so "" is checkable here: two words, no counters, no
 /// buffer depth, no reason — and nothing about audio anywhere else in the string.
 #[test]
 fn no_audio_says_only_that_it_is_off() {
     let mut f = healthy(captured());
     f.audio = AudioTitle::Off;
     let title = compose(&f);
-    assert!(title.contains(" — audio off"), "{title}");
+    assert!(title.contains(" audio off"), "{title}");
     for forbidden in [
         "buffer",
         "muted",
@@ -359,8 +336,7 @@ fn no_audio_says_only_that_it_is_off() {
     }
 }
 
-/// Running audio states the *configured* depth, in the words §5.5 requires: the number is what
-/// was configured, never an end-to-end latency this desk cannot measure.
+/// Label configured capacity accurately; it is not measured end-to-end latency.
 #[test]
 fn running_audio_states_the_configured_buffer_depth() {
     let mut f = healthy(captured());
@@ -402,8 +378,7 @@ fn muted_audio_is_not_the_same_as_audio_off() {
     assert_ne!(muted, off);
 }
 
-/// §2.8: surfaced, never silently absorbed. A drop shows in the title — and a healthy session
-/// still says nothing about counters, the rule the whole of this title follows.
+/// Show nonzero failure counters without cluttering a healthy session.
 #[test]
 fn the_audio_counters_appear_only_once_something_has_been_dropped() {
     let mut f = healthy(captured());
@@ -441,12 +416,8 @@ fn unavailable_audio_says_why_rather_than_only_that_it_failed() {
     );
 }
 
-/// **Hardware defect D2.** A side that is still opening says so, and does not read as "on".
-///
-/// D2: an open that never returned logged nothing and raised no condition, so a side that had
-/// never opened was indistinguishable from one that was working — same title, same counters.
-/// The word "opening" is the whole of the difference a user sees while it lasts; past 4a's
-/// supervision limit it turns into an ordinary `audio unavailable:` with 4a's own wording.
+/// An unfinished open must say “opening”, then report a supervision timeout.
+/// It must never appear as working audio.
 #[test]
 fn an_opening_side_says_so_rather_than_claiming_the_audio_is_on() {
     let mut f = healthy(captured());
@@ -462,7 +433,7 @@ fn an_opening_side_says_so_rather_than_claiming_the_audio_is_on() {
     );
     assert!(
         !opening.contains("audio on"),
-        "\"opening\" must not read as \"on\": that is the whole of D2: {opening}"
+        "\"opening\" must not read as \"on\": unfinished opens need a distinct status: {opening}"
     );
     assert!(
         !opening.contains("audio off"),

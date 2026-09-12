@@ -1,106 +1,16 @@
-//! The capture and decode threads (§4.1, §5.2).
+//! Capture and decode workers with independent recovery.
 //!
-//! §4.1's table, the two rows this module owns:
+//! Each handoff retains one pending frame. Replacing an old frame bounds memory and
+//! keeps the viewer current when decoding or presentation falls behind. Drops before
+//! and after decoding are counted separately.
 //!
-//! | Thread | Owns | Handoff out |
-//! | --- | --- | --- |
-//! | Capture | V4L2 dequeue, copy out, requeue | one pending owned frame |
-//! | Decode | MJPEG → RGBA, one thread (§1.3) | one pending decoded frame |
+//! A stalled source is restarted in place; a disconnected source is reopened with
+//! backoff. Persistent size mismatches trigger bounded format recovery. The last
+//! successfully decoded frame remains available throughout recovery.
 //!
-//! Render is somebody else's thread; it takes from [`PipelineHandle::output`] and never queues
-//! or drains (§5.2). Both handoffs are [`Slot`]s, so each carries at most one pending frame and
-//! a new frame displaces an unconsumed old one rather than queueing behind it. Displacement is
-//! counted, separately for each stage, because §5.5 asks for "frames dropped pre-decode" and
-//! "frames dropped post-decode" as distinct numbers — one means the decoder is behind, the
-//! other means the renderer is.
-//!
-//! **The capture thread survives everything, disconnection included.** §6.1 S1-2 is
-//! architectural: frames stopping must neither crash nor hang, and a stall is not evidence of
-//! signal loss (A5). [`CaptureError::Timeout`] and [`CaptureError::Io`] are counted and the loop
-//! continues. A frame that fails to decode is counted and skipped; the decode thread never exits
-//! over one.
-//!
-//! **Stage 2 adds the two recoveries §6.1's table asks for, and keeps them distinct.**
-//!
-//! | Condition | Evidence | What this module does |
-//! | --- | --- | --- |
-//! | Device disconnected | `ENODEV`, `POLLHUP`/`POLLNVAL`, or a panicking `v4l` destructor | drop the source, then reopen through the [`SourceOpener`] on an exponential backoff (S2-4) |
-//! | Capture stall | no frame for [`PipelineConfig::restart_after`], with or without an error | [`FrameSource::restart`] on the same device, repeated while the stall lasts (S2-1) |
-//! | Frames in the wrong mode | the SOF dimensions disagree with what `S_FMT` negotiated, for [`PipelineConfig::format_mismatch_frames`] consecutive frames *and* [`PipelineConfig::format_mismatch_grace`] | [`FrameSource::restart`] — a fresh `STREAMON` re-commits the format — at most [`PipelineConfig::format_mismatch_restart_limit`] times, then **one** reopen through the [`SourceOpener`] with a fresh budget, then the SOF dimensions are accepted |
-//!
-//! **The third row is a measured failure, not a hypothetical.** On 2026-09-11 a live viewer run
-//! through a real USB reset reopened the node correctly — rediscovered, `S_FMT` MJPG 1920x1080,
-//! `S_PARM` 60 fps — and then streamed 640x480 for the remaining two minutes of the run, with the
-//! V4L2 `ERROR` flag on the first buffer as the only tell. The dongle powers up in 640x480 and
-//! the reopen's UVC probe/commit was lost on it; `G_FMT` went on reporting 1920x1080 because that
-//! is the driver's opinion, not the device's. The *stream* was stuck, not the device: a fresh
-//! open by `v4l2-ctl` immediately afterwards got 1920x1080 from frame one. So the response is a
-//! `restart()` — `STREAMOFF`, re-prime, `STREAMON`, which re-commits the format — and the
-//! watchdog that calls it is bounded, because A6 keeps the SOF header as the authority on the
-//! size and a unit that does *not* rescale internally (this one does — C4, §6 item 3) would
-//! legitimately deliver a different size forever and must not be restarted in a loop.
-//!
-//! **`restart()` first, and a reopen only if it does not work.** A restart is strictly less than
-//! the reopen that had just failed — no `S_FMT`, no `S_PARM`, the same fd — so it is fair to ask
-//! why the weaker remedy goes first. Because it is the one that was measured to work: the second
-//! live run of 2026-09-11 (17:45:55–17:45:56) shows the reopen coming up at 640x480, the watchdog
-//! restarting the stream after 516.7 ms, and the very next frame at 1920x1080. One restart, fixed.
-//! The likely mechanism is timing rather than strength — the reopen lands about half a second
-//! after re-enumeration, while the device is still settling, and a `STREAMON` half a second later
-//! re-commits successfully — which is exactly why doing the *same* reopen again, later, is the
-//! right escalation when the restarts do not take: once the restart budget is spent the watchdog
-//! takes one full reopen through the [`SourceOpener`] (counted in
-//! [`PipelineStats::format_mismatch_reopens`]), re-arms itself with one fresh restart budget, and
-//! accepts only if that budget is spent too. The whole escalation runs at most once per run of
-//! mismatched frames, so a device that never reaches the negotiated mode ends in acceptance and
-//! never in a reopen loop.
-//!
-//! Four properties of the disconnect path are load-bearing rather than incidental:
-//!
-//! - **The decode thread and the output slot are never touched.** The compressed slot is *not*
-//!   closed, so the renderer keeps presenting the last decoded image for the whole gap — §6.1
-//!   S1-2's "the last image is preserved", now across a real unplug.
-//! - **The source is dropped under `catch_unwind`**, before any reopen. The `v4l` destructors
-//!   panic on a teardown ioctl that fails with anything but `ENODEV` (`capture::v4l2` module
-//!   docs item 4), and a panic that escaped here would leave the mmap buffers mapped and the
-//!   pipeline claiming `Running` forever.
-//! - **The backoff is interruptible.** `stop()` during a five-second wait returns as promptly as
-//!   `stop()` on a healthy pipeline; the wait polls the stop flag rather than sleeping through it.
-//! - **The open itself is not waited on.** [`SourceOpener::open`] cannot be interrupted — for
-//!   `V4l2Source` it is a chain of ioctls, each a USB control transfer to a device that has just
-//!   re-enumerated, and the kernel's timeout on one of those is seconds — so it runs on a
-//!   short-lived helper thread that the capture thread waits on but abandons on shutdown. See
-//!   [`PipelineHandle::stop`] for the bound this buys and the residual it leaves.
-//!
-//! **A stall response that fails is still a stall.** [`FrameSource::restart`] is called under its
-//! own `catch_unwind`, because `V4l2Source::restart` drops the old stream and those destructors
-//! panic (v4l2 module docs item 4) — and a panic there means the *restart* failed, not that the
-//! device is gone. A failed restart, panicking or not, is counted as a capture error and the loop
-//! keeps polling the same source, which is what §6.1 S1-2 requires of a stall and what
-//! `V4l2Source` is built for: it comes back from a failed rebuild marked broken, so the next
-//! `next_frame` tries the rebuild again.
-//!
-//! [`Pipeline::start`] keeps its Stage 1 contract exactly — one source, no reopen, the thread
-//! exits on disconnection — because a caller that handed over a device it opened itself has
-//! given the pipeline nothing to reopen. [`Pipeline::start_with_opener`] is the recovering entry
-//! point.
-//!
-//! **Surviving an error is not the same as tolerating it for free.** A source can fail
-//! *instantly* and repeatedly — `capture::v4l2` returns `EIO` without waiting when the fd
-//! reports `POLLERR`, and a `BadFrame` follows a perfectly prompt dequeue — so the error arm
-//! backs off ([`BACKOFF`], escalating to [`BACKOFF_SLOW`] after
-//! [`BACKOFF_ESCALATE_AFTER`] consecutive failures) instead of spinning a core. The backoff is
-//! interruptible: it wakes on the stop flag, so shutdown stays as prompt as it was.
-//!
-//! **The capture thread's loop body runs under `catch_unwind`.** The `v4l` crate's `Stream` and
-//! `Arena` destructors `panic!` on any teardown ioctl failure other than `ENODEV` (see
-//! `capture::v4l2` module docs item 4), and they run on this thread — during a stream rebuild,
-//! and when the source is finally dropped. §6.1 S1-1 says a capture failure must never tear the
-//! rest of the client down, and a panicking thread whose payload nobody catches until `stop()`
-//! would leave the pipeline claiming `Running` forever. A panic out of the *frame* path is
-//! therefore recorded as [`PipelineState::Disconnected`] with the panic message, exactly like a
-//! real `ENODEV` — the ring is in the state a failed dequeue leaves it in and only a fresh source
-//! can be trusted. A panic out of the *restart* path is not: see above.
+//! [`Pipeline::start`] uses one source without reopening. [`Pipeline::start_with_opener`]
+//! can acquire replacements. Blocking opens run on a helper thread so shutdown can
+//! return without waiting for a driver that never responds.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,28 +25,19 @@ use super::{
     SourceOpener,
 };
 
-/// How the pipeline is doing right now (§6.1: report only what is actually known).
-///
-/// There is deliberately no `NoSignal`: this hardware cannot report it and pixel content is
-/// never evidence of it (A5, §6.1).
+/// Pipeline status. The device provides no reliable HDMI signal-state report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
     /// Frames are arriving.
     Running,
     /// No frame has arrived for [`PipelineConfig::stall_after`]. The capture stalled — say that,
-    /// and do not say the signal is gone (§6.1).
+    /// and do not say the signal is gone.
     Stalled,
-    /// The device is gone — `ENODEV`, a `POLLHUP`/`POLLNVAL` on the node, or a panicking `v4l`
-    /// destructor — and no reopen is in flight.
-    ///
-    /// For [`Pipeline::start`] this is terminal: the capture thread has exited. For
-    /// [`Pipeline::start_with_opener`] it is the brief moment between noticing the loss and
-    /// entering the retry loop — the source is being dropped, which on real hardware means
-    /// `STREAMOFF`, `munmap` and `REQBUFS(0)`. It is genuinely observable, so it is a state
-    /// rather than an implementation detail, but a test that wants "the device went away" should
-    /// accept either this or [`PipelineState::Reconnecting`].
+    /// The device is disconnected and no reopen is in progress. A single-source pipeline
+    /// stays terminal; a recoverable pipeline proceeds to reconnect while retaining its
+    /// last decoded image.
     Disconnected,
-    /// Disconnected, and a reopen is being retried on the backoff (§6.1: "attempt rediscovery").
+    /// Disconnected, and a reopen is being retried on the backoff.
     ///
     /// Distinct from [`PipelineState::Disconnected`] because the two mean different things to a
     /// user: one says the device is gone, the other says the client is doing something about it.
@@ -177,24 +78,10 @@ pub struct PipelineConfig {
     /// How long the decode thread waits on the compressed slot before rechecking for shutdown.
     /// A `close()` wakes it immediately; this only bounds the pathological case.
     pub decode_wait: Duration,
-    /// **Test hook.** Sleep this long before each decode, to make the decoder deliberately
-    /// slower than the source and force §5.2's drop-before-decode path. `None` in production.
+    /// Optional decode delay for tests that force pre-decode drops. Disabled in production.
     pub decode_delay: Option<Duration>,
-    /// How long without a frame before [`FrameSource::restart`] is called, and then called again
-    /// for every further interval the stall lasts. `None` disables restarts entirely (§6.1:
-    /// "attempt restart" is a *response* to a stall, not a diagnosis of one).
-    ///
-    /// The default of 2 s is four times [`PipelineConfig::stall_after`]: reporting a stall is
-    /// cheap and should be prompt, while restarting a stream costs a `STREAMOFF`/`STREAMON`
-    /// round trip and throws away whatever the driver had queued, so it should only happen once
-    /// the stall has outlived any plausible hiccup. It stays cheap when the stall is long, since
-    /// it only re-runs a handful of ioctls every 2 s while it lasts.
-    ///
-    /// The 2 s was to be settled by the target-reboot measurement. It was not: measured on
-    /// 2026-09-11, a full reboot of the target **produces no stall at all** — the dongle keeps
-    /// emitting 60 fps of a no-signal picture throughout, so this path is never entered
-    /// (`docs/STAGE2_FINDINGS.md` C12 and §6 item 2). 2 s therefore remains an argued value for
-    /// an event this unit has not yet produced, not a measured one.
+    /// Interval without frames before restarting the stream, repeated while stalled.
+    /// `None` disables restart. Restart failures are counted; disconnection requests a reopen.
     pub restart_after: Option<Duration>,
     /// The first wait before a reopen is attempted after a disconnection, doubling up to
     /// [`PipelineConfig::reopen_max_backoff`].
@@ -207,63 +94,18 @@ pub struct PipelineConfig {
     /// twelve `open` attempts a minute while still recovering within one interval of it
     /// returning.
     pub reopen_max_backoff: Duration,
-    /// How long frames may keep arriving at dimensions other than the negotiated ones before
-    /// [`FrameSource::restart`] is called to re-commit the format. `None` disables the watchdog.
-    ///
-    /// **This is one of two gates and both must be passed**; the other is
-    /// [`PipelineConfig::format_mismatch_frames`]. The watchdog fires only once that many
-    /// *consecutive* mismatched frames have arrived **and** this much time has elapsed since the
-    /// first of them.
-    ///
-    /// **The default is 500 ms.** The failure it exists for is unbounded: on 2026-09-11 a
-    /// session stayed at 640x480 for two minutes after a USB reset and would have stayed there
-    /// forever. What this gate contributes is patience with a device that is settling — the same
-    /// fresh open showed 640x480 at sequence 1 and 1920x1080 by sequence 4 — so the watchdog does
-    /// not spend a restart the instant a burst of mismatched frames lands.
-    ///
-    /// **What the clock is, exactly.** It is wall clock from the first mismatched frame of the
-    /// current run, so a gap in which no frame arrives at all does count towards it. That is
-    /// deliberate rather than overlooked: the frame gate is what a stall cannot pass — a stalled
-    /// stream produces no frames, so it cannot produce
-    /// [`PipelineConfig::format_mismatch_frames`] mismatched ones — so time alone can no longer
-    /// buy a restart, and the clock does not need to be stopped to make that true. Both are
-    /// reset by a frame at the negotiated size, and by every watchdog restart; a *stall* restart
-    /// ([`PipelineConfig::restart_after`]) deliberately leaves them alone, so an intermittent
-    /// stream stuck in the wrong mode cannot have its evidence wiped out over and over.
+    /// Grace interval for a persistent negotiated-size mismatch. `None` disables the
+    /// format watchdog. Both elapsed grace and the consecutive-frame threshold must pass.
+    /// A matching frame resets the mismatch streak; stall recovery leaves it unchanged.
     pub format_mismatch_grace: Option<Duration>,
-    /// How many *consecutive* mismatched frames must have arrived before the format watchdog may
-    /// fire, alongside [`PipelineConfig::format_mismatch_grace`]'s elapsed time. Both, not
-    /// either.
-    ///
-    /// **The default is 12, and the load-bearing part is that it is greater than eight.** A6
-    /// bounds the benign transient at "up to eight frames at the previous resolution after an
-    /// idle period" — a bound in *frames*, which does not convert into a time without also
-    /// fixing the frame rate. A time-only grace of 500 ms sits three times over that transient
-    /// at the 60 fps this client negotiates and *under* it at 10 fps, where eight benign frames
-    /// take 800 ms; the watchdog would then restart a stream that was about to fix itself, at
-    /// the worst possible moment, since the transient happens precisely when a stream has just
-    /// come back. A count above A6's bound makes the transient un-triggerable at any frame rate,
-    /// which is what "a stream that is merely slow is not restarted for being slow" actually
-    /// requires.
+    /// Consecutive mismatches required alongside the grace interval. The default of 12
+    /// exceeds the eight stale startup frames observed on the device.
     pub format_mismatch_frames: u32,
-    /// How many times the format watchdog may restart the stream before it accepts the SOF
-    /// dimensions as the truth, per device open.
+    /// Restart budget for each format-recovery attempt.
     ///
-    /// **The default is 3.** A restart costs a `STREAMOFF`/`STREAMON` round trip (8.7 ms
-    /// measured, ~73 ms to the next frame — C4) and a lost frame or five, so three of them
-    /// spread over a doubling backoff is cheap; and the measured failure was fixed by *one*
-    /// fresh `STREAMON`, so three is two more chances than the event needs. The bound is the
-    /// load-bearing part rather than the number: A6 makes the frame's own header the authority
-    /// on its size, so a unit that does not rescale internally would legitimately deliver a
-    /// different size forever, and an unbounded watchdog would restart its stream every grace
-    /// period for as long as the client ran. When the budget is spent the watchdog escalates
-    /// **once** to a full reopen ([`PipelineStats::format_mismatch_reopens`]) and gets one fresh
-    /// budget; when that one is spent too, the mismatch is accepted, logged once at warn, and
-    /// counted in [`PipelineStats::format_mismatch_accepted`].
-    ///
-    /// The budget is refilled by **a frame at the negotiated size**, by a reopen, and by that one
-    /// escalation, and by nothing else — in particular not by a restart, which would let the
-    /// watchdog refill its own budget and defeat the bound.
+    /// After the default three restarts, escalate once to a reopen with a fresh budget.
+    /// If that budget is exhausted too, accept and report the delivered size. Matching
+    /// frames and new opens reset the budget; a restart cannot replenish its own budget.
     pub format_mismatch_restart_limit: u32,
 }
 
@@ -283,75 +125,60 @@ impl Default for PipelineConfig {
     }
 }
 
-/// A snapshot of the pipeline's counters (§5.5: "FPS alone hides exactly the failures §5.2 and
-/// §5.4 exist to prevent").
+/// Snapshot of capture, decode, freshness, and recovery counters.
 #[derive(Debug, Clone)]
 pub struct PipelineStats {
     /// Frames dequeued and copied out.
     pub frames_captured: u64,
     /// Frames decoded to RGBA.
     pub frames_decoded: u64,
-    /// Compressed frames displaced before the decoder got to them: the decoder is behind (§5.2
-    /// — "decoding an already-obsolete frame spends the most expensive step on output nobody
-    /// will see").
+    /// Compressed frames replaced before decoding because the decoder fell behind.
     pub dropped_pre_decode: u64,
     /// Decoded frames displaced before the renderer took them: the renderer is behind.
     pub dropped_post_decode: u64,
     /// Frames that failed to decode. Strict mode makes a truncated frame an error rather than a
-    /// partial image (§1.3), so this counts frames deliberately not shown.
+    /// partial image, so this counts frames not shown.
     pub decode_errors: u64,
     /// Survivable capture errors: timeouts and I/O errors. Not disconnections.
     pub capture_errors: u64,
-    /// The most recent error from either thread, for display.
-    ///
-    /// **Cleared when the pipeline reopens the device**, and only then: a fresh source has none
-    /// of the old one's history, and every other field in the snapshot — `state`,
-    /// `disconnected_since` — says the failure is over, so leaving the message here would make
-    /// one snapshot contradict itself for the rest of the process's life.
-    ///
-    /// It is deliberately **not** cleared by a frame arriving, which is the other thing that
-    /// could be called a recovery. A stream can deliver frames and errors at the same time — a
-    /// device that emits one unparseable frame in five is the shape `capture_pipeline`'s
-    /// oversized-header test pins — and a field that the next good frame wipes would hide exactly
-    /// that. So: "the last thing that went wrong, until the device was reopened", never "what is
-    /// wrong right now". A consumer that wants the latter reads `state` and the counters.
+    /// Most recent capture or decode error. Cleared only by a successful reopen, so an
+    /// intermittently successful source cannot hide a recurring error.
     pub last_error: Option<String>,
     /// Host-clock instant at which the last frame was captured, for staleness.
     pub last_frame_at: Option<Instant>,
-    /// The last frame's V4L2 timestamp on `CLOCK_MONOTONIC` (§5.5). Comparable with
-    /// [`super::v4l2::now_monotonic`] to get a capture-to-dequeue age — **not** a latency.
+    /// The last frame's V4L2 timestamp on `CLOCK_MONOTONIC`. Comparable with
+    /// [`super::v4l2::now_monotonic`] to get a capture-to-dequeue age — not a latency.
     pub last_captured_at: Option<Duration>,
-    /// Compressed frame sizes seen (§1.3: instrument `bytesused` in Stage 1).
+    /// Compressed frame sizes seen.
     pub bytes: BytesUsedStats,
-    /// The last frame's V4L2 buffer sequence counter. Advisory (A6 says it carries no reliable
+    /// The last frame's V4L2 buffer sequence counter. Advisory (it carries no reliable
     /// tell about a resolution change); it is here so an instrument can print *which* frame a
     /// dimension change was first seen on.
     pub last_sequence: Option<u32>,
     /// Times the device was lost: `ENODEV`, a `POLLHUP`/`POLLNVAL`, or a panic on the capture
     /// thread. Counted once per loss, not once per failed reopen.
     pub disconnects: u64,
-    /// Times a [`SourceOpener`] handed back a working source after a loss (§6.1 S2-4).
+    /// Times a [`SourceOpener`] handed back a working source after a loss.
     pub reopens: u64,
     /// [`SourceOpener::open`] calls made *while recovering*. The initial open is not one: there
     /// was nothing to get back. `reopen_attempts - reopens` is how many times the node was not
     /// ready yet, which is the number that says whether the backoff is tuned sanely.
     pub reopen_attempts: u64,
-    /// [`FrameSource::restart`] calls the stall timer made (§6.1 "attempt restart"). Counted on
+    /// [`FrameSource::restart`] calls the stall timer made. Counted on
     /// the attempt, because a restart that failed still happened and still cost the stream.
     pub stream_restarts: u64,
-    /// Frames whose SOF dimensions differed from the previous frame's (§6, A6). The first frame
-    /// is not a change. This is the local half of S2-3's measurement: the *device's* opinion of
-    /// the format is `V4l2Source::query_negotiated_format`, and the two need not agree.
+    /// Count changes in successive JPEG SOF dimensions, excluding the first frame.
+    /// These may differ from the driver’s negotiated format.
     pub resolution_changes: u64,
     /// The last frame's SOF dimensions, or `None` before the first frame.
     pub last_resolution: Option<(u32, u32)>,
-    /// [`FrameSource::restart`] calls the **format watchdog** made: frames kept arriving at
+    /// [`FrameSource::restart`] calls the format watchdog made: frames kept arriving at
     /// dimensions other than the negotiated ones for [`PipelineConfig::format_mismatch_grace`],
     /// so the stream was restarted to re-commit the format. Counted separately from
     /// [`PipelineStats::stream_restarts`] — they go through the same `restart()` call but they
     /// answer different questions ("no frames at all" against "frames in the wrong mode").
     pub format_mismatch_restarts: u64,
-    /// Times the watchdog escalated a spent restart budget to a **full reopen** of the device:
+    /// Times the watchdog escalated a spent restart budget to a full reopen of the device:
     /// release the source, open it again through the [`SourceOpener`], `S_FMT`/`S_PARM`/
     /// `STREAMON` from scratch. At most one per run of mismatched frames, so this is bounded by
     /// the same thing [`PipelineStats::format_mismatch_accepted`] is. Counted apart from
@@ -359,20 +186,15 @@ pub struct PipelineStats {
     /// that "the device went away" and "the watchdog gave up on restarts" stay distinguishable.
     pub format_mismatch_reopens: u64,
     /// Times the watchdog spent its restart budget, spent the fresh one the single escalation
-    /// reopen bought it, and accepted the SOF dimensions as the truth (A6). Nonzero means the
+    /// reopen bought it, and accepted the SOF dimensions as the truth. Nonzero means the
     /// negotiated format could not be established on this device and what is on screen is what
-    /// the device is actually sending.
+    /// the device is sending.
     pub format_mismatch_accepted: u64,
-    /// Times a caller asked for a different mode and the opener accepted it (§12 Stage 4b, the
-    /// chrome's Video popover). Counted apart from [`PipelineStats::reopens`] — which it also
-    /// increments, because it really is a reopen — so that "the user changed the resolution" is
-    /// never mistaken for "the device went away".
+    /// Accepted user format changes. Counted separately from recovery even though each
+    /// also reopens capture.
     pub format_changes: u64,
-    /// What the current source's `S_FMT` committed to, or `None` when there is no source or it
-    /// negotiated nothing. The other half of the comparison
-    /// [`PipelineStats::last_resolution`] is one half of: the two differing while
-    /// `format_mismatch_accepted` is nonzero is the state the viewer has to put in the title
-    /// (C5 — a condition is surfaced, not counted).
+    /// Negotiated source dimensions, or `None`. Compare with actual frame dimensions
+    /// to report a mismatch accepted after recovery is exhausted.
     pub negotiated_dimensions: Option<(u32, u32)>,
     /// When the current disconnection started, or `None` when connected. Cleared the instant a
     /// reopen succeeds, so `state == Running` always comes with `None`.
@@ -387,10 +209,8 @@ struct Shared {
     started_at: Instant,
     stopping: AtomicBool,
     stall_after: Duration,
-    /// A mode the caller asked for, for the capture thread to apply on its next pass (§12 Stage
-    /// 4b). A 1-slot request, not a queue: a user clicking three resolutions in a second wants the
-    /// third, and three sequential reopens of a streaming node would take about a second and a
-    /// half to arrive at the same place.
+    /// Latest requested format. Replacing an earlier request avoids unnecessary
+    /// intermediate reopens during rapid selection changes.
     format_request: Mutex<Option<(u32, u32, u32)>>,
 }
 
@@ -470,7 +290,7 @@ impl Shared {
 
     /// The same derivation against a guard the caller already holds.
     ///
-    /// [`PipelineHandle::stats`] needs the state and the counters to describe **one** moment. Two
+    /// [`PipelineHandle::stats`] needs the state and the counters to describe one moment. Two
     /// separate lock acquisitions let a frame land between them, which is how a snapshot ends up
     /// saying `Stalled` next to a `last_frame_at` of "just now".
     fn state_of(&self, inner: &Inner) -> PipelineState {
@@ -488,28 +308,15 @@ impl Shared {
     }
 }
 
-/// The capture pipeline (§4.1). A namespace for [`Pipeline::start`]; the running pipeline is
+/// The capture pipeline. A namespace for [`Pipeline::start`]; the running pipeline is
 /// owned by the [`PipelineHandle`] it returns.
 pub struct Pipeline;
 
 impl Pipeline {
-    /// Start the capture and decode threads and return a handle to them.
+    /// Start capture and decode workers with one source.
     ///
-    /// The threads are named `nanokvm-capture` and `nanokvm-decode`, so a stack dump or a
-    /// `perf` profile says which is which.
-    ///
-    /// Infallible by construction: if a thread cannot be spawned the handle comes back with
-    /// [`PipelineState::Stopped`] and the reason in [`PipelineStats::last_error`], rather than
-    /// panicking inside a library. Callers that care check [`PipelineHandle::state`].
-    /// Start the capture and decode threads on one source, with no recovery — the Stage 1
-    /// entry point, unchanged.
-    ///
-    /// The source is wrapped in an opener that yields it once and has nothing after that, and
-    /// recovery is off, so a disconnection is terminal exactly as it was in Stage 1: the state
-    /// becomes [`PipelineState::Disconnected`], the capture thread exits, and
-    /// [`PipelineStats::reopen_attempts`] stays at 0 — nothing was ever attempted, because a
-    /// caller who handed over a device it opened itself has given us nothing to reopen. Callers
-    /// that want §6.1's rediscovery use [`Pipeline::start_with_opener`].
+    /// Stall recovery can restart that source, but a disconnection is terminal because
+    /// there is no replacement opener. The final decoded frame remains available.
     pub fn start(source: Box<dyn FrameSource>, config: PipelineConfig) -> PipelineHandle {
         let describe = source.describe();
         let opener = OnceOpener {
@@ -519,17 +326,10 @@ impl Pipeline {
         Pipeline::spawn(Box::new(opener), describe, false, config)
     }
 
-    /// Start the pipeline against an opener, with the §6.1 recovery behaviours on
-    /// (S2-1, S2-2, S2-4).
+    /// Start capture and decode workers with a reopenable source.
     ///
-    /// The opener is called once now — on the capture thread, so a device that is not there yet
-    /// costs the caller nothing — and again on every reopen after a disconnection. A failure of
-    /// that first call is not fatal: it puts the pipeline straight into
-    /// [`PipelineState::Reconnecting`], which is the honest state for "the node is not there
-    /// yet" and is what makes starting the client before plugging the dongle in work.
-    ///
-    /// [`PipelineHandle::describe`] reports [`SourceOpener::describe`], because at the moment
-    /// this returns there may be no source to ask.
+    /// The capture worker performs the initial open and retries later failures with backoff.
+    /// Callers needing fail-fast startup can supply an already-open first source.
     pub fn start_with_opener(
         opener: Box<dyn SourceOpener>,
         config: PipelineConfig,
@@ -538,14 +338,7 @@ impl Pipeline {
         Pipeline::spawn(opener, describe, true, config)
     }
 
-    /// The shared body of both entry points. `recover` is the only difference between them.
-    ///
-    /// Infallible by construction: if a thread cannot be spawned the handle comes back with
-    /// [`PipelineState::Stopped`] and the reason in [`PipelineStats::last_error`], rather than
-    /// panicking inside a library. Callers that care check [`PipelineHandle::state`].
-    ///
-    /// The threads are named `nanokvm-capture` and `nanokvm-decode`, so a stack dump or a
-    /// `perf` profile says which is which.
+    /// Shared worker startup; `recover` controls whether replacement opens are allowed.
     fn spawn(
         opener: Box<dyn SourceOpener>,
         describe: String,
@@ -632,13 +425,8 @@ impl SourceOpener for OnceOpener {
     }
 }
 
-/// A cheap identity for a [`CaptureError`], so a repeat of the same failure can be recognised
-/// without formatting it.
-///
-/// `BadFrame` and `Config` carry a message that can differ between occurrences; they are treated
-/// as one kind each, so `last_error` keeps the first message of a run rather than being rewritten
-/// tens of times a second. The counter still moves on every error, which is the number §5.5 asks
-/// for; only the display string is left alone.
+/// Error category used to deduplicate display messages. Repeated errors of one kind
+/// retain their first message while every occurrence still increments the counter.
 fn error_kind(e: &CaptureError) -> (u8, i32) {
     match e {
         CaptureError::Disconnected => (0, 0),
@@ -663,17 +451,7 @@ fn backoff(shared: &Arc<Shared>, compressed: &Arc<Slot<CompressedFrame>>, nap: D
     }
 }
 
-/// Everything the capture thread owns across an iteration (§4.1 row 1, §6.1 Stage 2).
-///
-/// A struct rather than a pile of `&mut` parameters because the recovery paths need most of it:
-/// the opener outlives every source, the stall timer has to survive a reopen, and the error
-/// bookkeeping has to be reset by one.
-/// The warning for a format request a source cannot honour (§12 Stage 4b).
-///
-/// A function rather than a literal at the call site because a wrapped string literal loses its
-/// meaning silently: without the `\` continuation this message carried eighteen spaces in the
-/// middle of a sentence and nothing failed. Here the wording is a value, and the test below reads
-/// it.
+/// Capture-worker state retained across polling and recovery.
 fn format_refused(width: u32, height: u32, fps: u32) -> String {
     format!(
         "capture: {width}x{height}@{fps} was asked for, but this source cannot renegotiate; the \
@@ -704,7 +482,7 @@ struct Capture {
     /// negotiated nothing — every synthetic and scripted one — which leaves the watchdog inert.
     negotiated: Option<(u32, u32)>,
     /// When the current unbroken run of mismatched frames started. Cleared by a frame at the
-    /// negotiated size, by a *watchdog* restart, and by a reopen — and deliberately not by a
+    /// negotiated size, by a *watchdog* restart, and by a reopen — and not by a
     /// stall restart.
     mismatch_since: Option<Instant>,
     /// How many frames that run is, which is the gate a stall cannot pass. Cleared with
@@ -719,7 +497,7 @@ struct Capture {
     /// Set between asking for the escalation reopen and the re-arm that follows it, so
     /// [`Capture::arm_format_watch`] can tell that reopen apart from a disconnection's.
     escalating: bool,
-    /// Set when both budgets are spent: the SOF dimensions are the truth from here (A6) and the
+    /// Set when both budgets are spent: the SOF dimensions are the truth from here and the
     /// watchdog is silent until a negotiated-size frame or a reopen re-arms it.
     format_accepted: bool,
     consecutive_errors: u32,
@@ -756,17 +534,8 @@ impl Capture {
         }
     }
 
-    /// Apply a pending [`PipelineHandle::request_format`], if there is one (§12 Stage 4b).
-    ///
-    /// Takes the request whether or not it can be honoured — a request left in the slot would be
-    /// retried on every pass — and releases the source only when the opener says it renegotiated.
-    /// The loop's own `reconnect` then opens the node afresh on the next pass, which is exactly
-    /// the `S_FMT`/`S_PARM`/`STREAMON` the new mode needs; that is the same road the format
-    /// watchdog's escalation takes (`Step::Reopen`), and for the same reason: there is one
-    /// negotiation in this client and this is not a second one.
-    ///
-    /// Deliberately **not** `lose_device`: nothing was lost, so `disconnects` and
-    /// `disconnected_since` must not say it was.
+    /// Consume a pending format request. Unsupported requests leave the stream intact;
+    /// accepted requests update the opener and use the existing reopen path.
     fn apply_format_request(&mut self, shared: &Arc<Shared>) {
         let Some((width, height, fps)) = lock_or_recover(&shared.format_request).take() else {
             return;
@@ -788,15 +557,7 @@ impl Capture {
         self.release_source();
     }
 
-    /// Drop the current source, absorbing a panicking destructor.
-    ///
-    /// `capture::v4l2` module docs item 4: `Stream::drop` issues `STREAMOFF` and `Arena::drop`
-    /// `munmap`s and `REQBUFS(0)`s, and both `panic!` on any failure other than `ENODEV`. On the
-    /// disconnect path the ioctls are being issued against a node that has just gone away, which
-    /// is the one case they tolerate — but "tolerates the case we expect" is not a guarantee, and
-    /// a panic escaping here would skip the reopen entirely. Absorb it and say so; the mappings
-    /// are released by the same destructors either way, which is what H-B2 checks in
-    /// `/proc/self/maps`.
+    /// Drop the source while containing v4l teardown panics, allowing later recovery.
     fn release_source(&mut self) {
         let Some(source) = self.source.take() else {
             return;
@@ -809,7 +570,7 @@ impl Capture {
         }
     }
 
-    /// Record the loss of the device (§6.1 disconnect row) and release the source.
+    /// Record the loss of the device and release the source.
     fn lose_device(&mut self, msg: &str, shared: &Arc<Shared>) {
         {
             let mut inner = lock_or_recover(&shared.inner);
@@ -831,22 +592,10 @@ impl Capture {
         self.release_source();
     }
 
-    /// Call [`SourceOpener::open`] somewhere the capture thread can walk away from it.
+    /// Run a potentially blocking open on a helper thread.
     ///
-    /// An open cannot be interrupted and it is not quick: `V4l2Source::open` is `S_FMT`, `S_PARM`,
-    /// `REQBUFS`, four `mmap`s and `QBUF`s and a `STREAMON`, every one a USB control transfer to a
-    /// device that has just re-enumerated, where the kernel's control timeout runs to seconds. A
-    /// `stop()` that landed mid-open used to wait the whole of it out, because `stop()` joins this
-    /// thread. So the open runs on a helper thread and the capture thread waits on a channel,
-    /// polling the stop flag every [`STOP_POLL`]; on shutdown it drops the receiver and returns.
-    ///
-    /// The residual, documented on [`PipelineHandle::stop`]: the abandoned helper still finishes
-    /// its open and then drops whatever it produced — on its own thread, under `catch_unwind`,
-    /// because those destructors are the panicking kind — shortly after `stop()` has returned.
-    /// The device is released there rather than at `stop()`. Bounding the wait instead would give
-    /// the same promptness and *also* leave the open running, with no way to know when it ended.
-    ///
-    /// Returns `None` only when the pipeline is shutting down.
+    /// Shutdown can abandon the result; the helper then drops any opened source. The
+    /// device may be released after stop returns, but no frames from that open are delivered.
     fn open_detached(
         &mut self,
         compressed: &Arc<Slot<CompressedFrame>>,
@@ -942,15 +691,8 @@ impl Capture {
         }
     }
 
-    /// Wait out the backoff and try the opener, until it works or the pipeline stops (§6.1
-    /// "attempt rediscovery").
-    ///
-    /// The wait comes **first**: the device was lost microseconds ago and hammering `open` on a
-    /// node mid-re-enumeration answers nothing. The backoff doubles to
-    /// [`PipelineConfig::reopen_max_backoff`], and every step of it is interruptible, so `stop()`
-    /// is as prompt here as anywhere else.
-    ///
-    /// Returns false if the pipeline is shutting down.
+    /// Retry the opener after exponential backoff until success or stop. The first wait
+    /// is also capped, and waits are interruptible so a long outage cannot delay shutdown.
     fn reconnect(&mut self, compressed: &Arc<Slot<CompressedFrame>>, shared: &Arc<Shared>) -> bool {
         // The cap binds the *first* wait too. A config with `reopen_backoff` above
         // `reopen_max_backoff` is degenerate, but "the cap is the longest wait" should be true
@@ -983,7 +725,7 @@ impl Capture {
                     self.last_kind = None;
                     self.restart_base = Instant::now();
                     // The watchdog re-arms with the new source's negotiated format and a full
-                    // budget: the reopen is exactly the event that produced the stuck stream this
+                    // budget: the reopen is the event that produced the stuck stream this
                     // watchdog exists for.
                     self.arm_format_watch(shared);
                     let reopens = {
@@ -1017,23 +759,9 @@ impl Capture {
         }
     }
 
-    /// The stall response (§6.1 "attempt restart"): stop and restart the stream in place.
-    ///
-    /// The timer is reset *before* the call, so a restart that itself takes a while does not
-    /// immediately qualify for another one.
-    ///
-    /// **A restart that panics is a failed restart, not a lost device.** `V4l2Source::restart`
-    /// drops the old stream, and those destructors `panic!` on any teardown ioctl that fails with
-    /// something other than `ENODEV` (v4l2 module docs item 4) — which is exactly the state a
-    /// genuinely wedged stream is in, and the state the stall timer exists to attack. Letting
-    /// that panic reach the loop's `catch_unwind` would make it `Step::Lost`, and on
-    /// [`Pipeline::start`] — the entry point `src/main.rs` uses, with `restart_after` on by
-    /// default — a survivable stall would become a terminal disconnection with the capture thread
-    /// exited, which is precisely what §6.1 S1-1/S1-2 forbid. So the call gets its own
-    /// `catch_unwind` and lands where the non-panicking failure already landed: counted, logged,
-    /// same source, keep polling. Keeping the source is right rather than merely convenient — a
-    /// `V4l2Source` whose rebuild failed comes back marked broken, so its next `next_frame`
-    /// retries the rebuild; and a source that really is gone says `Disconnected` on that call.
+    /// Restart a stalled stream in place. Reset the timer before the call so a slow
+    /// restart cannot immediately trigger another. A restart panic is a failed attempt;
+    /// a reported disconnection requests reopening.
     fn restart_stream(&mut self, shared: &Arc<Shared>) -> Step {
         self.restart_base = Instant::now();
         let after = self.restart_after.unwrap_or_default();
@@ -1055,7 +783,7 @@ impl Capture {
     /// the source, so both get the same `catch_unwind` and the same three outcomes. They are
     /// counted separately by their callers and handled identically here, which is the point: a
     /// panicking `restart()` is a failed restart and never a lost device, whichever timer asked
-    /// for it (C4).
+    /// for it.
     fn invoke_restart(&mut self, shared: &Arc<Shared>) -> Step {
         // `AssertUnwindSafe`: what an unwind here can leave behind is the source, and the two
         // sources that can panic out of `restart` — `V4l2Source` and a test double — both leave
@@ -1067,22 +795,8 @@ impl Capture {
             catch_unwind(AssertUnwindSafe(|| source.restart()))
         };
         match outcome {
-            // Nothing about the watchdog is touched here, on purpose, and the two callers differ
-            // on what they want:
-            //
-            // - **The negotiated mode is not re-read.** It used to be, "in case the source
-            //   renegotiated", and on the only source that can renegotiate anything that was a
-            //   no-op: `V4l2Source::format` is set once in `open()` and `restart()` is
-            //   `REQBUFS`/`QBUF`/`STREAMON` on the same fd with no `S_FMT` and no `S_PARM`, so it
-            //   cannot change. Re-reading it here would therefore have been code only a test
-            //   double could exercise — the one shape where a fake can pass where hardware would
-            //   not. The negotiated mode changes when the device is opened, and
-            //   [`Capture::arm_format_watch`] is where that is picked up.
-            // - **The mismatch clock and frame count are not cleared.** The *watchdog's* restart
-            //   does clear them, at its own call site, because it wants fresh evidence for its
-            //   next decision. The *stall* restart must not: a stream that is both intermittent
-            //   and stuck in the wrong mode would otherwise have its evidence wiped out every
-            //   time the stall timer fired, and the watchdog would never fire at all.
+            // A stall restart must not reset the format watchdog: otherwise repeated stalls
+            // could indefinitely replenish its retry budget or hide mismatches.
             Ok(Ok(())) => Step::Continue,
             // The restart discovered what the stall could not tell us apart from: the node is
             // gone. That is the disconnect path, not a failed restart.
@@ -1097,15 +811,8 @@ impl Capture {
         }
     }
 
-    /// Re-arm the format watchdog for a freshly opened device: new negotiated mode, clean clock,
-    /// full restart budget.
-    ///
-    /// The one thing a reopen does **not** always clear is [`Capture::format_reopened`]. When the
-    /// reopen is the watchdog's own escalation, that flag is what stops the next spent budget
-    /// asking for another one: the escalation is bounded at one per run of mismatched frames, so
-    /// a device that never reaches the negotiated mode ends in acceptance rather than in a reopen
-    /// loop. A reopen the watchdog did not ask for — a real disconnection — is a new device open
-    /// and clears it like everything else.
+    /// Arm the size watchdog for a newly opened source. Preserve whether the one allowed
+    /// escalation reopen has been used so repeated mismatches cannot loop forever.
     fn arm_format_watch(&mut self, shared: &Arc<Shared>) {
         self.negotiated = self.source.as_ref().and_then(|s| s.negotiated_dimensions());
         lock_or_recover(&shared.inner).negotiated_dimensions = self.negotiated;
@@ -1130,32 +837,11 @@ impl Capture {
         self.format_accepted = false;
     }
 
-    /// The format watchdog, run on every delivered frame (§6/A6, C4).
+    /// Evaluate actual JPEG dimensions against the negotiated size.
     ///
-    /// A6 stands: `dims` came from *this frame's* start-of-frame header and nothing here
-    /// overrides it or rescales anything — the decoder and the renderer go on coping with
-    /// whatever size arrives. What this asks is a different question: is the **device** in the
-    /// mode `S_FMT` committed to? When it is not, and has not been for
-    /// [`PipelineConfig::format_mismatch_frames`] consecutive frames *and*
-    /// [`PipelineConfig::format_mismatch_grace`] of elapsed time, a `restart()` re-commits it.
-    ///
-    /// **Two gates, and both are needed.** The frame count is what a benign transient cannot
-    /// pass — A6 bounds it at eight frames whatever the frame rate — and it is also what a
-    /// *stall* cannot pass, since a stream delivering nothing delivers no mismatched frames
-    /// either. The elapsed time is what keeps a device that is merely settling from being
-    /// restarted the moment a burst lands.
-    ///
-    /// **The ladder, once both gates are passed.** `restart()` up to
-    /// [`PipelineConfig::format_mismatch_restart_limit`] times on a doubling backoff, then one
-    /// full reopen through the [`SourceOpener`] with a fresh restart budget, then acceptance. The
-    /// weaker remedy goes first because it is the one that was measured to work (module docs);
-    /// the reopen goes second because it is the same action that had already failed once, and the
-    /// evidence says its failure was about *when* it happened rather than about what it does.
-    /// Acceptance is checked **before** the doubled wait, because the doubling exists to space
-    /// restarts out and at that point there is no restart left to space.
-    ///
-    /// Returns a [`Step`] because a restart can report the node gone — the disconnect path, not
-    /// this one's — and because the escalation is itself a request to reopen the device.
+    /// A matching frame resets the streak. Persistent mismatches trigger bounded restarts,
+    /// one escalation reopen with a fresh budget, then acceptance with a warning. This
+    /// changes recovery state, never the dimensions attached to the received frame.
     fn watch_format(&mut self, dims: (u32, u32), shared: &Arc<Shared>) -> Step {
         let (Some(grace), Some(negotiated)) = (self.format_grace, self.negotiated) else {
             return Step::Continue;
@@ -1203,7 +889,7 @@ impl Capture {
                     dims.0, dims.1, self.format_restarts, negotiated.0, negotiated.1
                 ));
             }
-            // Both budgets spent and the frames are still the wrong size. A6: the SOF header is
+            // Both budgets spent and the frames are still the wrong size. the SOF header is
             // the authority, so this is now simply what the device sends — accept it, say so
             // once, and stop restarting a stream that may be perfectly correct for a unit that
             // does not rescale internally.
@@ -1215,7 +901,7 @@ impl Capture {
             };
             log::warn!(
                 "capture: the negotiated format {}x{} could not be established after {} stream \
-                 restart(s){}; accepting the {}x{} the device is sending as the truth (A6) and \
+                 restart(s){}; accepting the {}x{} the device is sending as the truth and \
                  leaving the stream alone (acceptance {accepted})",
                 negotiated.0,
                 negotiated.1,
@@ -1257,11 +943,11 @@ impl Capture {
         );
         self.format_restarts += 1;
         // The next decision is made on evidence gathered after this restart, not on the evidence
-        // that bought it: `invoke_restart` deliberately leaves the clock alone, so the watchdog
+        // that bought it: `invoke_restart` leaves the clock alone, so the watchdog
         // clears it here and the stall path does not.
         self.mismatch_since = None;
         self.mismatch_frames = 0;
-        // A restart is a stream start for the stall timer too, exactly as `restart_stream` makes
+        // A restart is a stream start for the stall timer too, as `restart_stream` makes
         // it: without this the next `step` could fire the stall restart on top of this one.
         self.restart_base = Instant::now();
         self.invoke_restart(shared)
@@ -1306,13 +992,12 @@ impl Capture {
                     inner.last_frame_at = Some(Instant::now());
                     inner.last_captured_at = Some(frame.captured_at);
                     inner.last_sequence = Some(frame.sequence);
-                    // `bytesused` is exactly the owned copy's length (§1.3, A19: instrument it).
+                    // `bytesused` is the owned copy's length.
                     let len = frame.jpeg.len().min(u32::MAX as usize) as u32;
                     inner.bytes.record(len);
                     inner.bytes_window.record(len);
-                    // A6: the SOF header of *this* frame is the only authority on its size, so a
-                    // target-side mode change (§6.1 S2-3) becomes visible here and nowhere else.
-                    // The first frame establishes the resolution; it is not a change.
+                    // Only this frame’s SOF can establish its dimensions. The first frame sets
+                    // the baseline and does not count as a change.
                     let previous = inner.last_resolution.replace(dims);
                     match previous {
                         Some(prev) if prev != dims => {
@@ -1345,20 +1030,17 @@ impl Capture {
                     }
                 }
                 // Replace-on-full: the displaced frame is an obsolete one nobody will see
-                // (§5.2, "drop before decoding"). Its allocation is released here.
+                // . Its allocation is released here.
                 if compressed.put(frame).is_some() && !compressed.is_closed() {
                     lock_or_recover(&shared.inner).dropped_pre_decode += 1;
                 }
-                // After the frame has been handed on, not instead of it: a mismatched frame is
-                // still a frame, and the renderer shows it while the watchdog works on the
-                // device (C4 — the client coping with a size is not this mechanism's business).
+                // Display valid mismatched frames while recovery runs; size mismatch alone does not
+                // make a decoded image unusable.
                 self.watch_format(dims, shared)
             }
             Err(CaptureError::Disconnected) => Step::Lost(CaptureError::Disconnected.to_string()),
             Err(e) => {
-                // A stall or an I/O error. Count it, say what it was, back off, keep polling —
-                // §6.1 S1-2 is that frames stopping neither crashes nor hangs, and A5 forbids
-                // turning this into a claim about the signal.
+                // Back off on a stall or I/O failure without claiming HDMI signal loss.
                 self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                 let kind = error_kind(&e);
                 let is_new_kind = self.last_kind != Some(kind);
@@ -1387,12 +1069,8 @@ impl Capture {
     }
 }
 
-/// Capture thread body (§4.1 row 1, §6.1 S2-1/S2-2/S2-4).
-///
-/// The loop body runs under `catch_unwind`: the `v4l` crate's destructors panic on a failed
-/// teardown ioctl and they run on this thread, and §6.1 S1-1 forbids a capture failure from
-/// taking anything else down. A panic is treated as a lost device, exactly like `ENODEV`, so a
-/// recovering pipeline reopens after one instead of sitting dead. See the module docs.
+/// Capture worker loop. Contain source and destructor panics as disconnections
+/// so a recoverable pipeline can reopen without stopping input.
 fn capture_loop(mut cap: Capture, compressed: &Arc<Slot<CompressedFrame>>, shared: &Arc<Shared>) {
     // The first open runs here rather than in `Pipeline::spawn` so that a device which is not
     // there yet costs the caller nothing and lands in the retry loop like any other absence.
@@ -1410,9 +1088,7 @@ fn capture_loop(mut cap: Capture, compressed: &Arc<Slot<CompressedFrame>>, share
             break;
         }
 
-        // §12 Stage 4b: a mode the chrome asked for. Checked here, between passes, because
-        // renegotiating means releasing the source — and releasing a source the loop is inside
-        // `next_frame` on is not a thing this thread can do to itself.
+        // Apply format requests between source calls because reopening drops the source.
         cap.apply_format_request(shared);
 
         // `AssertUnwindSafe` because the state that could be observed after an unwind is exactly
@@ -1439,7 +1115,7 @@ fn capture_loop(mut cap: Capture, compressed: &Arc<Slot<CompressedFrame>>, share
             // Not `lose_device`: the device never went away, so `disconnects` and
             // `disconnected_since` must not say it did. What this shares with a disconnection is
             // everything after that — the source is released under `catch_unwind` and the loop's
-            // own `reconnect` opens the node afresh on the next pass, which is exactly the
+            // own `reconnect` opens the node afresh on the next pass, which is the
             // `S_FMT`/`S_PARM`/`STREAMON` the watchdog is asking for. The state goes to
             // `Reconnecting` in there; for the half-second that takes, the title says the capture
             // device is being reopened, which is true.
@@ -1455,8 +1131,7 @@ fn capture_loop(mut cap: Capture, compressed: &Arc<Slot<CompressedFrame>>, share
         if let Some(msg) = lost {
             cap.lose_device(&msg, shared);
             if !cap.recover {
-                // Stage 1's terminal behaviour. Wake the decode thread; leave the output slot
-                // alone so the renderer can still present the last image it holds (§6.1 S1-2).
+                // Wake decode on termination while preserving the renderer’s last image.
                 compressed.close();
                 break;
             }
@@ -1475,9 +1150,9 @@ enum Step {
     Continue,
     /// The device is gone, with the message to record. Recovery decides what happens next.
     Lost(String),
-    /// The device is **there** and is to be opened again anyway, with the reason to record: the
+    /// The device is there and is to be opened again anyway, with the reason to record: the
     /// format watchdog's one escalation, once its restarts have failed to commit the negotiated
-    /// mode. Deliberately not a [`Step::Lost`] — nothing was lost, so nothing is counted as a
+    /// mode. not a [`Step::Lost`] — nothing was lost, so nothing is counted as a
     /// disconnection — but it takes the same road from there: release the source, then the
     /// capture loop's ordinary reconnect, backoff and all.
     Reopen(String),
@@ -1494,7 +1169,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Decode thread body (§4.1 row 2). Exactly one of these (§1.3).
+/// Decode thread body. Exactly one of these.
 fn decode_loop(
     compressed: &Arc<Slot<CompressedFrame>>,
     output: &Arc<Slot<DecodedFrame>>,
@@ -1502,7 +1177,7 @@ fn decode_loop(
     config: &PipelineConfig,
 ) {
     let mut decoder = Decoder::new();
-    // The reused RGBA buffer (§1.3). It is swapped with whatever `put` displaces, so in steady
+    // The reused RGBA buffer. It is swapped with whatever `put` displaces, so in steady
     // state with a slow renderer this pipeline decodes without allocating at all.
     let mut scratch = DecodedFrame::empty();
 
@@ -1537,7 +1212,7 @@ fn decode_loop(
                 }
             }
             Err(e) => {
-                // Strict mode rejecting a truncated frame is the expected shape here (§1.3).
+                // Strict mode rejecting a truncated frame is the expected shape here.
                 // Skip it; never exit over one bad frame.
                 let mut inner = lock_or_recover(&shared.inner);
                 inner.decode_errors += 1;
@@ -1550,7 +1225,7 @@ fn decode_loop(
     log::info!("decode thread finished");
 }
 
-/// A running pipeline (§4.1).
+/// A running pipeline.
 pub struct PipelineHandle {
     output: Arc<Slot<DecodedFrame>>,
     compressed: Arc<Slot<CompressedFrame>>,
@@ -1563,7 +1238,7 @@ pub struct PipelineHandle {
 impl PipelineHandle {
     /// The decoded-frame handoff. The render thread clones this `Arc` and calls
     /// [`Slot::take`] or [`Slot::wait_take`]; it takes whatever is pending, with no catch-up and
-    /// no queue drain (§5.2).
+    /// no queue drain.
     pub fn output(&self) -> Arc<Slot<DecodedFrame>> {
         Arc::clone(&self.output)
     }
@@ -1601,47 +1276,30 @@ impl PipelineHandle {
         }
     }
 
-    /// Take the `bytesused` fold accumulated since the last call, and reset it.
-    ///
-    /// [`PipelineStats::bytes`] is cumulative, so its `min`/`max` are min and max *ever* and
-    /// cannot answer "how big were the frames in the last second" — the question §1.3 and A19
-    /// leave open, because every decode margin so far was measured against an idle desktop.
-    /// Sampling `bytes.last` at any poll rate below the frame rate would miss frames and quietly
-    /// under-report the max, so the window is folded on the capture thread and handed over whole.
-    /// `examples/capture-probe.rs` is the caller; nothing else needs it.
+    /// Take and reset compressed-size statistics for the latest reporting interval.
+    /// The regular snapshot remains cumulative.
     pub fn take_bytes_window(&self) -> BytesUsedStats {
         std::mem::take(&mut lock_or_recover(&self.shared.inner).bytes_window)
     }
 
-    /// How long since the last frame was captured, or `None` if none ever has been.
-    ///
-    /// This is the number §6.1 S1-2 wants surfaced: "the tool says frames stopped arriving".
-    /// It says nothing about the signal (A5).
+    /// Age since the last captured frame, or `None` before the first frame.
+    /// This measures frame arrival, not HDMI signal presence.
     pub fn frames_stalled_for(&self) -> Option<Duration> {
         lock_or_recover(&self.shared.inner)
             .last_frame_at
             .map(|t| t.elapsed())
     }
 
-    /// Ask the capture thread to renegotiate at `width`x`height`@`fps` (§12 Stage 4b).
+    /// Request a format for the next open without blocking.
     ///
-    /// **Non-blocking, and it promises nothing about the outcome.** It records a request; the
-    /// capture thread applies it on its next pass by asking the [`SourceOpener`] to
-    /// [`SourceOpener::set_format`] and then taking its ordinary reopen path — release the source,
-    /// `S_FMT`/`S_PARM`/`STREAMON` afresh — which is the one negotiation this client does, with
-    /// its reply already checked against what was asked for (§6). An opener that cannot
-    /// renegotiate leaves the current mode alone and logs it.
-    ///
-    /// Called from the event loop, which must never block (§5.4), so the request is a 1-slot
-    /// mutex rather than a handshake: a second request before the first is applied replaces it.
-    ///
-    /// The picture blanks for the reopen. Nothing about the **target's** resolution is touched —
-    /// this is the capture side only, and `CLAUDE.md` forbids changing the target's.
+    /// A newer pending request replaces an older one. Unsupported openers report refusal
+    /// and retain the working stream. Acceptance reopens capture and may briefly blank
+    /// the image; the target's display settings are unchanged.
     pub fn request_format(&self, width: u32, height: u32, fps: u32) {
         *lock_or_recover(&self.shared.format_request) = Some((width, height, fps));
     }
 
-    /// The current state, with staleness derived from the clock (§6.1).
+    /// The current state, with staleness derived from the clock.
     pub fn state(&self) -> PipelineState {
         self.shared.state()
     }
@@ -1651,22 +1309,12 @@ impl PipelineHandle {
         &self.describe
     }
 
-    /// Close both handoffs and join both threads.
+    /// Close both handoffs and join capture and decode workers.
     ///
-    /// Returns once both have exited. Prompt in every case, including mid-reconnect: closing the
-    /// slots wakes any waiter, and every wait on the capture thread is a poll on the stop flag
-    /// rather than a sleep. **The bound is one in-flight call into the source, plus
-    /// [`STOP_POLL`] (2 ms):** either a `next_frame` — which [`FrameSource`] requires to be
-    /// bounded, and which `V4l2Source` bounds by its own dequeue timeout, 250 ms by default — or
-    /// a `restart`, measured at 8.7 ms on this hardware. The reopen backoff, up to
-    /// [`PipelineConfig::reopen_max_backoff`], does **not** count: it is interruptible.
-    ///
-    /// [`SourceOpener::open`] does not count either, and that is the one residual worth stating.
-    /// An open cannot be interrupted, so it runs on a helper thread (see `Capture::open_detached`)
-    /// which `stop()` abandons rather than joins. If `stop()` lands while one is in flight, the
-    /// helper finishes the open on its own and immediately drops whatever it got — so a device
-    /// opened at that moment is released a little *after* `stop()` returned, not before. Nothing
-    /// waits on it, nothing is reported from it, and no frame it produced can reach a consumer.
+    /// Capture stop waits for at most its current bounded source call plus `STOP_POLL`.
+    /// Reopen backoff is interruptible. An in-flight helper open is abandoned and may
+    /// finish releasing its device after this method returns. Decode finishes its current
+    /// frame before joining.
     pub fn stop(mut self) {
         self.shared.stopping.store(true, Ordering::SeqCst);
         self.compressed.close();
@@ -1708,8 +1356,7 @@ mod tests {
     use super::*;
     use crate::capture::SyntheticSource;
 
-    /// **Review item 12.** The warning is one sentence: a wrapped literal that lost its `\`
-    /// continuation printed eighteen spaces in the middle of it and nothing noticed.
+    /// Keep the format warning on one line without literal indentation.
     #[test]
     fn the_refused_format_warning_reads_as_a_sentence() {
         let msg = format_refused(1280, 720, 60);
@@ -1755,7 +1402,7 @@ mod tests {
         h.stop();
     }
 
-    /// A source that never produces a frame, only timeouts — the §6.1 "capture stalled" shape.
+    /// Source that times out without producing frames.
     struct NeverSource;
     impl FrameSource for NeverSource {
         fn next_frame(&mut self) -> Result<CompressedFrame, CaptureError> {
@@ -1770,7 +1417,7 @@ mod tests {
     #[test]
     fn stall_is_derived_from_the_clock_not_from_a_thread() {
         // A source that produces nothing at all: state must become Stalled without anybody
-        // having to notice (§6.1 S1-2), and must never become Disconnected.
+        // having to notice, and must never become Disconnected.
         let s = NeverSource;
         let cfg = PipelineConfig {
             stall_after: Duration::from_millis(20),
@@ -1853,7 +1500,7 @@ mod tests {
         let n = calls.load(Ordering::Relaxed);
         let st = h.stats();
         h.stop();
-        // 200 ms at the 20 ms backoff is ~10 attempts. The bound is deliberately loose: what is
+        // 200 ms at the 20 ms backoff is ~10 attempts. The bound is loose: what is
         // being asserted is "bounded", not a precise rate.
         assert!(
             n < 200,
@@ -1883,9 +1530,8 @@ mod tests {
         assert!(st.capture_errors >= 3);
     }
 
-    /// §6.1 S1-1 and `capture::v4l2` module docs item 4: the `v4l` crate's destructors panic on
-    /// a failed teardown ioctl, on this very thread. A panic must land as `Disconnected` with
-    /// the message, not as a silently dead thread whose pipeline still claims `Running`.
+    /// A source teardown panic must report disconnection instead of leaving a dead
+    /// worker labeled as running.
     #[test]
     fn a_panicking_source_becomes_disconnected_rather_than_killing_the_thread() {
         struct PanicsOnSecondCall(u32);

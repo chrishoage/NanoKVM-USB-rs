@@ -1,18 +1,11 @@
-//! `GET_USB_STRING` (0x0A) replies: the dongle's manufacturer, product and serial strings (A16).
+//! Parsing for CH9329 USB identification strings.
 //!
-//! A16 measured the three strings — `Sipeed` / `NanoKVM-USB` / `BA1612624UJPW2RUJ` — and recorded
-//! that the last one is unit-unique and unrelated to either USB `iSerial`. It did **not** record
-//! the reply bytes, so the shape below is the datasheet's (`[type, len, ascii…]`) with the
-//! one-byte-shorter form accepted too; `SerialLink::get_usb_strings` logs the raw reply at `debug`
-//! so a hardware run can pin a fixture and this can stop hedging.
-//!
-//! Pure, like the rest of [`crate::proto`]: the parsing is defensive because the device's own
-//! `LEN` is its claim and nothing else (§3.2), and because a listing command must not panic on a
-//! string the device made up.
+//! These strings identify an already-open bridge. They cannot establish which serial
+//! node is safe to open during discovery.
 
 use std::fmt;
 
-/// Which of the three strings a `GET_USB_STRING` transaction asks for (Appendix).
+/// Which of the three strings a `GET_USB_STRING` transaction asks for.
 ///
 /// The request payload is the single byte [`UsbStringKind::request_byte`], and the reply is
 /// expected to echo it back as its first byte — which is what makes a mismatched reply detectable
@@ -52,7 +45,7 @@ impl fmt::Display for UsbStringKind {
     }
 }
 
-/// The three strings a unit answers with (A16).
+/// The three strings a unit answers with.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsbStrings {
     pub manufacturer: String,
@@ -114,18 +107,11 @@ impl fmt::Display for UsbStringError {
     }
 }
 
-/// Read one `GET_USB_STRING` reply payload as text (A16).
+/// Parse a `GET_USB_STRING` payload and escape it for display.
 ///
-/// Two shapes are accepted, because A16 did not record which one this chip sends:
-/// `[type, len, ascii…]` when `len` accounts for exactly the bytes that follow it, and
-/// `[type, ascii…]` otherwise. The ambiguity is harmless in the direction that matters — a
-/// length byte that does not describe the rest of the payload is treated as text, which shows up
-/// as an escape in the output rather than silently eating a character.
-///
-/// The text is a **rendering, never the raw bytes**: invalid UTF-8 becomes `U+FFFD` and control
-/// characters become `\u{…}` escapes, so a device that answers with nonsense produces an ugly
-/// line in a listing instead of a panic or a terminal full of control codes (§3.2). The raw
-/// bytes are the caller's to log.
+/// The measured form is `[type, len, ascii…]`. A matching length is consumed; otherwise
+/// the remaining bytes are interpreted as the legacy `[type, ascii…]` form. Invalid
+/// UTF-8 becomes `U+FFFD`, and control characters become `\u{…}` escapes.
 pub fn parse_usb_string(kind: UsbStringKind, data: &[u8]) -> Result<String, UsbStringError> {
     let Some((&type_byte, rest)) = data.split_first() else {
         return Err(UsbStringError::Empty);
@@ -173,7 +159,7 @@ mod tests {
         );
     }
 
-    /// The shape without one. A16 measured the strings but not the bytes, so both are accepted.
+    /// Accept the legacy form without a length byte.
     #[test]
     fn a_reply_with_no_length_byte_is_read_as_text_after_the_type() {
         let data = [0x00, b'S', b'i', b'p', b'e', b'e', b'd'];
@@ -183,9 +169,7 @@ mod tests {
         );
     }
 
-    /// Matching replies by command byte is not enough here: all three answers are `0x8A`, so the
-    /// type byte is the only thing that says which question this one answers (A12 is about the
-    /// command, this is about the sub-question inside it).
+    /// All string replies share command 0x8A; the type byte distinguishes the requested string.
     #[test]
     fn a_reply_for_another_string_type_is_rejected_rather_than_filed_under_this_one() {
         let data = [0x02, b'x'];
@@ -210,8 +194,7 @@ mod tests {
         );
     }
 
-    /// §3.2: the device sends frames its own documented format forbids, so nothing here may
-    /// depend on the payload being sensible. A control byte is escaped, not printed.
+    /// Escape control bytes so device output cannot control the terminal.
     #[test]
     fn unprintable_bytes_are_escaped_rather_than_passed_through() {
         let text = parse_usb_string(UsbStringKind::Serial, &[0x02, b'A', 0x07, 0xFF, b'B'])

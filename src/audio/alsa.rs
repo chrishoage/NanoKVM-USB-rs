@@ -1,53 +1,8 @@
-//! The only file in this crate that mentions ALSA (plan §7.2, §12 Stage 4a).
+//! ALSA capture and playback adapters.
 //!
-//! §7.2's rule is now "link the four, dlopen nothing new": `libc`, `libm`, `libgcc_s` and, from
-//! Stage 4a, `libasound`. Everything above this file is written against [`PcmSource`] and
-//! [`PcmSink`], so the link surface and the untestable-off-hardware surface are the same small
-//! thing — which is the point of putting them together.
-//!
-//! # The capture format is not negotiated
-//!
-//! The dongle offers exactly one: **S16_LE, 2 channels, 48 000 Hz** (`/proc/asound/card8/stream0`,
-//! measured 2026-09-11). So [`AlsaCapture`] asks for exactly that on `hw:N` — the raw device, with
-//! `plug` nowhere near it — and then **reads back what it got and fails if it differs**. Asking
-//! for something and not checking is how a silent resample gets into a path that is supposed to
-//! be a byte copy; and on a device with one format, a mismatch means the card is not the one we
-//! think it is, which is worth a condition rather than a stream of wrong-rate audio.
-//!
-//! `set_rate_resample(false)` is belt and braces on top of that: on `hw:` there is no rate
-//! converter to disable, but the same call would matter if a future caller pointed this at a
-//! `plug` device by accident, and a rate we did not ask for is exactly what it would hide.
-//!
-//! # Playback goes to `default`, deliberately — and it *may* resample
-//!
-//! Not to a named card. `default` is the user's own output — `pipewire-alsa` on this desk, plain
-//! ALSA elsewhere, where the config's `plug` resamples if the hardware cannot do 48 kHz — which
-//! means this client is an ordinary client of whatever the user already uses, with no device
-//! picker, no config file and nothing to get wrong. §7.2: "on a PipeWire desk `default` routes
-//! through `pipewire-alsa` so we are an ordinary PipeWire client without linking PipeWire".
-//!
-//! So the two sides are configured **differently**, and [`HwPlan`] is that difference written
-//! down. §12 Stage 4a says it outright: the capture side takes the dongle's one format or
-//! nothing, and the playback side lets `plug` resample. Disabling resampling on `default` while
-//! also accepting whatever rate it grants is the worst of both — it asks the user's output chain
-//! not to convert and then runs 48 kHz audio into whatever it settled on.
-//!
-//! # What is not tested here, and why that is acceptable
-//!
-//! The two adapters themselves have no tests, and cannot: the failures worth asserting on are
-//! `EBUSY`, a card vanishing mid-read and a sink that goes away, none of which a test may produce
-//! on the user's hardware (CLAUDE.md), and a mock of `libasound` would be a test of the mock.
-//! Everything
-//! those failures *cause* — logged once, surfaced, and isolated from video and input — is tested
-//! against [`crate::audio::pcm`]'s fakes instead, which is where the behaviour actually lives.
-//! What is left here is parameter setting and one error mapping, and the only thing that can
-//! exercise those is the dongle itself — which is why Stage 4a's exit criteria are a hardware run
-//! (a 1 kHz tone found in the captured PCM by [`crate::audio::tone`], and the drift rate measured
-//! over ten minutes) rather than another test in this file.
-//!
-//! The exceptions are [`HwPlan`] and [`wait_ms`]: *which* parameters each side asks for, and how
-//! long a device call may block, are policies rather than device interactions, so they are values
-//! with unit tests that the two `open`s read rather than each spelling the rule out.
+//! Capture requires the device's native S16_LE, stereo, 48 kHz format without resampling.
+//! Playback uses the host's `default` PCM and permits conversion. Non-blocking I/O with
+//! bounded waits lets the workers observe shutdown between periods.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,7 +21,7 @@ pub const PLAYBACK_DEVICE: &str = "default";
 /// What one side asks ALSA for, and what it will accept back.
 ///
 /// Two fields and one rule each, because the two sides are not symmetrical: the capture side is
-/// reading a device with exactly one format and a conversion there would be a silent corruption
+/// reading a device with one format and a conversion there would be a silent corruption
 /// of the thing being measured, while the playback side is a guest in the user's own output chain
 /// and conversion is that chain's job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +33,7 @@ pub struct HwPlan {
 }
 
 impl HwPlan {
-    /// The plan for `side` (§12 Stage 4a).
+    /// PCM configuration for this side.
     pub fn for_side(side: AudioSide) -> HwPlan {
         match side {
             // The dongle offers S16_LE/2ch/48000 and nothing else, so anything else means this is
@@ -97,7 +52,7 @@ impl HwPlan {
     }
 }
 
-/// Turn an `alsa::Error` into the condition it actually is, keeping the device in the message.
+/// Turn an `alsa::Error` into the condition it is, keeping the device in the message.
 ///
 /// The errno is what separates "somebody else has the card" from "the card is gone", and those
 /// two want different words in front of a user: one is fixed by closing something, the other by
@@ -173,8 +128,8 @@ fn configure(
 
     // The *granted* sizes, which are not necessarily the asked-for ones: both setters are
     // `_near`. They are logged rather than enforced because ALSA is entitled to round them, and
-    // the number that matters afterwards — what the device buffer actually is, next to the ring's
-    // configured depth — is otherwise invisible in a session log (§2.8, §5.5).
+    // the number that matters afterwards — what the device buffer is, next to the ring's
+    // configured depth — is otherwise invisible in a session log.
     let period = hw
         .get_period_size()
         .map_err(|e| classify(device, "get_period_size", e))?;
@@ -207,7 +162,7 @@ fn configure(
 
 /// How long one `snd_pcm_wait` may block, in milliseconds: one period, floored.
 ///
-/// **This is what makes shutdown bounded.** The PCMs are opened non-blocking and waited on, so
+/// This is what makes shutdown bounded. The PCMs are opened non-blocking and waited on, so
 /// every device call this module makes returns within a period whether or not any audio arrived;
 /// the loop around it re-checks the stop flag and goes back in. A blocking `readi` on a card that
 /// has been yanked returns when the driver says so and not before, which is a thread
@@ -260,7 +215,7 @@ impl AlsaCapture {
         Self::open_with_stop(device, config, None)
     }
 
-    /// The same, with the flag that interrupts a wait (see [`wait_ms`]).
+    /// The same, with the flag that interrupts a wait (see `wait_ms`).
     pub fn open_with_stop(
         device: &str,
         config: &AudioConfig,
@@ -499,9 +454,8 @@ impl PcmSourceOpener for FixedSourceOpener {
 mod tests {
     use super::*;
 
-    /// §12 Stage 4a in one assertion: the dongle's stream is taken as it is or not at all, and
-    /// the user's own output chain is allowed to convert. Getting this backwards is invisible on
-    /// a desk whose `default` happens to be 48 kHz and is a silent resample everywhere else.
+    /// Capture must keep the native format; host playback may convert. Equal host and
+    /// device rates would hide an accidentally reversed policy.
     #[test]
     fn only_the_playback_side_may_resample() {
         let capture = HwPlan::for_side(AudioSide::Capture);

@@ -1,18 +1,7 @@
-//! The video handoff: **at most one pending owned frame** (§5.2).
+//! A single pending value shared between producer and consumer.
 //!
-//! §5.2 states the requirement and explicitly leaves the data structure open: "whether that is a
-//! mutex-guarded slot, a rendezvous channel, or a capacity-1 channel with replace-on-full is an
-//! implementation choice". This is the mutex-guarded slot, chosen because it gives the producer
-//! the displaced value back — which is what lets the pipeline count a drop *and* recycle the
-//! displaced frame's allocation instead of freeing and reallocating an 8 MB RGBA buffer.
-//!
-//! Anything that can hold two frames accumulates staleness by design, so [`Slot::put`] never
-//! blocks and never queues: it replaces.
-//!
-//! Lock poisoning: the module policy in `capture::lock_or_recover`. A `Slot` guards an
-//! `Option<T>` and three
-//! counters; there is no invariant that an unwind can break, and refusing to serve frames
-//! because some other thread panicked would violate §6.1 S1-1.
+//! New values replace unread ones to bound latency and memory when a consumer falls
+//! behind. Closing wakes waiters; replacement counts expose dropped work.
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -25,10 +14,7 @@ struct State<T> {
     dropped: u64,
 }
 
-/// A one-deep replace-on-full handoff between two threads (§5.2).
-///
-/// Share it as an `Arc<Slot<T>>`: `&self` on every method, so producer and consumer hold the
-/// same object.
+/// Single-value, replace-on-full handoff shared through `Arc<Slot<T>>`.
 pub struct Slot<T> {
     state: Mutex<State<T>>,
     ready: Condvar,
@@ -47,17 +33,10 @@ impl<T> Slot<T> {
         }
     }
 
-    /// Put `v` in the slot, displacing whatever was pending.
+    /// Store `v` without waiting for the consumer.
     ///
-    /// Returns the displaced value, if any. That return is not incidental: the caller counts it
-    /// as a drop (§5.5 tracks "frames dropped pre-decode" and "post-decode" separately) and can
-    /// reuse its allocation for the next frame.
-    ///
-    /// On a closed slot the value is handed straight back — the consumer is gone, so accepting
-    /// it would only leak staleness. That is *not* counted as a drop, because nothing was
-    /// displaced; [`Slot::is_closed`] is how a producer distinguishes the two.
-    ///
-    /// Never blocks.
+    /// Returns the displaced value for drop accounting or allocation reuse. If closed,
+    /// returns `v` without counting a displacement; check [`Slot::is_closed`] to distinguish it.
     pub fn put(&self, v: T) -> Option<T> {
         let mut st = lock_or_recover(&self.state);
         if st.closed {
@@ -74,17 +53,14 @@ impl<T> Slot<T> {
         displaced
     }
 
-    /// Take the pending value if there is one. Never blocks. This is the renderer's call:
-    /// "render takes whatever is pending — no catch-up, no queue drain" (§5.2).
+    /// Take the pending value without waiting.
     pub fn take(&self) -> Option<T> {
         lock_or_recover(&self.state).value.take()
     }
 
-    /// Take the pending value, waiting up to `timeout` for one to arrive.
+    /// Wait up to `timeout` for a value.
     ///
-    /// Returns `None` on timeout **and** on close. A caller that must tell them apart checks
-    /// [`Slot::is_closed`]; the decode thread does exactly that to decide between looping and
-    /// exiting.
+    /// Returns `None` on timeout or close; [`Slot::is_closed`] distinguishes the two.
     pub fn wait_take(&self, timeout: Duration) -> Option<T> {
         let deadline = Instant::now().checked_add(timeout);
         let mut st = lock_or_recover(&self.state);
@@ -133,8 +109,7 @@ impl<T> Slot<T> {
         lock_or_recover(&self.state).closed
     }
 
-    /// How many values have been displaced by [`Slot::put`] over this slot's lifetime — the
-    /// drop counter §5.5 asks to track and report.
+    /// Number of values displaced by [`Slot::put`].
     pub fn dropped(&self) -> u64 {
         lock_or_recover(&self.state).dropped
     }
@@ -275,9 +250,7 @@ mod tests {
         assert_eq!(s.take(), None);
     }
 
-    /// §5.2's real invariant: a frame is delivered exactly once or dropped exactly once, never
-    /// both and never twice. If `put` ever duplicated a value the renderer could show the same
-    /// frame twice while a newer one was freed.
+    /// Every value must be consumed once or dropped once, never both.
     #[test]
     fn no_value_is_ever_duplicated_or_lost() {
         const N: u32 = 5_000;
@@ -300,8 +273,7 @@ mod tests {
                 displaced.push(old);
             }
         }
-        // Rendezvous rather than sleep: wait for the consumer to drain the last value, so
-        // `close()` discards nothing and the accounting below is exact.
+        // Wait for the final consume so closing the slot cannot alter the drop count.
         let deadline = Instant::now() + Duration::from_secs(10);
         while s.is_pending() {
             assert!(Instant::now() < deadline, "consumer never drained the slot");

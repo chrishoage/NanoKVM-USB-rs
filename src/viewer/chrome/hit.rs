@@ -1,22 +1,7 @@
-//! Is the pointer over the chrome? Our own hit test, in physical pixels (plan §12 Stage 4b).
+//! Menu hit testing across physical pixels and egui points.
 //!
-//! [`super::route::RouteInputs::pointer_over_chrome`] is the one input to the routing rule that
-//! has to be *computed*, and it is computed here rather than taken from
-//! `egui::Context::is_pointer_over_area()` for two reasons:
-//!
-//! - **Units.** The viewer thinks in physical pixels throughout — `input_map::map_cursor` maps a
-//!   `PhysicalPosition` onto the video rectangle — while egui thinks in points. On a fractionally
-//!   scaled output the two differ by `pixels_per_point`, and a hit test that forgot the conversion
-//!   would misplace the pill by exactly that factor. The conversion is in one place, here, with a
-//!   test at 1.0 and at 1.5.
-//! - **Testability.** `is_pointer_over_area()` is an opaque predicate over egui's internal layer
-//!   state. A rectangle is a rectangle: it can be asserted directly, and the assertion is what
-//!   makes "a button never lands on the wrong side" a checked claim rather than a hope.
-//!
-//! Both are one frame stale — the rectangles come from the layout egui produced last frame — and
-//! that is accepted. Motion is safe either way (the viewer sends no blind click, and the CLI has
-//! no mouse path at all), but a *button* landing on the wrong side is not, and the pill is
-//! draggable, so the rectangle moves.
+//! Scale conversion must use the same factor as layout. Invalid scale factors fall back
+//! to one to avoid division by zero or non-finite hit rectangles.
 
 /// The chrome's rectangles for one frame, in egui points, with the scale that maps them to the
 /// physical pixels winit reports.

@@ -1,23 +1,8 @@
-//! The one test that needs the dongle and the target. Feature-gated and `#[ignore]`d, never
-//! gating CI (§9.3).
+//! Serial input verification against bridge 1a86:55d3 and the connected target.
 //!
-//! ```text
-//! cargo test --features hardware --test serial_hardware -- --ignored --nocapture
-//! ```
-//!
-//! **It verifies by consequence, not by acknowledgement** (§3.4, §12 Stage 1, A17). This device
-//! acknowledges requests it does not act on — a mouse report missing its mode byte gets a clean
-//! `0x84` ack and the pointer never moves — so an ack proves only that the chip parsed the frame.
-//! The consequence asserted here is the CapsLock bit, which originates in the *target's* HID
-//! output report (Appendix, A12): if it changes, the target processed the keystroke. That is the
-//! end-to-end check that needs no video.
-//!
-//! **It leaves the target as it found it.** CapsLock is pressed twice, so the bit ends where it
-//! started, and a `Drop` guard sends release-all — zeroed keyboard report and an all-buttons-up
-//! mouse report — on every path out, including a panic.
-//!
-//! **It never sends a mouse button.** A click on a live desktop can launch or destroy something.
-//! The only mouse frame here is the idle report (fixture `mouse_rel_idle`): no buttons, no motion.
+//! Verify that `/dev/ttyACM1` still names the intended bridge before running. Tests
+//! check returned CapsLock changes and attempt release on exit. Run one binary at
+//! a time with `--test-threads=1`; leave the user's bus-5 hardware untouched.
 
 #![cfg(feature = "hardware")]
 
@@ -32,12 +17,11 @@ use nanokvm::proto::report::{KeyboardReport, MOUSE_RELEASE_ALL};
 use nanokvm::serial::SerialLink;
 use serde::Deserialize;
 
-/// The dongle's serial node on this desk (CLAUDE.md). `/dev/ttyACM0` is unrelated hardware and is
+/// The dongle's serial node on the recorded test setup (CLAUDE.md). `/dev/ttyACM0` is unrelated hardware and is
 /// never opened.
 const PORT: &str = "/dev/ttyACM1";
 const TIMEOUT: Duration = Duration::from_millis(500);
-/// The push arrives about 15 ms after a lock-key change, 4 times out of 4 (A12). 500 ms is the
-/// window the plan asks for.
+/// Allow 500 ms for a lock-state push; recorded responses arrived around 15 ms.
 const FLIP_WINDOW: Duration = Duration::from_millis(500);
 
 // -- fixtures ---------------------------------------------------------------
@@ -54,7 +38,7 @@ struct Entry {
     data: Vec<u8>,
 }
 
-/// A request payload from `fixtures/packets/ch9329.toml`, which is the authority (§9.1).
+/// A request payload from `fixtures/packets/ch9329.toml`, which is the authority.
 fn payload(name: &str) -> Vec<u8> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/packets/ch9329.toml");
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -70,7 +54,6 @@ fn payload(name: &str) -> Vec<u8> {
 // -- the release-all guard --------------------------------------------------
 
 /// Owns the link and sends release-all when it goes out of scope, however it goes out of scope
-/// (§2.6: release-all on clean shutdown; the same applies to a failed test).
 struct Released(SerialLink);
 
 impl Deref for Released {
@@ -95,7 +78,7 @@ impl Drop for Released {
         ] {
             match self.0.transact(command, data, TIMEOUT) {
                 Ok(_) => eprintln!("[release-all] {name} report sent"),
-                // §2.6.1: an unsent release is worth saying out loud, not hiding.
+                // Cleanup failure must remain visible because the target may still hold keys.
                 Err(e) => eprintln!("[release-all] {name} report UNSENT: {e}"),
             }
         }
@@ -105,7 +88,7 @@ impl Drop for Released {
 // -- helpers ----------------------------------------------------------------
 
 /// Press and release CapsLock. Two frames, each acknowledged; the ack is timed but asserted on
-/// only as "the chip parsed it" (§3.4).
+/// only as "the chip parsed it".
 fn tap_caps_lock(link: &mut SerialLink) -> (Duration, Duration) {
     let press = payload("kb_capslock_press");
     let release = payload("kb_release_all");
@@ -124,7 +107,7 @@ fn tap_caps_lock(link: &mut SerialLink) -> (Duration, Duration) {
 }
 
 struct Flip {
-    /// When the unsolicited `0x81` push reporting the new state arrived (A12).
+    /// When the unsolicited `0x81` push reporting the new state arrived.
     via_push: Option<Duration>,
     /// When a `GET_INFO` first reported the new state.
     via_query: Option<Duration>,
@@ -199,7 +182,7 @@ fn caps_lock_round_trip_proves_the_target_processed_the_keystroke() {
     );
     assert_eq!(
         flipped.info.caps_lock, want,
-        "the lock bit did not change: the target did not process the keystroke (§3.4)"
+        "the lock bit did not change: the target did not process the keystroke "
     );
 
     // -- and back, so the target is left as it was found -------------------

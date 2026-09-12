@@ -1,38 +1,8 @@
-//! The bounded period ring and the drift policy, both pure (plan §4.1 rev 5, §12 Stage 4a).
+//! Bounded PCM period ring and clock-drift correction.
 //!
-//! Nothing in this file knows what ALSA is. That is deliberate and it is the whole reason the
-//! module is split this way: the two audio threads are thin, and everything that can be reasoned
-//! about — what happens when the producer outruns the consumer, what the consumer is handed when
-//! there is nothing to hand it, and what keeps two crystals from drifting the ring into one of
-//! those two walls for the rest of a session — is a value type with unit and property tests.
-//!
-//! # The three things that can go wrong, and which counter each is
-//!
-//! | | cause | policy | counted as |
-//! | --- | --- | --- | --- |
-//! | **Overrun** | the ring is *full* and a period arrives | drop the oldest period | `overruns` |
-//! | **Underrun** | the ring is *empty* and a period is wanted | hand over silence | `underruns` |
-//! | **Drift** | the level *stays* near a wall | drop or insert one period, early | `drift_drops` / `drift_inserts` |
-//!
-//! The first two are failures: something stalled. The third is not — it is the correction that
-//! stops the first two from happening at all, and §12 Stage 4a requires it to be counted
-//! *separately* for exactly that reason. A session that shows `drift_drops 6, overruns 0` after an
-//! hour is working as designed; one that shows `overruns 6` dropped six periods of audio because
-//! something went wrong.
-//!
-//! # Why drift needs a policy at all
-//!
-//! **The capture and playback clocks are different crystals** (§12 Stage 4a). The dongle's ADC
-//! and the host's DAC both believe they run at 48 000 Hz and neither does; a few parts per
-//! million between them is a sample every few seconds, one whole period every few minutes, and
-//! over a long session the ring either fills or drains no matter how big it is. So the choice is
-//! not *whether* a period is lost or repeated but *when* — a period dropped deliberately at a
-//! high-water mark, from a ring that is still doing its job, or one dropped by an overrun after
-//! the buffer has already collapsed to nothing. [`DriftPolicy`] is the first of those.
-//!
-//! It waits for a *streak* rather than acting on a single observation ([`DriftPolicy::hold`]),
-//! because the level swings by a period or two on ordinary scheduling jitter and correcting for
-//! jitter would throw away audio for no reason.
+//! Sustained high occupancy drops a period; sustained low occupancy inserts silence.
+//! Push and pop track their own streaks so a correction cannot be consumed on the wrong
+//! side. Underruns and overruns reset drift history and are counted separately.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -57,41 +27,12 @@ pub struct RingConfig {
 }
 
 impl Default for RingConfig {
-    /// 8 × 480 frames: 80 ms of buffer in 10 ms steps.
+    /// Default ring: eight 480-frame periods, or 80 ms capacity at 48 kHz.
     ///
-    /// The period is 10 ms because the device produces 1 ms USB packets (`Data packet interval:
-    /// 1000 us`, measured) and a 10 ms period is ten of them — short enough that the ring is not
-    /// the dominant latency, long enough that the two threads wake 100 times a second rather than
-    /// 1000.
-    ///
-    /// # The depth is 8 because of a measurement, not because 8 is a round number
-    ///
-    /// §12 Stage 4a requires the drift rate to be measured on hardware over at least ten minutes
-    /// and **the depth to be chosen from that number**. Measured on this desk **2026-09-11 over
-    /// 720 s** of steady state (`tests/audio_hardware.rs::drift_over_ten_minutes`, card8 to a
-    /// PipeWire null sink): 71 999 periods captured, 72 000 written, one drift insert, **zero
-    /// overruns and zero underruns**. That is one period of net imbalance in twelve minutes:
-    ///
-    /// ```text
-    ///   480 frames / (720 s x 48 000 Hz) = 13.9 ppm, the resolution of the measurement itself,
-    ///   with the sign saying the host's clock is the faster of the two.
-    /// ```
-    ///
-    /// So **the drift does not size this ring**. At 14 ppm the two clocks take
-    /// `480 / (48 000 x 14e-6) = 714 s` — twelve minutes — to move the level by a single period,
-    /// and the ring's operating level is two periods (see [`crate::audio::AudioConfig::prefill_periods`]),
-    /// leaving five periods of headroom above and one below before a correction fires. A ring
-    /// sized for drift alone could be three periods deep.
-    ///
-    /// What sizes it is scheduling: the depth has to cover the longest gap either thread can go
-    /// without being run. Eight periods is 80 ms, and the twelve-minute run recorded **no xrun in
-    /// either direction** on a desk that was also decoding 1080p60 video and playing the user's
-    /// own audio. Four would probably do and has no evidence behind it; sixteen would double a
-    /// latency nothing asked to be doubled. Eight stays, now for a stated reason.
-    ///
-    /// It is labelled *configured* everywhere it is surfaced (§5.5), never as an end-to-end
-    /// latency: the real path also holds `device_periods` periods in each sound card's own
-    /// buffer, and everything PipeWire does afterwards is not measurable from here.
+    /// Ten-millisecond periods bound wake-up overhead. The depth provides scheduling
+    /// headroom: two recorded 720-second runs had no xruns and about 14 ppm drift.
+    /// That drift alone takes roughly twelve minutes to move occupancy by one period.
+    /// See `docs/hardware.md` for measurement conditions.
     fn default() -> Self {
         RingConfig {
             periods: 8,
@@ -107,12 +48,8 @@ impl RingConfig {
         self.period_frames * CHANNELS
     }
 
-    /// The configured depth as a duration, at [`SAMPLE_RATE`].
-    ///
-    /// **Configured, not measured.** It is what the ring can hold, not what any sample actually
-    /// experienced end to end: §5.5's rule is that a number is named for what it is, and this one
-    /// excludes the ALSA device buffers on both sides, the USB transfer, and everything the
-    /// playback sink does afterwards.
+    /// Configured capacity at [`SAMPLE_RATE`]. Excludes device buffers, USB transfer,
+    /// and playback processing; this is not measured end-to-end latency.
     pub fn depth(&self) -> Duration {
         Duration::from_nanos(
             (self.periods as u64 * self.period_frames as u64 * 1_000_000_000) / SAMPLE_RATE as u64,
@@ -144,9 +81,9 @@ pub enum DriftAction {
     InsertOne,
 }
 
-/// When to spend one period to keep the ring off its walls (§12 Stage 4a).
+/// When to spend one period to keep the ring off its walls.
 ///
-/// Pure, and deliberately trivial to reason about: it sees one number — the fill level — and
+/// Pure, and trivial to reason about: it sees one number — the fill level — and
 /// returns one of three answers. It has no clock, so a test is a list of levels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriftPolicy {
@@ -218,7 +155,7 @@ impl DriftPolicy {
     /// The same on the way out, and only ever [`DriftAction::Hold`] or
     /// [`DriftAction::InsertOne`].
     ///
-    /// **The two sides count separately** rather than sharing one observation. A single counter
+    /// The two sides count separately rather than sharing one observation. A single counter
     /// fed from both push and pop can consume a low-side streak inside a push, which is where the
     /// correction it earned is then thrown away — the level reaches the mark, the streak
     /// completes on the wrong call, and nothing happens. Two counters, one per direction, cannot
@@ -241,16 +178,15 @@ impl DriftPolicy {
     /// Called by [`PeriodRing`] on every overrun and every underrun, because an xrun means the
     /// level was at a wall and not drifting towards one: one side has stopped. A streak counted
     /// through a stall is a measurement of the stall, and acting on it would drop or insert a
-    /// period for a clock difference that was never observed — which is exactly what makes
-    /// `drift_drops` readable as a drift rate afterwards (§12 Stage 4a).
+    /// period for a clock difference that was never observed — which is what makes
+    /// `drift_drops` readable as a drift rate afterwards.
     pub fn reset(&mut self) {
         self.high_streak = 0;
         self.low_streak = 0;
     }
 }
 
-/// Everything the ring has done, for the title and the stats line (§2.8: surfaced, never silently
-/// absorbed).
+/// Ring transfer, xrun, and clock-drift counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RingCounts {
     /// Periods handed to [`PeriodRing::push`].
@@ -302,11 +238,7 @@ pub enum PopOutcome {
     DriftInserted,
 }
 
-/// A bounded FIFO of whole periods with §4.1's two policies built in.
-///
-/// Push and pop both consult the [`DriftPolicy`] on the way, so the threads on either side of it
-/// contain no policy at all: the capture thread pushes what it read and the playback thread
-/// writes what it was given.
+/// Bounded FIFO of whole periods with drift correction on both push and pop.
 #[derive(Debug)]
 pub struct PeriodRing {
     config: RingConfig,
@@ -355,26 +287,10 @@ impl PeriodRing {
         self.queue.len() >= self.config.periods
     }
 
-    /// Queue one period, displacing the oldest if there is no room.
+    /// Queue a period, dropping the oldest when full to keep playback current.
     ///
-    /// **Oldest first, and whole periods.** §4.1: "the ring between them is bounded and drops
-    /// whole periods, oldest first, counting what it dropped". Dropping the *newest* would be
-    /// cheaper and is wrong — it would hand the listener a growing delay and then a jump, where
-    /// dropping the oldest keeps the audio current, which is the only property that matters for a
-    /// live KVM.
-    ///
-    /// **A drift correction happens only on a ring that is still doing its job**: not empty, and
-    /// not already at its wall. A ring nobody is draining sits pinned at `periods` for as long as
-    /// the stall lasts, and every push there is an *overrun* — counting those as drift would
-    /// report a stalled sink as a clock difference and would make the drift rate §12 Stage 4a
-    /// asks for unreadable. The overrun also clears both streaks, for the same reason.
-    ///
-    /// # Panics
-    ///
-    /// If `period` is not [`RingConfig::period_samples`] long. That is a programming error in the
-    /// caller, not a device condition: every source this ring is fed from reads exactly one
-    /// period, and a short buffer would desynchronise the stream silently for the rest of the
-    /// session.
+    /// Drift drops apply only while the ring is neither empty nor full. A full ring
+    /// is counted as overrun and resets drift streaks.
     pub fn push(&mut self, period: Vec<i16>) -> PushOutcome {
         assert_eq!(
             period.len(),
@@ -399,17 +315,10 @@ impl PeriodRing {
         outcome
     }
 
-    /// Take the oldest period, or silence if there is none.
+    /// Take the oldest period or return silence when empty.
     ///
-    /// **Never `None`.** The playback side must write something on every turn or the sink itself
-    /// underruns, which is an audible click and an ALSA state to recover from rather than a
-    /// counter. §4.1: "on underrun play silence and count".
-    ///
-    /// **A drift insert happens only while there is still something to hand over.** An empty ring
-    /// is an underrun, whatever the streak says: a capture side that has stopped keeps the level
-    /// at zero for as long as it is gone, and calling those silent periods "drift" would both
-    /// hide the outage and invent a clock difference from it. The underrun clears both streaks
-    /// for the same reason.
+    /// An empty ring counts as underrun and resets drift streaks. Drift inserts require
+    /// a nonempty ring so a capture outage is not classified as clock drift.
     pub fn pop(&mut self) -> (Vec<i16>, PopOutcome) {
         let wanted = self.drift.on_pop(self.queue.len());
         if wanted == DriftAction::InsertOne && !self.queue.is_empty() {
@@ -545,10 +454,7 @@ mod tests {
         assert_eq!(r.counts().overruns, 0, "the ring never reached its wall");
     }
 
-    /// A playback side that has stopped: pushes only, for ever. The ring fills, pins at its wall
-    /// and overruns — and **none of that is drift**. A correction that fired here would be
-    /// counted as a clock difference in the §12 Stage 4a measurement, which is read from exactly
-    /// these counters.
+    /// A stopped consumer produces overruns, not clock-drift corrections.
     #[test]
     fn a_ring_nobody_drains_overruns_rather_than_reporting_drift() {
         let drift = DriftPolicy::with_marks(3, 1, 2);

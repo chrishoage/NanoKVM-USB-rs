@@ -1,21 +1,4 @@
-//! The command-line surface of Stage 3 (plan §12, §8, §10.2), run against the built binary.
-//!
-//! Two things here are contract rather than cosmetics, and both are invisible to a unit test:
-//!
-//! - **A subcommand opens only the node it needs and never starts the viewer.** Nothing in the
-//!   library would notice if `key` began requiring a video node, or if `shot` brought up the
-//!   input writer; the evidence has to come from running the binary and reading what it says.
-//! - **`devices --probe` opens only a serial node discovery paired, or the one `--serial` named.**
-//!   On this desk `/dev/ttyACM0` is an unrelated device on the user's hub (CLAUDE.md), so "which
-//!   node would be opened" is tested as a pure function in `cli::devices`, and what this file
-//!   pins is that the probe's traffic is exactly one `GET_INFO` and three `GET_USB_STRING` — no
-//!   keyboard or pointer frame reaches a device whose identity is still being established.
-//!
-//! No hardware and no display. The only device any test here opens is the pty fake; every other
-//! path is one that cannot exist, and discovery is pointed at a **recorded** desk with
-//! `--sysfs-root` so that these runs enumerate a fixture rather than whatever is plugged into the
-//! machine. `/dev/video0`–`3` and `/dev/ttyACM0` are the user's hardware and are never named, not
-//! even as a path expected to fail.
+//! Command syntax, help, device selection, and access boundaries through the built binary.
 
 #[path = "support/child_guard.rs"]
 mod child_guard;
@@ -59,7 +42,7 @@ struct Ran {
 
 /// Run the binary against the fixture desk, bounded, killing it if it overruns.
 ///
-/// Every child goes through [`ChildGuard`], whose `Drop` kills and reaps: `Command::output()` waits
+/// Every child goes through [`ChildGuard`], whose `Drop` kills and reaps: `Command::output` waits
 /// for as long as the child cares to run, and an assertion that unwinds past a live child leaves
 /// it running.
 fn run(args: &[&str]) -> Ran {
@@ -116,22 +99,21 @@ fn the_help_lists_every_subcommand_and_still_describes_the_viewer() {
         assert!(text.contains(command), "no {command} in:\n{text}");
     }
     assert!(
-        text.contains("Capture and release:"),
+        text.contains("Viewer controls:"),
         "the viewer is still what `nanokvm` with no subcommand does:\n{text}"
     );
 }
 
-/// §10.2: the layout belongs to the *target* and the host cannot observe it, so the help must say
-/// so and must state the default rather than leave the user to assume one.
+/// Help must identify the target layout and its default; the host cannot infer it.
 #[test]
 fn the_type_help_states_the_default_layout_and_whose_layout_it_is() {
     let out = run(&["type", "--help"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("[default: us]"), "{text}");
-    assert!(text.contains("TARGET"), "{text}");
+    assert!(text.contains("Target keyboard layout"), "{text}");
     // The grammar the compiler implements, shared verbatim with `src/script/`.
-    assert!(text.contains("CHORD grammar"), "{text}");
+    assert!(text.contains("Key chords"), "{text}");
 }
 
 #[test]
@@ -149,8 +131,7 @@ fn a_viewer_flag_with_a_subcommand_is_a_usage_error() {
     for (argv, flag) in [
         (vec!["--pointer", "relative", "devices"], "--pointer"),
         (vec!["devices", "--pointer", "relative"], "--pointer"),
-        // §12 Stage 4a's flag is a viewer flag like the others: `devices` opens no card, so
-        // "do not open the card" is meaningless to it and saying nothing would be worse.
+        // Reject viewer-only audio flags on commands that never open an audio device.
         (vec!["--no-audio", "devices"], "--no-audio"),
         (vec!["devices", "--no-audio"], "--no-audio"),
     ] {
@@ -161,7 +142,7 @@ fn a_viewer_flag_with_a_subcommand_is_a_usage_error() {
     }
 }
 
-/// A global written **before** the subcommand is how most people type it, and it is not a mistake:
+/// A global written before the subcommand is how most people type it, and it is not a mistake:
 /// `nanokvm --serial X devices` and `nanokvm devices --serial X` are the same command. The first
 /// used to be a usage error, because the setting that refused a viewer flag refused these too.
 #[test]
@@ -202,9 +183,7 @@ fn the_listing_names_the_pair_of_the_recorded_desk() {
     );
 }
 
-/// §12 Stage 4a: `nanokvm devices` prints the paired card. The recorded desk's dongle carries
-/// `card8` on the same USB device as `/dev/video4`, and the listing says so with the evidence —
-/// which is the strongest §8 has, and the one the video-and-serial pairing cannot have here.
+/// The listing must expose both the paired card and its same-device evidence.
 #[test]
 fn the_listing_names_the_paired_sound_card_and_the_evidence_for_it() {
     let out = run(&["devices"]);
@@ -221,7 +200,7 @@ fn the_listing_names_the_paired_sound_card_and_the_evidence_for_it() {
     );
     assert!(
         text.contains("same USB device as the capture node (busnum:devnum) — proof"),
-        "the audio pairing states its evidence, which is §8's strongest:\n{text}"
+        "the audio pairing states its evidence, which is 's strongest:\n{text}"
     );
     // The webcam's card is in the same recording and belongs to someone else's hardware.
     assert!(
@@ -234,11 +213,8 @@ fn the_listing_names_the_paired_sound_card_and_the_evidence_for_it() {
     );
 }
 
-/// And a desk with no sound card at all says "no audio" honestly rather than leaving the line out.
-/// The SuperSpeed reconstruction is exactly that desk: `topology.md` recorded the dongle's two
-/// device nodes and nothing about its audio interface, so the tree has no card to find (see
-/// `fixtures/sysfs/MANIFEST.md`). The pairing must be unaffected, which is §4.1 rev 5's whole
-/// point about audio being a side channel.
+/// The SuperSpeed reconstruction has no sound card. Missing audio must not
+/// prevent video/serial pairing or disappear silently from the listing.
 #[test]
 fn a_desk_with_no_sound_card_says_no_audio_rather_than_leaving_the_line_out() {
     let root = nanokvm::discovery::testing::fixture("usb3-stage0")
@@ -277,8 +253,7 @@ fn a_desk_with_no_sound_card_says_no_audio_rather_than_leaving_the_line_out() {
 
 // ---- devices -------------------------------------------------------------------------------
 
-/// The listing answers the command line it was given (review finding 7): both paths are named,
-/// neither is a node discovery enumerated, and both are still what would be used (§8).
+/// Explicit paths must remain visible even when discovery did not enumerate them.
 #[test]
 fn devices_honours_the_flags_on_its_own_command_line_and_exits_zero() {
     let out = run(&["devices", "--serial", ABSENT, "--video", ABSENT]);
@@ -295,9 +270,7 @@ fn devices_honours_the_flags_on_its_own_command_line_and_exits_zero() {
     );
 }
 
-/// `--probe` prints what the link says about itself — and asks nothing else. An unidentified
-/// serial port must never be sent an input report (§3.4: an ack is not evidence of effect, and
-/// here it would be evidence written into someone else's device).
+/// A discovery probe may query information but must never send input reports.
 #[test]
 fn a_probe_reports_the_firmware_and_the_usb_strings_and_sends_nothing_else() {
     let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn the fake CH9329");
@@ -396,10 +369,8 @@ fn shot_resolves_only_the_video_node_and_starts_no_viewer() {
     );
 }
 
-/// `key --serial …` must work without `--video`: §8's override names the one node this command
-/// opens, and there is nothing left to infer. Reaching the *open* is the proof — a `key` that
-/// still demanded a pair would have died in discovery instead, naming the video node it does not
-/// need.
+/// An explicit serial path makes keyboard commands independent of video discovery.
+/// Reaching the open proves selection did not require a video pair.
 #[test]
 fn key_needs_no_video_node_and_starts_no_viewer() {
     let out = run(&["key", "--serial", ABSENT, "a"]);

@@ -1,13 +1,4 @@
-//! `serial` against the pty fake (§9.3). The `SerialLink` under test is the real one, unmodified;
-//! only the far end of the port is synthetic.
-//!
-//! Every reply the fake sends is either loaded from `fixtures/packets/ch9329.toml` or asserted
-//! against it, because that file is the authority for byte-level correctness (§9.1) and retyping
-//! its bytes is how a transcription bug silently blesses a wrong transport.
-//!
-//! Nothing here sleeps as its only guard. Where a test must act between two events on the link it
-//! uses the fake's own knobs — `wait_for_received`, `inject_before_reply`, `drop_next_reply` —
-//! which are exact rather than merely likely.
+//! Real serial transport against a pseudo-terminal bridge with controlled replies.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +9,7 @@ use nanokvm::serial::fake::{Behaviour, FakeCh9329};
 use nanokvm::serial::{OpenOptions, SerialLink};
 use serde::Deserialize;
 
-// -- the fixture file, read exactly as tests/proto_fixtures.rs reads it -----
+// -- the fixture file, read as tests/proto_fixtures.rs reads it -----
 
 #[derive(Debug, Deserialize)]
 struct Fixtures {
@@ -31,7 +22,7 @@ struct Fixtures {
 }
 
 /// A `[[disagreement]]` entry: where the wire parted company with the documented frame format
-/// (§9.1). Only the observed bytes are needed here — the note is the finding, not the test.
+/// . Only the observed bytes are needed here — the note is the finding, not the test.
 #[derive(Debug, Deserialize)]
 struct Disagreement {
     name: String,
@@ -83,9 +74,7 @@ fn frame(name: &str) -> Vec<u8> {
     hex_prefix(&entry(name).frame)
 }
 
-/// The bytes a `[[disagreement]]` says the device really sent, e.g. the §3.2 five-byte reply with
-/// no checksum byte. Read from the file for the same reason as everything else here: retyping the
-/// anomaly is how a test stops testing the anomaly.
+/// Read malformed replies from the fixture so the test preserves the recorded anomaly.
 fn observed_reply(name: &str) -> Vec<u8> {
     let d = fixtures()
         .disagreement
@@ -126,7 +115,7 @@ fn kb_release_all() -> Vec<u8> {
     payload("kb_release_all")
 }
 
-// -- 1. open + get_info (§12 Stage 1: no handshake beyond GET_INFO) ---------
+// -- 1. open + get_info ---------
 
 #[test]
 fn get_info_reports_version_1_8_target_connected_and_locks_off() {
@@ -151,13 +140,13 @@ fn get_info_reports_version_1_8_target_connected_and_locks_off() {
     assert_eq!(link.stats().unsolicited, 0);
 }
 
-// -- 2. matched by command byte, not arrival order (§9.2 item 6, A12) ------
+// -- 2. matched by command byte, not arrival order ------
 
 #[test]
 fn a_reply_is_matched_by_command_byte_not_by_arrival_order() {
     let (fake, mut link) = rig(default_script());
 
-    // The A12 ordering exactly: a lock-state push lands between the request and its ack.
+    // Interleave a lock-state push between request and acknowledgement.
     fake.inject_before_reply(&frame("get_info_reply_caps_on"));
 
     let reply = link
@@ -185,7 +174,7 @@ fn a_reply_is_matched_by_command_byte_not_by_arrival_order() {
     assert_eq!(stats.late_replies, 0, "this one was never requested at all");
 }
 
-// -- 3. fragmentation, leading garbage, and sustained traffic (§9.2 item 6) -
+// -- 3. fragmentation, leading garbage, and sustained traffic -
 
 #[test]
 fn a_reply_split_byte_by_byte_is_reassembled() {
@@ -237,7 +226,7 @@ fn two_hundred_sequential_transacts_all_succeed() {
     assert_eq!(fake.received().len(), 200);
 }
 
-// -- 4. error frames are surfaced, never dropped (§3.1, A14) ---------------
+// -- 4. error frames are surfaced, never dropped ---------------
 
 #[test]
 fn an_error_frame_surfaces_as_link_error_device_and_the_link_survives() {
@@ -269,14 +258,14 @@ fn an_error_frame_surfaces_as_link_error_device_and_the_link_survives() {
     fake.accept_cmd(cmd::SEND_KB_GENERAL_DATA);
     let reply = link
         .transact(cmd::SEND_KB_GENERAL_DATA, &kb_release_all(), TIMEOUT)
-        .expect("the link recovers immediately (§3.1)");
+        .expect("the link recovers immediately ");
     assert_eq!(reply.cmd, cmd::SEND_KB_GENERAL_DATA | 0x80);
 }
 
 #[test]
 fn the_fakes_bad_checksum_path_answers_with_the_fixture_error_frame() {
-    // Covers the half of §3.1 the test above cannot reach through `SerialLink`: a genuinely
-    // corrupt frame on the wire, answered by `cmd | 0xC0` with 0xE4.
+    // Send a corrupt checksum through the raw port; the device should return
+    // `cmd | 0xC0` with status 0xE4.
     let fake = FakeCh9329::spawn(default_script()).expect("spawn");
     let mut port = serialport::new(fake.slave_path().to_string_lossy().as_ref(), 57600)
         .timeout(Duration::from_millis(500))
@@ -294,7 +283,7 @@ fn the_fakes_bad_checksum_path_answers_with_the_fixture_error_frame() {
     assert_eq!(got, want);
 }
 
-// -- 5. the five-byte reply with no checksum byte (§3.2, A13) --------------
+// -- 5. the five-byte reply with no checksum byte --------------
 
 #[test]
 fn the_five_byte_no_checksum_reply_times_out_and_the_link_still_works() {
@@ -330,7 +319,7 @@ fn the_five_byte_no_checksum_reply_times_out_and_the_link_still_works() {
     assert!(info.target_connected);
 }
 
-// -- 6. hang-up (§2.7's precondition; A15's "the link is not trusted") -----
+// -- 6. hang-up -----
 
 #[test]
 fn a_hang_up_takes_the_link_down_promptly_and_the_reader_thread_joins() {
@@ -377,7 +366,7 @@ fn a_hang_up_takes_the_link_down_promptly_and_the_reader_thread_joins() {
     );
 }
 
-// -- 7. every request was one contiguous well-formed frame (§5.1, A15) ----
+// -- 7. every request was one contiguous well-formed frame ----
 
 #[test]
 fn every_request_reached_the_device_as_one_contiguous_well_formed_frame() {
@@ -463,7 +452,7 @@ fn a_late_reply_is_not_mistaken_for_the_next_requests_reply() {
 #[test]
 fn a_short_get_info_payload_is_an_io_error_and_leaves_the_link_up() {
     let (_fake, mut link) = rig(Behaviour {
-        // Two bytes: not enough for [version, connected, locks] (§3.2 — device lengths are claims).
+        // Two bytes: not enough for [version, connected, locks].
         get_info_payload: vec![0x38, 0x01],
         ..Behaviour::default()
     });
@@ -495,7 +484,7 @@ fn an_unsolicited_push_with_no_request_in_flight_is_still_delivered() {
 
 /// Poll `garbage_bytes` up to a deadline, the way the fake's own `wait_for_received` polls.
 ///
-/// The count is folded by the **reader thread**, which is not synchronised with `transact`:
+/// The count is folded by the reader thread, which is not synchronised with `transact`:
 /// `get_info` returns as soon as its own reply is routed, and the bytes injected ahead of it may
 /// still be in flight in the parser. Asserting the total immediately is therefore a race — it
 /// failed about one run in sixteen — and the fix is the one the rest of this file already uses:
@@ -539,18 +528,18 @@ fn open_options_are_honoured_and_a_missing_port_is_reported_as_down() {
     assert!(matches!(err, LinkError::Down(_)), "got {err:?}");
 }
 
-// -- 9. the resynchronisation window after a timeout (§3.1, §5.1, A11, A12) -----------------
+// -- 9. the resynchronisation window after a timeout -----------------
 //
 // The four tests below are the ones the review turned up. The device's reply to a request that
 // already gave up is byte-identical to the reply the next request of that command is waiting for,
-// and the input writer sends one command byte over and over (§2.6, A11), so the transport cannot
+// and the input writer sends one command byte over and over, so the transport cannot
 // tell them apart by content. It tells them apart in time instead: after a timeout the next
 // request waits for the link to fall quiet, and until it does, a frame answering the timed-out
 // command is diverted rather than delivered.
 
 /// The defect the review found: `route` preferred the in-flight slot, so the reply to a request
 /// that had already timed out was handed to the *next* request of the same command — reporting a
-/// success for a frame the device may never have parsed (§3.4, A17). Here the second request is
+/// success for a frame the device may never have parsed. Here the second request is
 /// never answered at all, so anything delivered to it can only be the first request's.
 #[test]
 fn a_late_reply_is_never_handed_to_the_next_transact_of_the_same_command() {
@@ -651,10 +640,8 @@ fn a_late_reply_inside_the_quiet_window_is_diverted_and_the_next_transact_gets_i
     assert_eq!(fake.received().len(), 2);
 }
 
-/// The window must not become a hang. Here the device chatters without pause, and with acks for
-/// the very command that timed out — the worst case, since every one of them is a candidate late
-/// reply. `transact` waits at most twice `quiet_after_timeout` and then writes anyway (§2.6: this
-/// is the thread that delivers release-alls).
+/// Continuous late replies must not postpone a release indefinitely. The quiet
+/// window is bounded at twice `quiet_after_timeout` even while the device chatters.
 #[test]
 fn the_quiet_window_is_bounded_when_the_device_will_not_stop_talking() {
     let quiet = Duration::from_millis(100);
@@ -714,7 +701,7 @@ fn the_quiet_window_is_bounded_when_the_device_will_not_stop_talking() {
 /// The second defect the review found: when the unsolicited receiver had been dropped, the failed
 /// `send` stopped the reader thread without marking the link down, so every later `transact` burnt
 /// its whole timeout against a link still reporting itself healthy. Dropping the receiver is a
-/// supported thing to do (§4.1) and must cost nothing but the frames themselves.
+/// supported thing to do and must cost nothing but the frames themselves.
 #[test]
 fn dropping_the_unsolicited_receiver_leaves_the_link_hearing_and_working() {
     let (fake, mut link) = rig(default_script());
@@ -722,7 +709,7 @@ fn dropping_the_unsolicited_receiver_leaves_the_link_hearing_and_working() {
         .expect("the first report is acknowledged");
     let before = link.stats().frames_rx;
 
-    // Somebody takes the receiver and drops it, then the device pushes a lock-state frame (A12).
+    // Somebody takes the receiver and drops it, then the device pushes a lock-state frame.
     drop(link.take_unsolicited());
     fake.inject_unsolicited(&frame("get_info_reply_caps_on"));
 
@@ -754,11 +741,11 @@ fn dropping_the_unsolicited_receiver_leaves_the_link_hearing_and_working() {
     assert_eq!(stats.timeouts, 0);
 }
 
-// -- 10. the write half has its own deadline (§5.1, A11, A15) -------------------------------
+// -- 10. the write half has its own deadline -------------------------------
 
 /// `serialport` keeps one timeout per handle and uses it for both directions, so the reader's
 /// 25 ms heartbeat used to be the deadline for `write_all` of a frame as well — and a `write_all`
-/// cut short tears the frame, which the chip then eats as the head of the next command (A15).
+/// cut short tears the frame, which the chip then eats as the head of the next command.
 /// The halves now carry different timeouts, and neither leaks into the other.
 #[test]
 fn the_write_half_has_its_own_timeout_and_the_reader_keeps_its_heartbeat() {
@@ -782,8 +769,7 @@ fn the_write_half_has_its_own_timeout_and_the_reader_keeps_its_heartbeat() {
     let info = link.get_info(TIMEOUT).expect("writing still works");
     assert!(info.target_connected);
 
-    // The §3.2 five-byte reply with no checksum byte (A13), pushed with nothing waiting for it.
-    // Only the reader's own heartbeat can retire it, and only after `silence_before_expire`.
+    // With no request pending, only the reader heartbeat can expire this partial reply.
     let started = Instant::now();
     fake.inject_unsolicited(&observed_reply(
         "unknown_command_reply_has_no_checksum_byte",

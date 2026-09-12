@@ -1,16 +1,4 @@
-//! The two audio threads, their counters, their shutdown and their failure isolation
-//! (plan §4.1 rev 5, §12 Stage 4a).
-//!
-//! No ALSA and no sound card. Everything here drives [`nanokvm::audio::AudioHandle`] through the
-//! [`PcmSource`]/[`PcmSink`] seam with the fakes in `nanokvm::audio::pcm`, which is the only way
-//! §12 Stage 4a's four failure claims can be tested at all: a missing card, an `EBUSY`, a card
-//! that disappears mid-session and a playback sink that vanishes are not states a test may
-//! produce on the user's hardware.
-//!
-//! Every one of those four has a test here **whose fake fails in a way that would break the claim
-//! if the isolation were missing** — an opener that never succeeds, a source that dies after
-//! three periods, a sink that dies after two — rather than a test that merely calls the happy
-//! path and checks nothing blew up.
+//! Audio worker pacing, counters, shutdown, and failure isolation using fake PCM devices.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,7 +49,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// A source that yields the markers and then blocks until the handle is stopped, so the test sees
-/// exactly the periods it asked for and no filler.
+/// the periods it asked for and no filler.
 struct FiniteSource {
     markers: std::collections::VecDeque<i16>,
 }
@@ -136,9 +124,7 @@ fn every_captured_period_reaches_the_sink_in_the_order_it_was_captured() {
     );
 }
 
-/// §12 Stage 4a: "a missing card … logs **once**, sets a surfaced condition, and changes nothing
-/// about video or input". The fake here never succeeds, so the retry loop runs dozens of times;
-/// without the once-only rule that is dozens of identical warnings in the user's log.
+/// Repeated open failures must produce one condition change, not a warning per retry.
 #[test]
 fn a_card_that_is_never_there_is_one_condition_however_many_times_it_is_retried() {
     let opener = FnSourceOpener::new("absent", |_| {
@@ -229,7 +215,7 @@ fn a_card_that_disappears_mid_session_is_surfaced_and_then_recovers() {
                 device: "hw:8".to_string(),
                 why: "No such device".to_string(),
             }),
-            // ... and then it is replugged, as `hw:9`, which is what C13 says happens, and it
+            // ... and then it is replugged, as `hw:9`, which is what happens, and it
             // keeps producing — so the condition clearing below is the recovery and not a gap
             // between two failures.
             _ => Ok(Box::new(ScriptedSource::new(
@@ -266,9 +252,7 @@ fn a_card_that_disappears_mid_session_is_surfaced_and_then_recovers() {
     assert!(snapshot.capture_opens >= 2, "{snapshot:?}");
 }
 
-/// The fourth of §12 Stage 4a's four: the *playback* sink goes away. Capture must carry on —
-/// which is exactly what a bounded, dropping ring is for — and the condition must name the
-/// playback side rather than blaming the dongle.
+/// A missing playback sink must not stop capture or blame the dongle.
 #[test]
 fn a_playback_sink_that_vanishes_does_not_stop_capture() {
     let opener = FnSourceOpener::new("steady", |_| {
@@ -367,8 +351,8 @@ fn mute_silences_the_output_without_stalling_the_ring() {
     // And the muted periods are counted as muted rather than as audio the user heard: a single
     // "played" counter would report a muted session as a perfect one.
     assert!(snapshot.periods_muted > 0, "{snapshot:?}");
-    // The flag is an atomic anything can flip, and nothing in Stage 4a flips it — the control
-    // lives in the chrome (§12 Stage 4b) and no key is bound to it here.
+    // The flag is an atomic anything can flip, and nothing in flips it — the control
+    // lives in the chrome and no key is bound to it here.
     let flag = audio.mute_flag();
     flag.store(false, Ordering::Relaxed);
     assert!(!audio.muted());
@@ -508,8 +492,8 @@ fn a_stalled_sink_makes_the_ring_drop_rather_than_the_capture_thread_block() {
     audio.stop();
 }
 
-/// **Both sides failing at once is two conditions, not one slot they fight over.** An unplugged
-/// dongle and a `default` whose daemon restarted are one event on this desk, and with a single
+/// Both sides failing at once is two conditions, not one slot they fight over. An unplugged
+/// dongle and a `default` whose daemon restarted are one event on the recorded test setup, and with a single
 /// condition between them each side's retry overwrites the other's: every retry then looks new,
 /// every retry logs, `conditions_logged` counts retries, and the title flaps between the two
 /// several times a second. Dozens of retries here, two log lines, and a title that always says
@@ -555,7 +539,7 @@ fn two_sides_failing_at_once_are_two_conditions_however_often_they_are_retried()
 }
 
 /// A card that opens and then fails its first read — a half-dead USB device — every cycle. The
-/// open is **not** the recovery: treating it as one produces a "recovered" line and a warning
+/// open is not the recovery: treating it as one produces a "recovered" line and a warning
 /// twice a second for the rest of the session, which is the same log spam the once-only rule
 /// exists to prevent.
 #[test]
@@ -600,7 +584,7 @@ fn an_open_that_never_reads_is_one_warning_and_never_a_recovery() {
 /// The one failure [`AudioHandle::stop`]'s deadline exists for: a device call that never returns,
 /// which is what an ALSA PCM whose card was yanked can do. Nothing releases these fakes. `stop`
 /// must come back anyway — `main.rs` drops audio on every shutdown path, after the release-all,
-/// and a side channel may not hold the process open (§4.1 rev 5, §2.6).
+/// and a side channel may not hold the process open.
 #[test]
 fn stopping_does_not_wait_for_a_device_call_that_never_returns() {
     let mut audio = AudioHandle::spawn(
@@ -631,12 +615,12 @@ fn stopping_does_not_wait_for_a_device_call_that_never_returns() {
     audio.stop();
 }
 
-/// The playback side's patience is **one period**, not one ring depth. The device buffer is
+/// The playback side's patience is one period, not one ring depth. The device buffer is
 /// `device_periods` periods; a thread that waited the whole ring for a period that is not coming
 /// would let the sound card run dry first, which is an XRUN — a click and an ALSA state to
 /// recover from — in place of a counted period of silence.
 ///
-/// The ring here is deliberately deep (8 × 100 ms) so the two are three quarters of a second
+/// The ring here is deep (8 × 100 ms) so the two are three quarters of a second
 /// apart and the assertion is not about scheduling noise.
 #[test]
 fn silence_is_written_within_one_period_rather_than_one_ring_depth() {
@@ -684,9 +668,9 @@ fn silence_is_written_within_one_period_rather_than_one_ring_depth() {
 // ---- the prefill against a real sound card's own buffer ---------------------------------------
 
 /// A sink that behaves like a sound card: it has a buffer `depth` periods deep that drains in
-/// real time, so the **first `depth` writes do not block** and everything after them is paced.
+/// real time, so the first `depth` writes do not block and everything after them is paced.
 ///
-/// Every other fake in this file takes a period instantly, which is exactly the property that
+/// Every other fake in this file takes a period instantly, which is the property that
 /// hides the defect below: a prefill is a cushion only if something downstream stops accepting
 /// periods. This one stops.
 struct DeviceBufferedSink {
@@ -740,7 +724,7 @@ impl PcmSource for PacedSource {
         if self.next > now {
             std::thread::sleep(self.next - now);
         }
-        // Advanced by exactly one interval, never clamped to `now`: a card that was not read
+        // Advanced by one interval, never clamped to `now`: a card that was not read
         // from for a while has the samples waiting, so a late reader catches up rather than
         // losing the time. Clamping here would make this fake run measurably slower than the
         // sink below and the test would be measuring `thread::sleep`'s overshoot as drift.
@@ -754,22 +738,8 @@ impl PcmSource for PacedSource {
     }
 }
 
-/// **The prefill has to survive the sink's own buffer, or it is not a cushion.**
-///
-/// Found on hardware on 2026-09-11 and reproduced here. The playback side primes the ring with
-/// `prefill_periods` and then starts writing — and the first `device_periods` of those writes do
-/// not block, because the sound card's buffer is empty. With the two equal, the prefill is
-/// transferred straight into the card, the ring is left at zero sitting on its low-water mark,
-/// and [`nanokvm::audio::DriftPolicy`] duly inserts periods of silence for a clock difference
-/// that has not happened. On the desk that was two inserts and two silent periods in the first
-/// second of every run, against a card and a host whose clocks had not had time to differ by a
-/// single sample.
-///
-/// It matters because §12 Stage 4a asks for the drift rate to be **measured** from those
-/// counters. A counter that moves at startup is a rate that is wrong.
-///
-/// Both halves are run here, because "this configuration is quiet" says nothing on its own: the
-/// same fakes, the same timings, and the only difference is the one period of prefill.
+/// The sink initially accepts `device_periods` without blocking. Prefill must exceed
+/// that capacity so the first writes leave a cushion in the ring.
 #[test]
 fn a_prefill_no_deeper_than_the_sinks_own_buffer_is_no_cushion_at_all() {
     // 96 frames is 2 ms at 48 kHz, and the fakes below are paced at 2 ms, so the ring's own
@@ -835,24 +805,8 @@ fn a_prefill_no_deeper_than_the_sinks_own_buffer_is_no_cushion_at_all() {
     );
 }
 
-/// **Hardware defect D2.** A side whose open never returns must not look like a side that is
-/// working.
-///
-/// D2, observed once on this desk: the playback thread sat inside `snd_pcm_open` for six seconds
-/// and logged nothing. No condition was raised, `playback_opens` stayed at 0, and the title still
-/// said `audio on`. "Has not started" and "working" were indistinguishable, which is exactly the
-/// surfacing gap §2.8 exists to forbid.
-///
-/// Two claims, in order:
-///
-/// 1. while the open is outstanding the side reports itself as **opening** — which the title and
-///    the Audio popover render;
-/// 2. an open still outstanding after [`AudioConfig::reopen_backoff_cap`] — the longest this
-///    module ever waits for anything — becomes an ordinary condition, **logged once** however
-///    many times it is read.
-///
-/// The fake is `WedgedSourceOpener`, whose `open` never returns, so `stop` detaches its thread at
-/// the deadline; that is the shipped behaviour for a wedged device call and is asserted here too.
+/// An opener that never returns must remain visibly opening, then report its
+/// supervision timeout. Zero successful opens must never appear as working audio.
 #[test]
 fn an_open_that_never_returns_is_surfaced_rather_than_looking_like_a_working_side() {
     let config = AudioConfig {
@@ -884,7 +838,7 @@ fn an_open_that_never_returns_is_surfaced_rather_than_looking_like_a_working_sid
     );
     assert_eq!(
         opening.capture_opens, 0,
-        "nothing has opened — that is the whole point of D2"
+        "unfinished opens must not appear as working audio"
     );
 
     // 2. Past the limit it is a condition, and it is one condition however often it is read.
@@ -925,7 +879,7 @@ fn an_open_that_never_returns_is_surfaced_rather_than_looking_like_a_working_sid
     audio.stop();
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "stop() waited {:?} for a thread that cannot come back",
+        "stop waited {:?} for a thread that cannot come back",
         started.elapsed()
     );
 }

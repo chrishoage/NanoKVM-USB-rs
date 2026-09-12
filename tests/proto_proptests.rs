@@ -1,15 +1,11 @@
-//! Property tests for the pure `proto` module (§9.3: "`proto` is I/O-free, so it takes property
-//! tests and a fuzzer directly").
-//!
-//! The parser reads bytes off hardware that is already known to emit frames its own documented
-//! format forbids (§3.2), so the load-bearing property is the negative one: **no input panics**.
+//! Protocol parser and encoder properties over arbitrary and malformed byte streams.
 
 use nanokvm::proto::frame::{encode, Event, Frame, Parser, MAX_FRAME, MAX_PAYLOAD};
 use nanokvm::proto::report::{MouseAbsReport, ABS_MAX};
 use proptest::prelude::*;
 
 /// Split `bytes` at the given boundaries and push each piece separately, so a property holds for
-/// every read boundary rather than only for whole-frame reads (§9.2 item 6).
+/// every read boundary rather than only for whole-frame reads.
 fn push_in_chunks(parser: &mut Parser, bytes: &[u8], chunk_sizes: &[usize]) {
     let mut rest = bytes;
     let mut sizes = chunk_sizes.iter().copied().cycle();
@@ -56,7 +52,7 @@ proptest! {
         }
     }
 
-    /// (b) N frames concatenated and pushed in arbitrary chunk sizes come out as exactly those N
+    /// (b) N frames concatenated and pushed in arbitrary chunk sizes come out as those N
     /// frames, in order. Payloads may themselves contain `57 AB`; a frame is delimited by `LEN`,
     /// not by hunting for the next header.
     #[test]
@@ -110,21 +106,21 @@ proptest! {
         }
 
         // Whatever the input, at most one incomplete frame is ever held back.
-        prop_assert!(parser.pending_len() <= MAX_FRAME, "{}", parser.pending_len());
+        prop_assert!(parser.pending_len()<= MAX_FRAME, "{}", parser.pending_len());
         // Expiring must not panic either, and must leave the buffer empty.
         let _ = parser.expire_partial();
         prop_assert_eq!(parser.pending_len(), 0);
     }
 
     /// (c) again, biased towards traffic that looks like frames: headers, plausible lengths and
-    /// truncated tails, which is what a resynchronising parser actually meets on this device.
+    /// truncated tails, which is what a resynchronising parser meets on this device.
     #[test]
     fn frame_shaped_garbage_never_panics(
         pieces in proptest::collection::vec(
             prop_oneof![
                 Just(vec![0x57u8, 0xAB]),
                 Just(vec![0x57u8]),
-                // The §3.2 five-byte reply with no checksum byte.
+                // Recorded reply missing its checksum byte.
                 Just(vec![0x57u8, 0xAB, 0x00, 0xFE, 0x00]),
                 proptest::collection::vec(any::<u8>(), 0..6),
                 (any::<u8>(), proptest::collection::vec(any::<u8>(), 0..20))
@@ -146,13 +142,8 @@ proptest! {
         prop_assert_eq!(parser.pending_len(), 0);
     }
 
-    /// Every byte the parser is given is covered by at least one event: it is part of a frame,
-    /// part of a rejected candidate, part of an expired partial, or counted as garbage. Nothing
-    /// vanishes quietly, which is the failure §3.1 describes upstream having.
-    ///
-    /// Coverage rather than a partition, because byte-wise resync overlaps deliberately: the bytes
-    /// after a rejected candidate's first header byte appear in its `raw` *and* are handed back to
-    /// the scan, where they may become a frame.
+    /// Every input byte must contribute to a frame, rejected candidate, expired partial,
+    /// or garbage count. Overlapping candidates can cover a byte more than once.
     #[test]
     fn every_byte_is_covered_by_some_event(
         bytes in proptest::collection::vec(
@@ -178,7 +169,7 @@ proptest! {
 
     /// (d) Whatever the caller puts in the struct, the payload on the wire carries coordinates
     /// within the 12 usable bits. Overshooting past 8191 wraps the pointer to the top-left corner
-    /// of a live console, so the encoder clamps and never relies on the device (§3.4).
+    /// of a live console, so the encoder clamps and never relies on the device.
     #[test]
     fn an_absolute_report_never_emits_a_coordinate_above_full_scale(
         buttons in any::<u8>(),
@@ -198,7 +189,7 @@ proptest! {
         prop_assert_eq!(sent_y, y.min(ABS_MAX));
     }
 
-    /// The checksum covers the whole frame, so flipping any single byte is detected (§3.1).
+    /// The checksum covers the whole frame, so flipping any single byte is detected.
     #[test]
     fn corrupting_any_byte_fails_the_checksum(
         cmd in any::<u8>(),

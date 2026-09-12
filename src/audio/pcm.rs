@@ -1,19 +1,7 @@
-//! The seam between the audio threads and a sound device, and the fakes that stand in for one.
+//! PCM interfaces and test adapters.
 //!
-//! §4 allows a trait "only where a test needs to substitute a fake", and this is that case twice
-//! over. Everything §12 Stage 4a asks to be true about audio — that a missing card, an `EBUSY`, a
-//! card that disappears mid-session and a playback sink that vanishes each **log once, set a
-//! surfaced condition, and change nothing about video or input** — is a claim about behaviour
-//! under failure, and none of those four failures can be produced on demand from a real sound
-//! card. So the threads are written against [`PcmSource`] and [`PcmSink`], the openers that
-//! produce them are traits too (a failure at *open* is a different path from a failure at *read*),
-//! and `src/audio/alsa.rs` is the only file in the module that mentions ALSA.
-//!
-//! The fakes live here rather than behind `#[cfg(test)]` for the same reason `input::testing` and
-//! `discovery::testing` do: the tests that matter are integration tests in `tests/`, and an
-//! integration test links the library like any other consumer. (Those two are named in prose
-//! rather than linked, because nothing under `src/audio/` may so much as mention another
-//! subsystem's path — see `tests/audio_isolation.rs`.)
+//! Sources and sinks exchange interleaved sample periods without exposing ALSA types.
+//! Fakes model buffering, pacing, failure, and calls that never return.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +11,7 @@ use super::AudioError;
 
 /// One period of PCM in, at the configured format.
 pub trait PcmSource: Send {
-    /// Fill `out` — exactly one period, `RingConfig::period_samples` long — with the next
+    /// Fill `out` — one period, `RingConfig::period_samples` long — with the next
     /// captured samples. Blocks until the device has them.
     fn read_period(&mut self, out: &mut [i16]) -> Result<(), AudioError>;
 
@@ -33,19 +21,14 @@ pub trait PcmSource: Send {
 
 /// One period of PCM out.
 pub trait PcmSink: Send {
-    /// Write exactly one period. Blocks until the device has taken it.
+    /// Write one period. Blocks until the device has taken it.
     fn write_period(&mut self, samples: &[i16]) -> Result<(), AudioError>;
 
     fn describe(&self) -> String;
 }
 
-/// Where a [`PcmSource`] comes from, and comes from **again** after a failure.
-///
-/// Separate from the source itself because §2.7's reconnect policy applies here as it does to the
-/// other two nodes: a card that went away comes back under whatever number the kernel had free
-/// (C13), so the opener re-resolves rather than reopening a remembered name. The implementation
-/// that does the resolving is `discovery::reopen`'s `DiscoveringCardOpener`, which sits *above*
-/// this module so the dependency points the right way.
+/// Opens fresh PCM sources after failure. The discovery adapter resolves the current
+/// card number; retry timing belongs to the audio worker.
 pub trait PcmSourceOpener: Send {
     fn open(&mut self) -> Result<Box<dyn PcmSource>, AudioError>;
     fn describe(&self) -> String;
@@ -55,7 +38,7 @@ pub trait PcmSourceOpener: Send {
     /// Called once, by [`crate::audio::AudioHandle::spawn`], before either thread starts.
     /// [`PcmSource::read_period`] blocks in the device, and "wait for a period, but give up when
     /// the process is shutting down" cannot be expressed from outside the call — so the flag goes
-    /// *into* the device, where the wait actually is. The default does nothing, which is right
+    /// *into* the device, where the wait is. The default does nothing, which is right
     /// for every implementation whose blocking is bounded by construction (all the fakes below).
     fn on_stop_flag(&mut self, _stop: Arc<AtomicBool>) {}
 }
@@ -78,7 +61,7 @@ pub trait PcmSinkOpener: Send {
 ///
 /// Each entry is one `read_period` result, in order. When the script runs out the source keeps
 /// returning `end`, which is how "the card was fine and then it vanished" is expressed: a few
-/// good periods followed by an error that repeats for ever, exactly as a dead device does.
+/// good periods followed by an error that repeats for ever, as a dead device does.
 pub struct ScriptedSource {
     script: VecDeque<Result<i16, AudioError>>,
     end: Result<i16, AudioError>,
@@ -136,8 +119,7 @@ impl RecordingSink {
         Self::default()
     }
 
-    /// Make the sink vanish after `n` successful writes — the "playback sink that vanishes"
-    /// §12 Stage 4a requires to be isolated.
+    /// Make the sink disappear after `n` successful writes.
     pub fn failing_after(mut self, n: usize) -> Self {
         self.fail_after = Some(n);
         self
@@ -183,7 +165,7 @@ impl PcmSink for RecordingSink {
 ///
 /// A closure rather than a list of prepared devices because "the card is not there" is not one
 /// failed open: it is a failed open on *every* retry for as long as the dongle is unplugged, and
-/// the rule under test is that all of them together produce **one** log line. The closure is
+/// the rule under test is that all of them together produce one log line. The closure is
 /// handed the open count so it can say "fail for ever", "fail three times then succeed", or
 /// "succeed once and never again".
 pub struct FnSourceOpener {
@@ -298,9 +280,9 @@ impl PcmSource for WedgedSource {
     }
 }
 
-/// An opener whose `open` never returns — **hardware defect D2's fake.**
+/// An opener whose `open` never returns — hardware defect fake.
 ///
-/// D2: on this desk the playback thread once sat inside `snd_pcm_open` and never came out. It
+/// on the recorded test setup the playback thread once sat inside `snd_pcm_open` and never came out. It
 /// logged nothing, raised no condition and left `playback_opens` at 0, so the title and the
 /// popover both said audio was on. That is the one failure shape the other fakes here cannot
 /// produce: every one of them either succeeds or returns an `Err`, and the invisible failure is
@@ -322,7 +304,7 @@ impl PcmSourceOpener for WedgedSourceOpener {
     }
 }
 
-/// The sink half of [`WedgedSourceOpener`], and the side D2 was actually observed on.
+/// Playback opener that never returns, for open-supervision tests.
 #[derive(Default)]
 pub struct WedgedSinkOpener(Wedged);
 

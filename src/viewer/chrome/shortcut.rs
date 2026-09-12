@@ -1,54 +1,14 @@
-//! The chrome's two built-in shortcuts, and the send path they take (plan §12 Stage 4b, §2.9,
-//! `docs/STAGE3_FINDINGS.md` D1).
+//! Built-in keyboard shortcuts compiled through the shared script mapper.
 //!
-//! §12 Stage 4b: *"Keyboard (paste, the two built-in shortcuts through `script::compile`)"* — the
-//! reference's `Win+Tab` and `Ctrl+Alt+Del`. The chords are compiled by
-//! [`crate::script::compile_key`], so the HID usages come from the one keymap the viewer already
-//! forwards through and nothing here retypes a usage.
-//!
-//! # The send path, and why it is not D1's
-//!
-//! D1 says a script is **not** "the same queue with a different admission policy": `key`, `type`
-//! and `macro` transact one report at a time over their own [`crate::link::Link`], under the
-//! `Released` guard, because §2.7's reconnect policy is wrong for a script (a script must stop and
-//! say how far it got) and because the queue would coalesce nothing for it.
-//!
-//! **Neither reason applies to a chrome shortcut, and the alternative is not available anyway.**
-//!
-//! - *The port is taken.* The viewer's writer thread owns the serial link for the life of the
-//!   window. There is no second `Link` for the chrome to transact over; opening the node twice
-//!   would either fail or interleave two writers' frames on a chip whose parser has no inter-byte
-//!   timeout (§5.1) — the "a truncated serial write corrupts the next command" hazard, with two
-//!   writers guaranteeing it.
-//! - *D1's first reason inverts.* A script stops and reports its progress because nobody is
-//!   watching. Here the user is at the window: §2.7's answer — discard the queue, release
-//!   everything, resume disengaged, say so in the title — is exactly what should happen to a
-//!   `Ctrl+Alt+Del` whose link died halfway, and it is what happens to every other key the user
-//!   presses.
-//! - *D1's second reason is vacuous here.* Coalescing exists for pointer motion (§5.1, C8). These
-//!   are key events, which §2.2 makes **barriers**: never dropped, never merged, never reordered.
-//!   Six events cannot lose one.
-//!
-//! So a built-in shortcut is submitted through the viewer's own [`crate::input::Producer`] as
-//! ordinary key transitions — byte for byte what the host would produce if the user held Ctrl and
-//! Alt and tapped Delete themselves, which is the point of the menu item.
-//!
-//! # Nothing is left held
-//!
-//! [`crate::script::Script::tap`] is *always* a press followed by `RELEASE_ALL`; a script that
-//! could stop between them is what §2.6 forbids. [`events`] turns that pair into transitions by
-//! **differencing consecutive reports**, so the trailing `RELEASE_ALL` becomes an explicit key-up
-//! for every modifier and every usage the press put down. The writer's held-state tracker (§2.5)
-//! therefore sees a matched pair for everything, and
-//! [`tests::every_builtin_ends_with_nothing_held`] asserts it rather than trusting it.
+//! Report differences become key transitions for the viewer's producer, preserving its
+//! cancellation and release guarantees.
 
 use crate::input::Event;
 use crate::proto::report::KeyboardReport;
 use crate::proto::HidKey;
 use crate::script::{compile_key, CompileError, Layout, Script, Step};
 
-/// The shortcuts the chrome offers. The reference's two, and no more: §12 Stage 4b keeps saved
-/// user shortcuts and the on-screen keyboard out of scope.
+/// Built-in shortcuts offered by the Keyboard menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     /// `Win+Tab` — the target's window switcher.
@@ -83,8 +43,8 @@ impl Builtin {
 ///
 /// US QWERTY: a chord is *key forwarding*, not text injection, so it is layout-independent —
 /// [`crate::script::compile_key`] resolves named keys through the keymap and never through a
-/// layout table (§10.2, and `script`'s own module docs). The layout argument is still required by
-/// the signature, and `Us` is the declared default (D2).
+/// layout table. The layout argument is still required by
+/// the signature, and `Us` is the declared default.
 ///
 /// # Errors
 ///
@@ -96,23 +56,11 @@ pub fn events(builtin: Builtin) -> Result<Vec<Event>, CompileError> {
     Ok(transitions(&script))
 }
 
-/// Turn a compiled script's reports into the key transitions that produce them.
+/// Convert report differences into key transitions.
 ///
-/// The rule is one difference per report, applied in this order within each step:
-///
-/// 1. usages that went away, then modifiers that went away;
-/// 2. modifiers that arrived, then usages that arrived.
-///
-/// Releases before presses, and modifiers outside usages, so that the target never observes a key
-/// pressed without the modifier it was meant to be pressed under — which is the whole content of a
-/// chord.
-///
-/// Shared with [`super::paste`], which differences a [`crate::script::compile_type`] script the
-/// same way: one mapper, one rule about what a report transition is (§10.2 rev 5).
-///
-/// [`Step::Wait`] is ignored: [`compile_key`] emits none, and the pacing a `macro` file's `wait`
-/// expresses belongs to the blocking sender D1 describes, not to a non-blocking submission from an
-/// event loop that must not sleep (§2.9).
+/// Release usages before modifiers, then press modifiers before usages. This preserves
+/// chord modifiers throughout each key press. The caller submits through the existing
+/// viewer producer so cancellation remains ordered with ordinary input.
 pub(super) fn transitions(script: &Script) -> Vec<Event> {
     let mut out = Vec::new();
     let mut held = KeyboardReport::RELEASE_ALL;
@@ -189,9 +137,9 @@ mod tests {
         held
     }
 
-    /// The exit criterion for the send path: **nothing is left held**, and every release matches a
+    /// The exit criterion for the send path: nothing is left held, and every release matches a
     /// press. A shortcut that left Ctrl down would leave the target unusable and nothing local
-    /// could fix it (§2.6.1).
+    /// could fix it.
     #[test]
     fn every_builtin_ends_with_nothing_held() {
         for b in Builtin::ALL {

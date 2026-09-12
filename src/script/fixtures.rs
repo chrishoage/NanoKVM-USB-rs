@@ -1,17 +1,6 @@
-//! Reading `fixtures/packets/ch9329.toml`, the authority for packet bytes (§9.1).
+//! Packet-fixture loading for dry runs and compiler tests.
 //!
-//! It is read for two reasons, and neither is "so the client can work":
-//!
-//! - a dry run can *name* the frames it prints, and say so loudly when the encoder and the
-//!   authority disagree, rather than printing a name that is not the truth;
-//! - the tests check the encoder against the file rather than against bytes retyped into a test,
-//!   because retyping is exactly where a transcription bug enters and silently blesses a wrong
-//!   encoder.
-//!
-//! The path is resolved at *compile* time from `CARGO_MANIFEST_DIR`, so it points at the source
-//! tree. A shipped binary has no source tree: [`Fixtures::load`] returning `Err` is therefore
-//! ordinary, not a failure, and every caller must work without it — which is why
-//! [`crate::script::render`] takes an `Option`.
+//! The committed TOML file supplies expected bytes independently of the encoders.
 
 use serde::Deserialize;
 
@@ -78,7 +67,7 @@ impl Fixtures {
         &self.packet
     }
 
-    /// The fixture whose bytes are exactly this keyboard payload, if the file carries one.
+    /// The fixture whose bytes are this keyboard payload, if the file carries one.
     pub fn keyboard(&self, payload: &[u8]) -> Option<&Fixture> {
         self.packet
             .iter()

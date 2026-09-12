@@ -1,6 +1,4 @@
-//! §9.2 item 3 — **held-key projection: suppression** (§2.5). Status is fixed at press time and
-//! never changes while the key remains held, so the invariant is tested directly, through the
-//! frames the fake link recorded rather than through the tracker's internals.
+//! Six-key HID projection and suppression until the physical key is released.
 
 use std::time::Duration;
 
@@ -34,7 +32,7 @@ fn release(u: u8) -> Event {
 }
 
 /// Seven keys pressed in order: the report carries the first six, and the seventh appears in no
-/// report at all — pressing it changed nothing observable (§2.5).
+/// report at all — pressing it changed nothing observable.
 #[test]
 fn a_seventh_key_never_appears_in_any_report() {
     let (link, ctl) = fake_link();
@@ -67,7 +65,7 @@ fn a_seventh_key_never_appears_in_any_report() {
 }
 
 /// Releasing one of the six frees a slot and the report is rebuilt from the remaining `Reported`
-/// keys: **five**, not six. The suppressed key is not promoted (§2.5).
+/// keys: five, not six. The suppressed key is not promoted.
 #[test]
 fn releasing_one_of_six_yields_a_five_key_report() {
     let (link, ctl) = fake_link();
@@ -94,7 +92,7 @@ fn releasing_one_of_six_yields_a_five_key_report() {
 }
 
 /// A suppressed key becomes eligible again only through a fresh press: release it, press it
-/// again while five are `Reported`, and it enters a slot (§2.5).
+/// again while five are `Reported`, and it enters a slot.
 #[test]
 fn a_suppressed_key_enters_a_slot_on_a_fresh_press() {
     let (link, ctl) = fake_link();
@@ -119,7 +117,7 @@ fn a_suppressed_key_enters_a_slot_on_a_fresh_press() {
 }
 
 /// Pressing a key while six are `Reported` emits no report at all — nothing observable changed
-/// (§2.5). The frame either side of it proves the writer did not stall or reorder.
+/// . The frame either side of it proves the writer did not stall or reorder.
 #[test]
 fn pressing_a_key_while_six_are_reported_emits_nothing() {
     let (link, ctl) = fake_link();
@@ -150,7 +148,7 @@ fn pressing_a_key_while_six_are_reported_emits_nothing() {
 }
 
 /// A duplicate key-down for a key already held emits nothing. The viewer discards host repeats
-/// (§2.5); this is the second line of defence.
+/// ; this is the second line of defence.
 #[test]
 fn a_duplicate_key_down_emits_nothing() {
     let (link, ctl) = fake_link();
@@ -198,9 +196,7 @@ fn a_key_up_for_an_unheld_key_emits_nothing() {
     let _ = writer.shutdown();
 }
 
-/// Release-all produces the zeroed report, and the physical set with its statuses is empty
-/// afterwards: the next press of a previously suppressed key lands in the first slot (§2.5,
-/// §2.6).
+/// Release clears suppression so the next press can use the first available slot.
 #[test]
 fn release_all_zeroes_the_report_and_empties_the_set() {
     let (link, ctl) = fake_link();

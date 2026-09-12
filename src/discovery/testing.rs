@@ -1,16 +1,7 @@
-//! Fakes for driving [`super::discover`] against a recorded sysfs tree (§9.3).
+//! Recorded sysfs trees and capability maps for discovery tests.
 //!
-//! These are compiled into the library, not behind `#[cfg(test)]`, for the same reason
-//! [`crate::serial::fake`] and [`crate::input::testing`] are: the tests that matter here are
-//! integration tests in `tests/`, and an integration test links the library like any other
-//! consumer would.
-//!
-//! Both fakes are *decorators over real fixture data* rather than hand-built tables. §9.1's rule
-//! — the recording is the authority, never a retyped description of it — applies to sysfs
-//! snapshots exactly as it applies to packet fixtures. [`OverrideSysfs`] therefore expresses "the
-//! desk, but with the internal hub's id changed" as a one-attribute override on the real
-//! snapshot, so a test cannot accidentally pass because a hand-typed tree left out the attribute
-//! that decides the case.
+//! Missing fixture trees are generated from the committed recording. Fake probes avoid
+//! opening device paths from a recording on the machine running the test.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -31,12 +22,12 @@ fn fixtures_dir() -> PathBuf {
 
 /// A recorded sysfs tree from `fixtures/sysfs/`.
 ///
-/// The trees themselves are **not committed** — 1300-odd single-line files is not what git is
+/// The trees themselves are not committed — 1300-odd single-line files is not what git is
 /// for. What is committed is `fixtures/sysfs/usb2-desk.sysfs`, the recording serialised to one
 /// line-oriented file, plus `fixtures/sysfs/synthesize.py`, which expands it and derives the
 /// other three trees from it. A tree that is missing is therefore not a broken checkout: it is a
-/// fresh one, and this materialises it on first use. **python3 is a test-time dependency of this
-/// crate** for that reason.
+/// fresh one, and this materialises it on first use. python3 is a test-time dependency of this
+/// crate for that reason.
 ///
 /// # Panics
 ///
@@ -161,10 +152,8 @@ impl<S: Sysfs> Sysfs for OverrideSysfs<S> {
     }
 }
 
-/// A [`NodeProbe`] that answers from a table and records every node it was asked about.
-///
-/// The recording is the point: the probe opens a device node, so "which nodes did discovery
-/// open?" is a behaviour worth asserting on, not an implementation detail.
+/// Capability map that records queried paths so tests can verify which nodes
+/// discovery would open.
 pub struct MapProbe {
     answers: HashMap<PathBuf, Result<bool, i32>>,
     default: Option<Result<bool, i32>>,

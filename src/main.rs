@@ -1,48 +1,11 @@
-//! `nanokvm` — the viewer (plan §12, Stages 1 and 2).
+//! Command-line dispatch and viewer startup.
 //!
-//! Wiring only: parse arguments, choose the devices, start the subsystems and hand the
-//! event loop over to [`nanokvm::viewer::run`].
+//! The viewer opens serial and video before creating its window, so invalid device paths
+//! fail at startup. Once running, input and capture recover independently. Audio starts
+//! last; its failures do not stop either subsystem.
 //!
-//! Stage 4a adds a fourth subsystem and a third device: the dongle's own sound card (§12 Stage
-//! 4a). It is started last, nothing waits for it, and `--no-audio` starts none of it — §4.1 rev 5
-//! makes audio a side channel, and the ordering here is what makes that true rather than
-//! intended.
-//!
-//! The order below is deliberate. **Serial comes up first and is never taken down by the capture
-//! path** (§6.1 S1-1): sending a chord to a target with no video is a primary use case, so a
-//! capture failure after startup must not tear down input. A capture failure *at* startup is
-//! fatal only because there is nothing to look at yet.
-//!
-//! # Startup fails fast; everything after startup recovers
-//!
-//! Stage 2 gives both subsystems a *source* of devices rather than one device
-//! ([`input::spawn_with_source`], [`Pipeline::start_with_opener`]), so a device that goes away is
-//! reopened rather than lost (§2.7, §6.1 S2-4). That is deliberately **not** extended to startup:
-//!
-//! - the serial link is still waited for, once, with [`Producer::wait_for_link`], and a dongle
-//!   that is not there is an error the user reads rather than a window that silently never types;
-//! - the video node is still opened here, by this thread, before the pipeline starts — a wrong
-//!   `--video` must fail loudly, and at startup there is nothing to look at anyway, which is the
-//!   argument §6.1 S1-1 makes for the opposite policy *after* startup.
-//!
-//! The already-open source is then handed to the opener, which yields it first and reopens by
-//! path afterwards. So the fail-fast startup and the recovering steady state share one code path
-//! and one negotiated mode.
-//!
-//! # Rediscovery on reopen (§8)
-//!
-//! Both reopeners go through [`discovery::NodeResolver`]: a node that was *discovered* is
-//! rediscovered on every attempt, because the kernel gives a replugged device the lowest free
-//! name and not necessarily the old one; a node that was given explicitly is reopened by that
-//! name and discovery is never consulted for it. See [`nanokvm::discovery::reopen`].
-//!
-//! # Subcommands open one node, and never the viewer's (§12 Stage 3)
-//!
-//! Everything above is the *viewer*, which is what `nanokvm` with no subcommand still runs, flag
-//! for flag. A subcommand starts none of those threads and opens **only the node it needs**:
-//! `devices` opens nothing unless `--probe` is given, `key`/`type`/`macro` open the serial node,
-//! `shot` opens the video node. So [`select_devices`] is asked for one [`NodeKind`] rather than a
-//! pair — see its doc for what that changes and what it deliberately does not.
+//! Discovered nodes are resolved again on reconnect. Explicit paths remain fixed.
+//! Subcommands start only the resources they need; keyboard dry runs skip discovery.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,22 +26,17 @@ use nanokvm::input::{self, ReleaseOutcome};
 use nanokvm::serial::{self, OpenOptions};
 use nanokvm::viewer::{self, PointerMode, ViewerConfig, RELEASE_KEY};
 
-/// How long startup waits for the writer to commission a link before giving up (§2.7).
-///
-/// Long enough to cover one open plus the §5.1 resync preamble and a `GET_INFO` — measured at
-/// well under 10 ms on this desk — with three orders of magnitude of slack, and short enough
-/// that a missing dongle is reported while the user is still watching the terminal.
+/// Startup deadline for commissioning serial before reporting failure.
 const STARTUP_LINK_WAIT: Duration = Duration::from_secs(2);
 
-/// Seconds between the viewer's statistics lines when `--stats-interval` is not given. Stated in
-/// that flag's help text, which is where the user reads it.
+/// Default interval between diagnostic snapshots.
 const DEFAULT_STATS_INTERVAL_SECS: u64 = 5;
 
 /// Set by the `SIGINT` handler and polled by the event loop.
 ///
 /// A signal handler may only do async-signal-safe things, and storing to an `AtomicBool` is one
-/// of them. Everything the interrupt actually causes — the release-all, the clean exit — happens
-/// on the event loop thread when it next notices (§2.6).
+/// of them. Everything the interrupt causes — the release-all, the clean exit — happens
+/// on the event loop thread when it next notices.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_interrupt(_signal: libc::c_int) {
@@ -90,27 +48,23 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
     name = "nanokvm",
     about = "Native Linux client for the Sipeed NanoKVM-USB",
     after_help = concat!(
-        "Capture and release:\n",
-        "  Click in the window, or press Enter, to capture the keyboard and mouse.\n",
-        "  Press Pause to release. On niri, Mod+Escape also releases: the compositor keeps that\n",
-        "  binding for itself even while shortcuts are inhibited, so it always works.\n",
-        "  Focus loss releases too, and every release sends a full key-and-button release to the\n",
-        "  target.\n",
+        "Viewer controls:\n",
+        "  Click the video or press Enter to capture keyboard and mouse input.\n",
+        "  Press Pause to release; focus loss also releases input.\n",
+        "  Press Shift+Pause to type clipboard text using the target's US QWERTY layout.\n",
+        "  Press Pause during paste to cancel.\n",
+        "  On niri, Mod+Escape can release compositor shortcut inhibition and capture.\n",
     ),
 )]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Serial node of the CH9329 bridge, e.g. /dev/ttyACM1. Discovered from USB topology when
-    /// omitted (§8). Given together with --video it is used exactly as typed and discovery is
-    /// not consulted; given alone it picks among the pairs discovery found.
+    /// CH9329 serial device path. Omit for USB-topology discovery.
     #[arg(long, value_name = "PATH", global = true)]
     serial: Option<PathBuf>,
 
-    /// Video node of the capture device, e.g. /dev/video4. Discovered from USB topology when
-    /// omitted (§8). Given together with --serial it is used exactly as typed and discovery is
-    /// not consulted; given alone it picks among the pairs discovery found.
+    /// Video capture device path. Omit for USB-topology discovery.
     #[arg(long, value_name = "PATH", global = true)]
     video: Option<PathBuf>,
 
@@ -122,18 +76,15 @@ struct Args {
     #[arg(long, default_value_t = 1080, global = true)]
     height: u32,
 
-    /// Capture frame rate. Passed to S_PARM explicitly; without it the driver keeps its own
-    /// default, which is 240 fps at 1080p (§6, A7).
+    /// Capture frame rate in frames per second.
     #[arg(long, default_value_t = 60, global = true)]
     fps: u32,
 
-    /// Pointer mode. Absolute can reach a specific pixel; relative cannot, because the target
-    /// applies its own pointer acceleration (§3.4). [default: abs]
+    /// Pointer mode: absolute positioning or relative movement. [default: abs]
     #[arg(long, value_enum)]
     pointer: Option<PointerArg>,
 
-    /// Do not open the dongle's sound card. The viewer is then exactly what it was in Stage 3:
-    /// no card is opened, no audio thread runs, and the title says only "audio off".
+    /// Disable audio capture and playback.
     #[arg(long)]
     no_audio: bool,
 
@@ -145,43 +96,29 @@ struct Args {
     #[arg(long, value_name = "SECS", hide = true)]
     exit_after: Option<u64>,
 
-    /// Open this chrome popover at startup: Video, Keyboard, Mouse or Audio. Development flag —
-    /// it exists so §12 Stage 4b's "event-loop handling latency with a popover open" can be
-    /// measured on a desk where nothing may drive the pointer.
+    /// Open a viewer panel at startup: Video, Keyboard, Mouse, or Audio. Development only.
     #[arg(long, value_name = "NAME", hide = true)]
     chrome_popover: Option<String>,
 
-    /// Engage capture as soon as the window is up. Development flag: §12 Stage 4c's exit criterion
-    /// types onto the target, and nothing on this desk may drive the pointer or the keyboard for a
-    /// hardware run. It feeds the reducer the same Enter edge a keypress would, which is consumed
-    /// and never forwarded.
+    /// Capture input when the window opens. Development only; sends input to the target.
     #[arg(long, hide = true)]
     capture_on_start: bool,
 
-    /// Paste the clipboard as soon as capture engages. Development flag, and it implies
-    /// --capture-on-start: a paste needs a captured session, and nothing can click for it.
+    /// Paste the clipboard after capture. Implies --capture-on-start. Development only.
     #[arg(long, hide = true)]
     paste_on_capture: bool,
 
-    /// Feed the release key this many milliseconds after a paste starts. Development flag: §12
-    /// Stage 4c's exit criterion includes cancelling a running paste, and nobody can press the
-    /// release key for an unattended run. It takes the key's own path, not a private cancel.
+    /// Cancel paste through the release-key path after this many milliseconds. Development only.
     #[arg(long, value_name = "MS", hide = true)]
     paste_cancel_after_ms: Option<u64>,
 
-    /// Read USB topology from this directory instead of /sys. Development flag: it points
-    /// discovery at a recorded tree (`fixtures/sysfs/`) so that a test of the command line does
-    /// not enumerate the machine it runs on. It also stops discovery opening any video node —
-    /// see `cli::sources`.
+    /// Read initial USB topology from a recorded tree without probing devices. Development only.
     #[arg(long, value_name = "PATH", global = true, hide = true)]
     sysfs_root: Option<PathBuf>,
 }
 
-/// The viewer-only flags, by the name the user typed, for the usage error a subcommand gets.
-///
-/// They are `Option` for exactly this: a clap default would make "the user asked for relative
-/// pointer mode" indistinguishable from "the user said nothing", and `nanokvm --pointer relative
-/// devices` would then be silently ignored rather than refused.
+/// Return a supplied viewer-only flag for subcommand validation. Optional values
+/// distinguish explicit arguments from defaults.
 impl Args {
     fn viewer_only_flag(&self) -> Option<&'static str> {
         if self.pointer.is_some() {
@@ -229,7 +166,7 @@ impl From<PointerArg> for PointerMode {
 
 /// Which nodes a command is going to open.
 ///
-/// A subcommand opens one node and must not require the other to exist (§12 Stage 3): `key
+/// A subcommand opens one node and must not require the other to exist: `key
 /// --serial /dev/ttyACM1` has to work on a desk whose video node is unplugged, and asking for a
 /// pair would make discovery's verdict about the video node fatal to a command that never
 /// touches it.
@@ -244,16 +181,13 @@ enum Needed {
 struct Selection {
     video: Option<PathBuf>,
     serial: Option<PathBuf>,
-    /// The sysfs directory of the USB device the video node belongs to, when discovery
-    /// enumerated one. It is what the audio card is paired against, and the only thing the card
-    /// opener needs — see [`discovery::reopen::CardResolver`], which is why it is carried here
-    /// rather than re-derived by a second run of discovery on every audio retry.
+    /// Capture device's USB directory, retained for audio-card resolution without
+    /// repeating video/serial discovery on audio retries.
     video_usb: Option<PathBuf>,
 }
 
 impl Selection {
-    /// One node and nothing else: the §8 override arm, where the node that was asked for was
-    /// named on the command line and there is no pair to report.
+    /// An explicitly selected node without a resolved pair.
     fn just(kind: NodeKind, path: PathBuf) -> Selection {
         match kind {
             NodeKind::Video => Selection {
@@ -282,33 +216,11 @@ impl Selection {
     }
 }
 
-/// The device nodes to open, from `--video`/`--serial`, discovery, or both (§8).
+/// Select required device nodes and report pairing evidence.
 ///
-/// §8's policy in one function: an explicit path always wins and is used even when no rule
-/// connects it to the other node — that is what makes the tool usable when discovery is wrong —
-/// while anything discovery cannot narrow to exactly one pair is a printed listing and a
-/// non-zero exit, never a guess.
-///
-/// # Asking for one node (§12 Stage 3)
-///
-/// [`Needed::One`] changes exactly one thing: **a discovery failure is survivable when the needed
-/// node was given explicitly.** Discovery still runs, and a pair it does find is still used and
-/// still logged with its evidence, because the pairing is what says the node belongs to this
-/// dongle and a command that skipped it would be quieter about a real ambiguity than the viewer
-/// is. But `key --serial /dev/ttyACM1` on a desk with no video node must send the chord: §8 makes
-/// the explicit path the thing that rescues a wrong discovery, and there is nothing left to
-/// infer once the one node needed has been named. The warning it logs is the same "given
-/// explicitly, so used as asked" the both-given arm has always logged.
-///
-/// It does **not** make discovery cheaper or narrower. `inventory` opens a `VIDIOC_QUERYCAP` on
-/// the video nodes that could take part in a pair whatever node is wanted, because that is what
-/// decides the pairing; the probe is read-only and the alternative is a special case in the one
-/// module whose job is to be the single answer to "which nodes are the dongle's".
-///
-/// The error path deliberately does not go through `anyhow`, and so this returns no `Result`:
-/// [`discovery::DiscoveryError`]'s `Display` is a multi-line table of every node found, and
-/// wrapping it in "Error: " with a context chain would bury the part the user has to read. It is
-/// printed as-is and the process exits 1.
+/// Explicit paths override selection failures. A command needing one node can use its
+/// explicit path without a pair. Otherwise discovery must yield one pair. Selection
+/// errors print the inventory and exit; candidate capability queries remain read-only.
 fn select_devices(
     constraints: &Constraints,
     need: Needed,
@@ -319,8 +231,7 @@ fn select_devices(
     let pair = match discovery::discover(&sysfs, probe.as_ref(), constraints) {
         Ok(pair) => pair,
         Err(e) => {
-            // §8's override, for a command that needs one node: the pairing could not be made,
-            // but the node this command opens was named, so there is nothing left to infer.
+            // A one-node command can honor its explicit path despite failed pair selection.
             if let Needed::One(kind) = need {
                 if let Some(path) = explicit(constraints, kind) {
                     log::warn!(
@@ -362,24 +273,16 @@ fn select_devices(
     }
 }
 
-/// The viewer's account of the pairing: the whole of §8's reasoning, once, at startup.
-///
-/// It is long because of what it precedes — a window that is about to capture the user's keyboard
-/// and write CH9329 frames into whichever port this chose. A subcommand gets
-/// [`short_pairing_line`] instead.
+/// Report viewer device selection and warn when pairing evidence is weak or absent.
 fn log_pairing_paragraph(pair: &discovery::Pair) {
     let (video, serial) = (pair.video.dev.display(), pair.serial.dev.display());
     match &pair.evidence {
-        // §8's items 1 and 2 are the kernel's own assertions; nothing to add.
         Some(evidence) if evidence.is_proof() => {
             log::info!("using {video} + {serial} — {evidence}")
         }
-        // Item 3 is a containment test over three commodity vendor ids. It is the only rule this
-        // desk has on a USB 2.0 port, so it is used — but a user who is about to have CH9329
-        // frames written into that port should be told the pairing is inferred, and how to
-        // overrule it.
+        // Commodity IDs provide weaker evidence than a kernel port relationship.
         Some(evidence) => log::warn!(
-            "using {video} + {serial} — {evidence}. This is §8's degraded rule: the hub, the \
+            "using {video} + {serial} — {evidence}. Pairing is inferred: the hub, the \
              capture chip and the serial bridge are all commodity parts, so an unrelated capture \
              stick and serial adapter sharing a cheap hub would look the same. Pass --video and \
              --serial to overrule it; `nanokvm devices` shows what discovery can see."
@@ -392,14 +295,7 @@ fn log_pairing_paragraph(pair: &discovery::Pair) {
     }
 }
 
-/// A subcommand's account of the same pairing: one line, naming the node it opens, the node that
-/// vouches for it, and where the evidence can be read in full.
-///
-/// The paragraph above is right for the viewer and wrong here. `nanokvm key a` is a one-shot
-/// command whose output is two lines, and six lines of §8 reasoning in front of them — on every
-/// run, dry runs included — is noise that trains the user to stop reading warnings. The degraded
-/// rule still warns, because it is still an inference; a proof logs at `info` and says which of
-/// §8's two proofs it was. `nanokvm devices` prints the whole evidence on demand.
+/// Summarize command device selection, warning for degraded or missing evidence.
 fn short_pairing_line(used: &str, other: &str, evidence: Option<&Evidence>) -> String {
     match evidence {
         Some(Evidence::InternalHub { .. }) => format!(
@@ -417,7 +313,7 @@ fn short_pairing_line(used: &str, other: &str, evidence: Option<&Evidence>) -> S
     }
 }
 
-/// The single node a subcommand opens (§12 Stage 3). See [`select_devices`] for what asking for
+/// The single node a subcommand opens. See [`select_devices`] for what asking for
 /// one node changes.
 fn one_node(args: &Args, constraints: &Constraints, kind: NodeKind) -> PathBuf {
     select_devices(constraints, Needed::One(kind), args.sysfs_root.as_ref()).node(kind)
@@ -438,11 +334,11 @@ fn constraints(args: &Args) -> Constraints {
     }
 }
 
-/// The path handed to a `--dry-run`, which resolves no node at all (§12 Stage 3).
+/// The path handed to a `--dry-run`, which resolves no node at all.
 ///
 /// A dry run opens nothing, so there is nothing for discovery to answer — and running it anyway
 /// would make "opens no device" untrue: `inventory` opens a `VIDIOC_QUERYCAP` on every candidate
-/// video node, which on this desk is the dongle's. So the dispatch below compiles first and this
+/// video node, which on the recorded test setup is the dongle's. So the dispatch below compiles first and this
 /// stands in for the node, where it is never read. It is not a path: if one ever reached an
 /// `open()`, the message would say where it came from.
 const NO_NODE: &str = "<no device: --dry-run resolves none>";
@@ -452,11 +348,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let constraints = constraints(&args);
 
-    // A viewer flag with a subcommand is a mistake worth naming rather than ignoring: `--pointer`
-    // means nothing to `devices`. Checked here, rather than by clap's
-    // `args_conflicts_with_subcommands`, because that setting also rejects `nanokvm --serial X key
-    // a` — a global written before the subcommand instead of after it, which is how most people
-    // type it and is not a mistake at all (H4).
+    // Reject viewer-only options here so shared options remain valid before subcommands.
     if let (Some(command), Some(flag)) = (&args.command, args.viewer_only_flag()) {
         Args::command()
             .error(
@@ -478,9 +370,7 @@ fn main() -> Result<()> {
             let video = one_node(&args, &constraints, NodeKind::Video);
             shot::run(a, &video, args.width, args.height, args.fps)
         }
-        // §2.8 item 3 in the dispatch: a dry run is dispatched *before* `select_devices`, so it
-        // reads no `/sys` and opens no node — not even the read-only `QUERYCAP` discovery uses to
-        // tell a capture node from its metadata sibling (H3).
+        // Dispatch dry runs before discovery so validation cannot access sysfs or devices.
         Some(Command::Key(a)) => keys::run_key(a, &serial_node(&args, &constraints, a.dry_run)),
         Some(Command::Type(a)) => keys::run_type(a, &serial_node(&args, &constraints, a.dry_run)),
         Some(Command::Macro(a)) => keys::run_macro(a, &serial_node(&args, &constraints, a.dry_run)),
@@ -488,11 +378,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// Which chrome popover `--chrome-popover` named, or `None` when the flag was not given.
-///
-/// A development flag (§12 Stage 4b): it exists so the measurement with a popover open can be
-/// taken on a desk where nothing may drive the pointer. The names come from the popovers
-/// themselves, so the flag cannot name one that does not exist.
+/// Resolve the development panel name against the UI's own panel list.
 fn chrome_popover(name: Option<&str>) -> Result<Option<nanokvm::viewer::chrome::Popover>> {
     let Some(name) = name else {
         return Ok(None);
@@ -525,18 +411,17 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
-/// Stage 1 and 2's viewer, unchanged: the three subsystems, the window, and the release-all on
-/// the way out. Reached only when no subcommand was given.
+/// Start the viewer and supervise capture, input, audio, and shutdown.
 fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     // SAFETY: `on_interrupt` is an `extern "C"` function whose entire body is one atomic store,
     // which is async-signal-safe. `libc::signal` is being handed a valid function pointer, and
-    // the previous disposition is deliberately discarded — there is none worth restoring in a
+    // the previous disposition is discarded — there is none worth restoring in a
     // program that installs this once at startup.
     unsafe {
         libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t);
     }
 
-    // ---- which two nodes (§8) --------------------------------------------------------------
+    // ---- which two nodes --------------------------------------------------------------
     // Reads /sys only, and opens a video node for one QUERYCAP just where that can change the
     // answer. Nothing here touches the serial node.
     let selection = select_devices(constraints, Needed::Both, args.sysfs_root.as_ref());
@@ -545,10 +430,10 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         selection.node(NodeKind::Serial),
     );
 
-    // ---- serial, first and independent of everything else (§6.1 S1-1) --------------------
-    // The writer owns opening now (§2.7): it opens, resynchronises the chip's parser (§5.1),
+    // ---- serial, first and independent of everything else --------------------
+    // The writer owns opening now: it opens, resynchronises the chip's parser,
     // re-queries device info and retries on a backoff, for the initial link and every
-    // replacement alike. `wait_for_link` is what keeps the Stage 1 fail-fast startup on top of
+    // replacement alike. `wait_for_link` is what keeps the fail-fast startup on top of
     // that. The receiver is the *source's*, so it stays valid across every reopen and every
     // rename (see `discovery::reopen`).
     let (source, unsolicited) = DiscoveringLinkSource::new(
@@ -557,11 +442,8 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     );
     let (producer, writer) = input::spawn_with_source(Box::new(source), input::Config::default());
 
-    // The one handshake this device needs, and the one thing that proves the link answers
-    // (Appendix). A failure here is fatal: without it we do not know there is a CH9329 there.
-    // The writer has already logged what each attempt reported — a permissions error on the node
-    // reads differently from a device that is simply absent — so this says what was waited for
-    // and points at those lines rather than guessing which of them was the cause.
+    // Fail startup if commissioning cannot establish a working bridge; earlier logs
+    // retain the specific open or transaction failure.
     let info = producer.wait_for_link(STARTUP_LINK_WAIT).with_context(|| {
         format!(
             "no CH9329 answered on {} within {STARTUP_LINK_WAIT:?}. Check the path and that you \
@@ -580,16 +462,14 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         );
     }
 
-    // The device pushes an unsolicited 0x81 frame about 15 ms after a lock-key state change
-    // (A12). A lock-bit change is proof the target processed a keystroke, which is the cheapest
-    // end-to-end check there is — so it is logged rather than dropped.
+    // Lock-state notifications can confirm target keystrokes, so retain them in diagnostics.
     std::thread::Builder::new()
         .name("nanokvm-locks".to_string())
         .spawn(move || {
             for reply in unsolicited {
                 if let Some(state) = serial::lock_state_from(&reply) {
                     // The bits only: an unsolicited 0x81 push is not an answer to `GET_INFO`, so
-                    // printing its version and target flag would claim more than was asked (§3.4).
+                    // printing its version and target flag would claim more than was asked.
                     log::info!("target lock state: {}", state.locks());
                 }
             }
@@ -597,9 +477,7 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         })
         .context("spawning the lock-state reader thread")?;
 
-    // ---- capture ---------------------------------------------------------------------------
-    // Opened here, on this thread, so that a wrong `--video` or an absent dongle is a message
-    // rather than an empty window (see the module docs). From the reopen on, the opener owns it.
+    // Open capture before creating the window so invalid paths fail visibly at startup.
     let source =
         V4l2Source::open(&video_path, args.width, args.height, args.fps).with_context(|| {
             format!(
@@ -621,12 +499,8 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     );
     let pipeline = Pipeline::start_with_opener(Box::new(opener), PipelineConfig::default());
 
-    // ---- the chrome's settings and the mode list (§12 Stage 4b) -----------------------------
-    // Loaded **before** the window, and a parse failure is returned rather than defaulted: §12
-    // Stage 4b says a malformed file is an error naming the key, not a silent reset, and an error
-    // raised after the window exists is one nobody reads. `None` — no `HOME`, no
-    // `XDG_CONFIG_HOME` — means the defaults and nothing remembered, which is honest degradation
-    // rather than a dotfile scattered in the working directory.
+    // Validate settings before starting the window or audio workers. Missing configuration
+    // uses defaults; malformed configuration must remain an error.
     let chrome_store = viewer::chrome::Store::discover();
     let chrome_config = match chrome_store.as_ref() {
         Some(store) => store.load().with_context(|| {
@@ -645,10 +519,7 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         }
     };
 
-    // The Video popover's list, read from the device rather than written down (§12 Stage 4b). A
-    // read-only `VIDIOC_ENUM_FRAMESIZES` on a second handle — the pipeline owns the streaming one
-    // — and a failure is a warning with an empty list, because a menu that cannot be built is not
-    // a reason to refuse to show a picture.
+    // A missing mode list disables resolution selection without stopping the working picture.
     let video_modes = match nanokvm::capture::v4l2::enumerate_modes(&video_path) {
         Ok(modes) => {
             log::info!(
@@ -671,14 +542,8 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         }
     };
 
-    // ---- audio, last and least (§4.1 rev 5, §12 Stage 4a) ----------------------------------
-    // Started after video and input are already running, and nothing below waits for it: audio
-    // is a side channel, so a card that is absent, busy or unbound must leave the client exactly
-    // as usable as it was in Stage 3. `--no-audio` spawns nothing at all — not a thread, not an
-    // open — which is what makes "exactly Stage 3" checkable rather than merely intended.
-    //
-    // The card is resolved the same way the other two nodes are (§8, C13): rediscovered on every
-    // open, because card numbers renumber on replug exactly as /dev names do.
+    // Start audio independently after input and capture. Missing or busy audio must not
+    // prevent control; disabling it creates no audio workers.
     let audio = match (args.no_audio, &selection.video_usb) {
         (true, _) => {
             log::info!("audio: disabled by --no-audio; no sound card will be opened");
@@ -714,8 +579,7 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
 
     // ---- the window ------------------------------------------------------------------------
     log::info!("press {RELEASE_KEY} (or Mod+Escape on niri) to release capture");
-    // The defaults live here rather than in clap, because the flags have to stay `Option` to tell
-    // "asked for" from "not mentioned" when a subcommand is present (see `viewer_only_flag`).
+    // Apply defaults after validation so explicit viewer flags remain distinguishable.
     let config = ViewerConfig {
         // The command line still wins at startup, and the chrome's remembered choice is the
         // default when the flag was not given — which is why `--pointer` is an `Option`.
@@ -741,9 +605,7 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     };
     let result = viewer::run(&pipeline, producer, audio.as_ref(), config, &INTERRUPTED);
 
-    // ---- shutdown, release first -------------------------------------------------------------
-    // §2.6: clean shutdown is a release-all trigger, and §2.6.1: an `Unsent` outcome means the
-    // target may still be holding keys, which is worth saying rather than hiding.
+    // Release before teardown and report failure: cleared local state does not release the target.
     match writer.shutdown() {
         ReleaseOutcome::Submitted => log::info!("release-all submitted on shutdown"),
         ReleaseOutcome::Unsent => log::warn!(
@@ -752,8 +614,7 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
         ),
     }
     pipeline.stop();
-    // Explicit rather than left to the drop order, so the audio threads' last log lines land
-    // before the process exits and a stuck one is reported rather than silently detached.
+    // Stop audio explicitly so shutdown diagnostics precede process exit.
     drop(audio);
     result
 }
@@ -763,9 +624,7 @@ mod tests {
     use super::*;
     use nanokvm::discovery::UsbDevice;
 
-    /// H5: a subcommand gets one line, not the viewer's paragraph — but it still says the pairing
-    /// was inferred, and still says where the evidence is. A six-line warning on every `key a`
-    /// trains the reader to skip warnings, which costs more than it buys.
+    /// Subcommands must report weak pairing evidence in a concise selection line.
     #[test]
     fn a_subcommand_gets_one_line_that_still_names_the_degraded_rule() {
         let hub = UsbDevice {
@@ -792,8 +651,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1, "one line: {line}");
     }
 
-    /// A proof-grade pairing says which proof it was, in one line, and the caller logs it at
-    /// `info` rather than `warn` (§8 items 1 and 2 are the kernel's own assertions).
+    /// Strong pairing evidence is informational.
     #[test]
     fn a_proof_grade_pairing_names_the_rule_in_one_line() {
         let line = short_pairing_line("/dev/video4", "/dev/ttyACM1", Some(&Evidence::SameDevice));
@@ -810,7 +668,7 @@ mod tests {
         assert!(short_pairing_line("a", "b", Some(&peer)).lines().count() == 1);
     }
 
-    /// Both nodes given explicitly: there is no rule to name, and §8 says they are used as asked.
+    /// Explicit paths remain usable without automatic pairing evidence.
     #[test]
     fn an_unevidenced_pairing_says_it_was_the_users_choice() {
         let line = short_pairing_line("/dev/ttyACM9", "/dev/video9", None);
@@ -819,8 +677,7 @@ mod tests {
         assert_eq!(line.lines().count(), 1, "{line}");
     }
 
-    /// H4: the viewer-only flags are `Option` so that "not mentioned" is distinguishable, and the
-    /// error names the flag the user typed rather than the first one in the struct.
+    /// Validation reports the supplied viewer-only flag.
     #[test]
     fn each_viewer_only_flag_is_named_when_it_is_the_one_given() {
         let args = Args::parse_from(["nanokvm", "--pointer", "relative", "devices"]);
@@ -833,8 +690,7 @@ mod tests {
         assert_eq!(args.viewer_only_flag(), Some("--exit-after"));
     }
 
-    /// The globals a subcommand *does* take are accepted on either side of it, and none of them
-    /// is a viewer-only flag. `nanokvm --serial X key a` was a usage error before H4.
+    /// Global device options must work before or after the subcommand.
     #[test]
     fn the_shared_globals_are_accepted_before_or_after_the_subcommand() {
         for argv in [

@@ -1,25 +1,14 @@
-//! Held-state tracking and the six-slot projection (§2.5).
+//! Held-key state owned by the input writer.
 //!
-//! Two distinct pieces of state, and conflating them is a bug:
-//!
-//! - the **physical held set** — every non-modifier key currently held, unbounded, plus the
-//!   modifier bitmask and the mouse button mask;
-//! - the **six report slots** — a *projection* of that set into the 8-byte HID report.
-//!
-//! **Projection rule: suppression, never promotion.** A key's status is decided at press time
-//! and never changes while the key remains held. A `Suppressed` key becomes eligible again only
-//! through a fresh press. The consequence is deliberate: the report can carry fewer than six
-//! keys while more than six are physically held (§2.5).
-//!
-//! This type is pure — no I/O, no locks. The writer thread owns exactly one of them, which is
-//! what makes "the writer is the sole serialization point" (§2.6) true of held state too.
+//! The six-key HID limit suppresses additional keys until their release. Promoting a
+//! previously suppressed key would create a press the user did not just make.
 
 use crate::proto::report::{HidKey, KeyboardReport};
 
-/// Non-modifier keys the 8-byte report can carry (§2.5).
+/// Non-modifier keys the 8-byte report can carry.
 pub(crate) const SLOTS: usize = 6;
 
-/// The status a key is admitted with at press time, fixed for the duration of the hold (§2.5).
+/// The status a key is admitted with at press time, fixed for the duration of the hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// Pressed while fewer than six keys were `Reported`; occupies a slot.
@@ -34,7 +23,7 @@ struct HeldKey {
     status: Status,
 }
 
-/// The physical held set with its per-key statuses, the modifier mask and the button mask (§2.5).
+/// The physical held set with its per-key statuses, the modifier mask and the button mask.
 #[derive(Debug, Default)]
 pub(crate) struct HeldState {
     /// Non-modifier keys in press order. Unbounded: this is the physical set, not the report.
@@ -55,7 +44,7 @@ impl HeldState {
 
     /// Project the physical set into the 8-byte report: the `Reported` keys in press order,
     /// remaining slots zero. Never more than [`SLOTS`], and often fewer than the number of keys
-    /// physically held (§2.5).
+    /// physically held.
     pub(crate) fn report(&self) -> KeyboardReport {
         let mut keys = [0u8; SLOTS];
         for (slot, key) in keys
@@ -78,7 +67,7 @@ impl HeldState {
     }
 
     /// Apply one key transition and return the report to send, or `None` when nothing
-    /// observable changed (§2.5).
+    /// observable changed.
     ///
     /// `None` is returned for:
     /// - a key-down for a key already held (a host auto-repeat that slipped past the viewer's
@@ -89,7 +78,7 @@ impl HeldState {
     pub(crate) fn apply_key(&mut self, key: HidKey, down: bool) -> Option<KeyboardReport> {
         match key {
             HidKey::Modifier(bit) => {
-                // Modifiers live in the report's first byte and never occupy a slot (§2.5).
+                // Modifiers live in the report's first byte and never occupy a slot.
                 let next = if down {
                     self.modifiers | bit
                 } else {
@@ -124,7 +113,7 @@ impl HeldState {
                     let removed = self.keys.remove(pos);
                     // A freed slot is never filled by a suppressed key: the report is rebuilt
                     // from the remaining `Reported` keys and may carry five where six were
-                    // held (§2.5).
+                    // held.
                     match removed.status {
                         Status::Reported => Some(self.report()),
                         Status::Suppressed => None,
@@ -151,7 +140,7 @@ impl HeldState {
     }
 
     /// Clear the physical held set with its per-key statuses, the modifier mask and the button
-    /// mask. Part of the cancellation sequence (§2.6 step 2).
+    /// mask. Part of the cancellation sequence.
     pub(crate) fn clear(&mut self) {
         self.keys.clear();
         self.modifiers = 0;

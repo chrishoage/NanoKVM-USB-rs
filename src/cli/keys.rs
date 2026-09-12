@@ -1,55 +1,12 @@
-//! `nanokvm key`, `nanokvm type`, `nanokvm macro` — the keyboard senders (§10.2, §12 Stage 3).
+//! Keyboard chord, text, and macro delivery.
 //!
-//! All three open the serial node and nothing else: sending a chord to a target with no video is
-//! a primary use case (§6.1 S1-1), and a screenshot is a different command.
+//! Compile the entire input before opening the port. Send reports sequentially and stop
+//! on failure, reporting partial progress; replay after reconnect could repeat a command.
+//! A release guard attempts to clear held keys on exit, including errors and caught signals.
 //!
-//! # The layout is the target's, and the host cannot see it
-//!
-//! §10.2: this is key *forwarding*, not text injection. What arrives at the target is a HID
-//! usage, and which character that produces is decided by the keymap running on the target —
-//! which this program has no way to observe. So `--layout` declares it, the default is stated
-//! rather than assumed, and a character the declared layout cannot reach is an error, never an
-//! approximation.
-//!
-//! # Compile the whole script before opening the port (§2.8 item 3)
-//!
-//! An invocation is either fully resolvable to reports or it sends nothing and names every
-//! problem. Half a password typed into a live console is worse than none, and the failure the
-//! user can act on is "these three characters are unreachable", not "it stopped at the fourth".
-//! `--dry-run` is the same compiler with the port left shut.
-//!
-//! The compiler is [`crate::script`], which is pure: this file is the I/O half — open, gate,
-//! guard, pace — and the one ordering the safety argument depends on is [`deliver`], which is
-//! worth reading in one piece.
-//!
-//! # There is no mouse in these commands
-//!
-//! Not a click, not the idle report, not a mouse half of the release. A click on a live desktop
-//! can launch or destroy something (CLAUDE.md), so the code that would build one does not exist
-//! here: neither mouse command byte is named anywhere under `src/cli/` or `src/script/`, and a
-//! test in `tests/cli_keys.rs` reads every file in both directories to keep it that way.
-//!
-//! # The safety properties, and where each comes from
-//!
-//! - **Compile the whole script, then send** (§2.8 item 3), as above. An unknown key name or a
-//!   character the layout cannot produce is an error before the port is opened, so a script is
-//!   either fully typeable or not attempted. A half-typed `sudo reboot` on a live console is
-//!   exactly the partially delivered sequence §2.8 forbids.
-//! - **Release-all on every exit path**, including panic and any of SIGINT, SIGTERM and SIGHUP,
-//!   with the [`Released`] `Drop` guard (§2.6). A harness timeout sends SIGTERM and a closed
-//!   terminal sends SIGHUP, so treating only SIGINT specially would leave a key held for exactly
-//!   the caller who most needs these commands. The outcome is printed rather than swallowed: an
-//!   unsent release means the target may still be holding a key (§2.6.1).
-//! - **Blocking and paced** (§2.9). Every report is an acknowledged `transact`; a device error or
-//!   timeout aborts the script and names how far it got.
-//! - **An acknowledgement is not evidence of effect** (§3.4, A17). What these print is acks. The
-//!   consequence is on the target's screen, and checking it is the operator's job.
-//!
-//! The 40 ms default pacing is for the *target*, not the chip: a keyboard ack round trip measured
-//! 4.16–4.19 ms (STAGE1_FINDINGS "hardware numbers", A11), so the chip could take reports ten
-//! times faster. Desktops drop keys delivered faster than a human types them. The number itself is
-//! [`crate::script::REPORT_DELAY_MS`], because the viewer's clipboard paste runs at the same rate
-//! (§12 Stage 4c) and two literals that agree today are two literals that will not.
+//! Text is mapped for the declared target layout. CapsLock policy is checked against a
+//! fresh device reading before any keyboard report is sent. Dry runs use the same compiler
+//! and fixture comparisons without opening a device.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -68,14 +25,14 @@ use crate::script::{
 use crate::serial::SerialLink;
 
 /// Reply window for one report. The same 500 ms `tests/serial_hardware.rs` uses, which is two
-/// orders of magnitude above the measured 4 ms ack (A11).
+/// orders of magnitude above the measured 4 ms ack.
 const TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Longest uninterruptible sleep. A `wait` step and the inter-report delay are served in slices
 /// this long, so a signal arriving during a long wait is noticed promptly rather than after it.
 const SLICE: Duration = Duration::from_millis(10);
 
-/// What to do when the target reports CapsLock on (§10.2).
+/// What to do when the target reports CapsLock on.
 ///
 /// The host cannot turn it off without changing the target's state, and it cannot see it change
 /// afterwards either, so this is the user's call and not a guess.
@@ -93,12 +50,11 @@ pub struct KeyArgs {
     #[arg(value_name = "CHORD", required = true)]
     pub chords: Vec<String>,
 
-    /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
-    /// is ~4 ms.
+    /// Milliseconds between keyboard reports.
     #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
-    /// Print the frames that would be sent and exit. Opens no device and sends nothing.
+    /// Print reports without opening devices or sending input.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -106,26 +62,21 @@ pub struct KeyArgs {
 #[derive(clap::Args, Debug)]
 #[command(after_help = GRAMMAR)]
 pub struct TypeArgs {
-    /// the text; `-` reads it from stdin
+    /// Text to type; use `-` to read stdin.
     #[arg(value_name = "TEXT", required = true)]
     pub text: String,
 
-    /// Keyboard layout of the TARGET, which the host cannot observe (§10.2). Characters
-    /// unreachable on it are an error, never approximated. [default: us]
-    // `Option` rather than a clap default, because "the user said us" and "the user said nothing"
-    // are different facts to `macro`, which shares this flag's meaning: a file's own `layout`
-    // directive may supply the answer, and a default would make every directive look like a
-    // conflict. The default itself is `Layout::default`, stated in the help text above (§10.2:
-    // stated, never assumed).
+    /// Target keyboard layout, independent of the host layout. Unsupported characters
+    /// stop the command before typing. [default: us]
+    // Keep omission distinct from an explicit layout so a macro directive can supply it.
     #[arg(long, value_name = "LAYOUT")]
     pub layout: Option<String>,
 
-    /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
-    /// is ~4 ms.
+    /// Milliseconds between keyboard reports.
     #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
-    /// Print the frames that would be sent and exit. Opens no device and sends nothing.
+    /// Print reports without opening devices or sending input.
     #[arg(long)]
     pub dry_run: bool,
 
@@ -142,20 +93,19 @@ pub struct MacroArgs {
     #[arg(value_name = "FILE")]
     pub file: PathBuf,
 
-    /// Keyboard layout of the TARGET, which the host cannot observe (§10.2). Characters
-    /// unreachable on it are an error, never approximated. [default: us]
+    /// Target keyboard layout, independent of the host layout. Unsupported characters
+    /// stop the command before typing. [default: us]
     // `None` means the file decides: a `layout` directive supplies it, and its absence means
     // `Layout::default`. Given here, a directive that disagrees is an error rather than a silent
     // override — see `compile_macro`.
     #[arg(long, value_name = "LAYOUT")]
     pub layout: Option<String>,
 
-    /// Milliseconds between reports. Paces the target's desktop, not the chip: the ack round trip
-    /// is ~4 ms.
+    /// Milliseconds between keyboard reports.
     #[arg(long, value_name = "MS", default_value_t = crate::script::REPORT_DELAY_MS)]
     pub delay_ms: u64,
 
-    /// Print the frames that would be sent and exit. Opens no device and sends nothing.
+    /// Print reports without opening devices or sending input.
     #[arg(long)]
     pub dry_run: bool,
 
@@ -165,23 +115,13 @@ pub struct MacroArgs {
     pub caps_lock: CapsLockPolicy,
 }
 
-/// The message a refusal prints. The target's CapsLock is the target's state: this host can
-/// neither read it without asking nor change it without typing, so the choice is handed back to
-/// the user together with both ways of overruling it (§10.2).
-/// It says "no keyboard report was sent" rather than "nothing was sent": by the time this is
-/// reached the port has been opened, the §5.1 preamble written and `GET_INFO` answered, so
-/// "nothing" would be a claim the code cannot make (§3.4). What it can promise is the thing that
-/// matters — the target received no keystroke.
+/// CapsLock refusal after preamble and device query, but before any keyboard report.
 const CAPS_LOCK_REFUSAL: &str = "the target reports CapsLock ON; letters would be typed inverted. \
      Turn it off with \"nanokvm key capslock\", or pass --caps-lock ignore|compensate. No \
      keyboard report was sent.";
 
-/// A compiled script and, where the command is text injection, the same source compiled as if the
-/// target's CapsLock were on.
-///
-/// Both are produced before anything is opened (§2.8 item 3), because the CapsLock decision needs
-/// `GET_INFO` — and a decision that needed a *compile* after the port was open would put a
-/// resolution failure on the far side of the gate, which is the shape §2.8 rules out.
+/// Script compiled for CapsLock off and, for text, with compensation. Both versions
+/// are prepared before opening serial so compilation cannot fail during delivery.
 struct Compiled {
     /// The script as the caller asked for it, with CapsLock assumed off.
     script: Script,
@@ -193,7 +133,7 @@ struct Compiled {
 impl Compiled {
     /// Whether the target's CapsLock changes what this script types.
     ///
-    /// Asked of the compiler rather than restated here: the two compilations differ exactly when
+    /// Asked of the compiler rather than restated here: the two compilations differ when
     /// some report's shift bit depends on CapsLock, which is `script`'s own definition of "a
     /// letter". Nothing in the CLI has to know which characters those are.
     fn affected_by_caps_lock(&self) -> bool {
@@ -214,7 +154,7 @@ struct Delivery<'a> {
 /// Send one or more chords, each pressed with its modifiers and then fully released.
 ///
 /// Chords are key forwarding, so the declared layout only decides what a single-character chord
-/// key such as `ctrl+c` means, and the target's CapsLock decides nothing at all (§10.2).
+/// key such as `ctrl+c` means, and the target's CapsLock decides nothing at all.
 pub fn run_key(args: &KeyArgs, serial: &Path) -> Result<()> {
     let compiled = Compiled {
         script: compile_key(&args.chords, Layout::default())?,
@@ -232,7 +172,7 @@ pub fn run_key(args: &KeyArgs, serial: &Path) -> Result<()> {
     )
 }
 
-/// Type text, one press and release per character, against the declared target layout (§10.2).
+/// Type text, one press and release per character, against the declared target layout.
 pub fn run_type(args: &TypeArgs, serial: &Path) -> Result<()> {
     let layout = declared_layout(args.layout.as_deref())?.unwrap_or_default();
     let text = text_to_type(args)?;
@@ -254,7 +194,7 @@ pub fn run_type(args: &TypeArgs, serial: &Path) -> Result<()> {
 /// Run a macro file of `key`, `type` and `wait` steps.
 ///
 /// The layout is passed through as the `Option` the command line gave: `None` leaves the file's
-/// own `layout` directive free to supply it, which is the whole point of the directive (§10.2).
+/// own `layout` directive free to supply it, which is the whole point of the directive.
 pub fn run_macro(args: &MacroArgs, serial: &Path) -> Result<()> {
     let layout = declared_layout(args.layout.as_deref())?;
     let source = std::fs::read_to_string(&args.file).with_context(|| {
@@ -281,7 +221,7 @@ pub fn run_macro(args: &MacroArgs, serial: &Path) -> Result<()> {
 /// The `--layout` value parsed, or `None` where the flag was not given.
 ///
 /// Separate from `Layout::from_str` only so that both callers spell the "not given" case the same
-/// way: an unknown name is the layout module's error, unchanged (§10.2).
+/// way: an unknown name is the layout module's error, unchanged.
 fn declared_layout(name: Option<&str>) -> Result<Option<Layout>> {
     match name {
         Some(name) => Ok(Some(name.parse::<Layout>()?)),
@@ -291,16 +231,16 @@ fn declared_layout(name: Option<&str>) -> Result<Option<Layout>> {
 
 /// The text `type` was given: its argument, or all of stdin when that argument is `-`.
 ///
-/// Read **verbatim, to EOF**, trailing newline included. `echo | nanokvm type -` therefore ends
+/// Read verbatim, to EOF, trailing newline included. `echo | nanokvm type -` therefore ends
 /// in an Enter, which is the only way a piped script can press one; silently trimming it would
 /// make a whole keystroke unreachable and would differ from the argument form for no reason
-/// visible to the user. `--dry-run` shows exactly what would be sent.
+/// visible to the user. `--dry-run` shows what would be sent.
 fn text_to_type(args: &TypeArgs) -> Result<String> {
     if args.text != "-" {
         return Ok(args.text.clone());
     }
     // A `type -` typed at a terminal reads the terminal, and an unannounced read to EOF looks
-    // exactly like a hang. Said on stderr so it cannot end up in anything piped.
+    // like a hang. Said on stderr so it cannot end up in anything piped.
     if stdin_is_a_terminal() {
         out::note("reading text from stdin until EOF (Ctrl-D)");
     }
@@ -323,12 +263,12 @@ fn stdin_is_a_terminal() -> bool {
 /// Every step before the guard exists is one that must be able to refuse without having sent
 /// anything: `--dry-run` opens nothing, the port is opened only after the compile succeeded, the
 /// `GET_INFO` gate and the CapsLock policy are both checked before [`Released`] is constructed,
-/// and from that point on every exit path emits a release-all (§2.6, §2.8 item 3).
+/// and from that point on every exit path emits a release-all.
 fn deliver(compiled: &Compiled, how: &Delivery) -> Result<()> {
     if how.dry_run {
         // Nothing is opened, so nothing can be sent — not even the node this command was handed,
         // which on a dry run is never resolved at all (see `main.rs`). The authority file names
-        // the frames it has (§9.1); a shipped binary has no source tree to read it from, which is
+        // the frames it has; a shipped binary has no source tree to read it from, which is
         // why its absence is ordinary and the rows simply go unnamed.
         out::block(&render(&compiled.script, Fixtures::load().ok().as_ref())?);
         return Ok(());
@@ -347,9 +287,7 @@ fn deliver(compiled: &Compiled, how: &Delivery) -> Result<()> {
         )
     })?;
 
-    // §5.1: the chip has no inter-byte timeout, so a process that died mid-write left its parser
-    // waiting for the rest of a frame — and the first thing written here would be eaten as that
-    // remainder. The preamble finishes it and forms no command of its own.
+    // Finish any prior torn frame before sending the first request.
     link.resync().with_context(|| {
         format!(
             "resynchronising the CH9329 frame parser on {}",
@@ -357,7 +295,7 @@ fn deliver(compiled: &Compiled, how: &Delivery) -> Result<()> {
         )
     })?;
 
-    // GET_INFO first: it is the one thing that proves a CH9329 is there and answering (Appendix),
+    // GET_INFO first: it is the one thing that proves a CH9329 is there and answering,
     // and `target_connected` is the difference between typing into a console and typing into
     // nothing. Checked before the guard exists, so refusing to run sends no frame at all.
     let info = link
@@ -384,7 +322,7 @@ fn deliver(compiled: &Compiled, how: &Delivery) -> Result<()> {
 }
 
 /// Which of the two compilations goes on the wire, given what `GET_INFO` said and what the user
-/// asked for (§10.2).
+/// asked for.
 ///
 /// A CapsLock the script does not care about is not a reason to refuse anything, so the policy is
 /// consulted only when the target reports it on *and* the two compilations differ. Refusing here
@@ -403,7 +341,7 @@ fn choose_encoding(
         CapsLockPolicy::Compensate => {
             // On stderr, because it is a note about the run and not part of what the run produced
             // — and because the target's CapsLock may have changed since GET_INFO answered, which
-            // no ack can tell us (§3.4).
+            // no ack can tell us.
             out::note("compensating for CapsLock: shift inverted on letters");
             Ok(compiled
                 .compensated
@@ -414,7 +352,7 @@ fn choose_encoding(
 }
 
 /// Owns the link and sends a keyboard release-all when it goes out of scope, however it goes out
-/// of scope — clean exit, `?`, panic, or a caught signal the send loop turns into an error (§2.6).
+/// of scope — clean exit, `?`, panic, or a caught signal the send loop turns into an error.
 ///
 /// Keyboard only. The mouse half that `tests/serial_hardware.rs` sends is absent on purpose:
 /// these commands never press a button, so they have nothing to release, and building a mouse
@@ -429,7 +367,7 @@ impl Drop for Released {
             .transact(cmd::SEND_KB_GENERAL_DATA, &payload, TIMEOUT)
         {
             Ok(_) => out::note("[release-all] keyboard report sent"),
-            // §2.6.1: an unsent release means the target may still be holding a key. Say so.
+            // An unsent release leaves target state uncertain and must be reported.
             Err(e) => out::note(&format!("[release-all] keyboard report UNSENT: {e}")),
         }
     }
@@ -453,10 +391,10 @@ fn pause(total: Duration) -> Result<()> {
     }
 }
 
-/// Deliver the compiled script, blocking on each acknowledgement (§2.9).
+/// Deliver the compiled script, blocking on each acknowledgement.
 ///
 /// Every error names how far the script got, because "it failed" and "it failed after typing
-/// `sudo reb`" are different facts to the person holding the console (§2.8 item 3).
+/// `sudo reb`" are different facts to the person holding the console.
 fn run(link: &mut Released, script: &Script, delay: Duration) -> Result<usize> {
     let total = script.report_count();
     let mut sent = 0usize;
@@ -518,7 +456,7 @@ mod tests {
     /// The refusal happens before the guard exists, so its message has to be the whole of what
     /// the user gets: what is wrong, both ways to overrule it, and what did or did not reach the
     /// target. The port is already open and `GET_INFO` already answered by this point, so the
-    /// promise it makes is about keyboard reports and not about the wire (§3.4).
+    /// promise it makes is about keyboard reports and not about the wire.
     #[test]
     fn refuse_is_the_default_and_names_both_ways_out() {
         let err = choose_encoding(&compiled("hello"), true, CapsLockPolicy::Refuse).unwrap_err();

@@ -1,16 +1,9 @@
-//! Capture recovery against the real dongle: §6.1 S2-1 and S2-4 (plan §6.1, §12 Stage 2).
+//! Capture restart and USB replug tests against video device 345f:2133.
 //!
-//! ```text
-//! cargo test --features hardware --test capture_recovery_hardware -- --ignored --nocapture --test-threads=1
-//! ```
-//!
-//! `/dev/video4` is the NanoKVM-USB node on this desk. `/dev/video0`–`3` belong to unrelated
-//! hardware and are never opened here. Nothing in this file sends input of any kind; the target
-//! is only ever watched.
-//!
-//! §12 "verify by consequence, not by acknowledgement": every assertion is on an observed frame,
-//! an observed node, or an observed mapping — never on an ioctl returning success. `restart()`
-//! returning `Ok` proves nothing; frames arriving after it does.
+//! The recorded path is `/dev/video4`; replug recovery resolves by identity. Verify
+//! selection and keep unrelated bus-5 hardware untouched. Run one binary at a time
+//! with `--test-threads=1`. USB reset requires explicit task authorization.
+//! Assertions observe returned frames and mappings, not just successful ioctls.
 
 #![cfg(feature = "hardware")]
 
@@ -25,10 +18,8 @@ use nanokvm::capture::{
 };
 use nanokvm::discovery::{Constraints, DiscoveringOpener, NodeKind, NodeResolver};
 
-/// `00-common.md`: kill every process you start. H-B2 spawns `scripts/usb-replug.py` and then
-/// asserts its way to the bottom of the test, so the child is spawned through a `Drop` guard
-/// rather than a bare `Child`, which does not kill on drop. `tests/capture_recovery.rs` owns the
-/// test that the guard works.
+/// Use a kill-and-reap guard because assertions can fail before the reset child
+/// is awaited. `capture_recovery` tests the guard without hardware.
 #[path = "support/child_guard.rs"]
 mod child_guard;
 
@@ -37,48 +28,22 @@ mod child_guard;
 /// *binaries* must still be run one at a time.
 static DEVICE: Mutex<()> = Mutex::new(());
 
-/// The dongle's video node on this desk (CLAUDE.md): the capture node of the `345f:2133`
-/// interface under the dongle's own `1a40:0101` hub, as `VIDIOC_QUERYCAP` decides it — never the
-/// metadata sibling, and never anything on bus 5, which is the user's dock.
-///
-/// H-B1 opens this name directly: it neither takes the device away nor expects it back, so the
-/// name cannot move under it, and a run on a renumbered desk fails with this comment as the
-/// explanation. **H-B2 reopens by identity instead** (§8, C6) — a replug is exactly when the
-/// kernel can hand the node back under a different name — and uses this only as the expectation
-/// it prints.
+/// Recorded capture path for video 345f:2133 under hub 1a40:0101. Verify its
+/// identity before running direct-path tests; exclude metadata nodes and bus 5.
+/// Replug tests resolve the replacement path through discovery.
 const NODE: &str = "/dev/video4";
-/// The primary path (§6): the target outputs 1080p.
+/// The primary path: the target outputs 1080p.
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const FPS: u32 = 60;
-/// How long after a reopen the frames have to settle at the negotiated size (H-B2), **derived
-/// from the config the test actually runs with** rather than written down.
-///
-/// A hand-written constant here was wrong twice over: it said 5 s and justified it as "the 500 ms
-/// grace plus a restart", which understates the real arithmetic by three seconds because the
-/// watchdog doubles its wait between restarts and then escalates. Worse, it was wrong *silently* —
-/// raising `format_mismatch_grace` or `format_mismatch_restart_limit` would have broken the
-/// assertion with no sign of why. So it is computed, and printed next to the config it came from.
-///
-/// The watchdog's whole ladder, in order:
-///
-/// - restart *k* fires after `grace * 2^(k-1)` of mismatched frames, so a full budget of `limit`
-///   restarts costs `grace * (2^limit - 1)` — 3.5 s at the shipped 500 ms and 3;
-/// - each restart costs the stream ~82 ms (8.7 ms for the `restart()` itself, ~73 ms to the next
-///   frame — C4);
-/// - one more `grace` passes before the watchdog decides the budget is spent;
-/// - it then escalates **once** to a full reopen — the pipeline's `reopen_backoff` wait plus an
-///   open of a device that has just re-enumerated — and gets one fresh budget, so the whole of
-///   the above happens a second time before the mismatch is accepted.
-///
-/// The frame gate (`format_mismatch_frames`, 12) adds 200 ms at 60 fps and is inside the
-/// rounding. `MARGIN` is slack for a loaded machine, not part of the derivation.
+/// Derive the settling deadline from the actual watchdog budgets, including
+/// exponential backoff and the fresh budget after escalation.
 fn settle_window(config: &PipelineConfig) -> Duration {
     /// Slack on top of the derived worst case.
     const MARGIN: Duration = Duration::from_secs(1);
-    /// C4: `restart()` 8.7 ms, ~73 ms to the first frame after it.
+    /// `restart` 8.7 ms, ~73 ms to the first frame after it.
     const RESTART_COST: Duration = Duration::from_millis(82);
-    /// A generous allowance for the `open()` itself: `S_FMT`, `S_PARM`, `REQBUFS`, four `mmap`s
+    /// A generous allowance for the `open` itself: `S_FMT`, `S_PARM`, `REQBUFS`, four `mmap`s
     /// and `QBUF`s and a `STREAMON`, each a USB control transfer to a freshly enumerated device.
     const OPEN_COST: Duration = Duration::from_secs(1);
 
@@ -117,7 +82,7 @@ fn wait_for(label: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
 
 /// The node a [`FrameSource`] says it is streaming from: `V4l2Source::describe` is
 /// `"V4L2 /dev/videoN MJPG WxH @F fps, B mmap buffers"`, and the second word is the path. Used
-/// because H-B2's opener resolves the node itself, so the test learns which one only by asking
+/// because H-opener resolves the node itself, so the test learns which one only by asking
 /// what was opened — which is the point: the name is an outcome, not an input.
 fn node_of(describe: &str) -> String {
     describe
@@ -127,7 +92,7 @@ fn node_of(describe: &str) -> String {
         .to_string()
 }
 
-/// What the frames after the reopen actually looked like (§6/A6).
+/// What the frames after the reopen looked like.
 ///
 /// The stats alone cannot answer this: `last_resolution` is a sample, and the failure measured on
 /// 2026-09-11 — a reopened stream stuck in the device's power-on 640x480 while `S_FMT` had
@@ -192,7 +157,7 @@ impl FrameSource for WatchedSource {
     }
 }
 
-/// A [`SourceOpener`] that records the node each open actually landed on, wraps what it opened in
+/// A [`SourceOpener`] that records the node each open landed on, wraps what it opened in
 /// a [`WatchedSource`], and delegates everything else.
 struct RecordingOpener {
     inner: DiscoveringOpener,
@@ -205,7 +170,7 @@ impl SourceOpener for RecordingOpener {
         let source = self.inner.open()?;
         let mut opened = lock(&self.opened);
         opened.push(node_of(&source.describe()));
-        // The first open is the control; everything from the reopen on is what H-B2 measures.
+        // Keep initial-open frames separate from the reopened-stream measurements.
         let post = (opened.len() > 1).then(|| Arc::clone(&self.post));
         drop(opened);
         Ok(Box::new(WatchedSource {
@@ -224,23 +189,21 @@ impl SourceOpener for RecordingOpener {
 ///
 /// The `v4l` crate's `Arena` mmaps one region per buffer and unmaps them in its `Drop`. A reopen
 /// that leaked them would show here and nowhere else — the counters would look perfect while the
-/// process quietly accumulated a 4-buffer arena per replug (§6.1 S2-2: "no leaked buffers").
+/// process quietly accumulated a 4-buffer arena per replug.
 fn mappings_of(node: &str) -> usize {
     std::fs::read_to_string("/proc/self/maps")
         .map(|maps| maps.lines().filter(|l| l.contains(node)).count())
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------------------------
-// H-B1 — the pipeline's stream restart, on the real device
-// ---------------------------------------------------------------------------------------------
+// Stream restart on the real capture device.
 
 /// What the wrapper below recorded, for the test to assert on once the pipeline gives it back.
 #[derive(Default)]
 struct Observed {
     frames_before: u64,
     frames_after: u64,
-    /// `captured_at` going backwards, which §5.5 says cannot happen on this clock.
+    /// Monotonic capture timestamps must not move backwards.
     monotonic_violations: u64,
     /// Frames whose SOF header disagreed with the negotiated mode.
     wrong_dimensions: u64,
@@ -248,20 +211,13 @@ struct Observed {
     restart_called: Option<Instant>,
     restart_returned: Option<Instant>,
     first_frame_after_restart: Option<Instant>,
-    /// `V4l2Source::stream_rebuilds` after the restart: the B2 rebuild really ran.
+    /// Confirm the source rebuilt its V4L2 stream, not just its public status.
     rebuilds_after: u64,
     restart_error: Option<String>,
 }
 
-/// A real [`V4l2Source`] that stops handing frames on after `stall_after` of them, until the
-/// pipeline restarts it.
-///
-/// This is the only honest way to exercise the *pipeline's* stall response against hardware. The
-/// device will not stall on demand, and the captured video is the target's only feedback channel
-/// so the cable cannot be pulled (CLAUDE.md) — but the pipeline cannot tell a consumer that has
-/// stopped dequeuing from a device that has stopped producing, which is precisely the condition
-/// §6.1's "capture error or stall" row covers. The restart underneath is the genuine article:
-/// [`V4l2Source::restart`], `STREAMOFF`, re-prime, `STREAMON`.
+/// Withhold real frames after `stall_after` until restart. This exercises the
+/// pipeline’s stall response without unplugging the target’s only video feedback.
 struct StallingSource {
     inner: V4l2Source,
     obs: Arc<Mutex<Observed>>,
@@ -275,7 +231,7 @@ struct StallingSource {
 impl FrameSource for StallingSource {
     fn next_frame(&mut self) -> Result<CompressedFrame, CaptureError> {
         if self.stalling {
-            // A stall with no error to explain it: exactly what `restart_after` is for. Paced,
+            // A stall with no error to explain it: what `restart_after` is for. Paced,
             // so it costs the wall clock a real dequeue timeout costs.
             std::thread::sleep(Duration::from_millis(5));
             return Err(CaptureError::Timeout(Duration::from_millis(5)));
@@ -363,12 +319,7 @@ impl SourceOpener for StallingOpener {
     }
 }
 
-/// **H-B1.** A stall on the real device is answered with a real `STREAMOFF`/`STREAMON`, and
-/// frames come back (§6.1 "capture error or stall — attempt restart").
-///
-/// The number this exists to produce is the **cost of a restart**: the wall clock from
-/// `restart()` returning to the next frame landing. That is what says whether
-/// `restart_after = 2 s` is a sane default for a target that is rebooting for a minute.
+/// Measure restart-to-first-frame time after a real `STREAMOFF`/`STREAMON` cycle.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle on /dev/video4"]
 fn hb1_a_stalled_stream_is_restarted_and_frames_come_back() {
@@ -393,7 +344,7 @@ fn hb1_a_stalled_stream_is_restarted_and_frames_come_back() {
         Duration::from_secs(20),
         || lock(&obs).frames_before >= 60,
     );
-    // The renderer's last image, held across the stall (§6.1 S1-2).
+    // The renderer's last image, held across the stall.
     wait_for("a decoded frame", Duration::from_secs(20), || {
         out.is_pending()
     });
@@ -432,11 +383,9 @@ fn hb1_a_stalled_stream_is_restarted_and_frames_come_back() {
 
     println!("-- H-B1: pipeline stream restart on {NODE} --");
     println!("  frames before the stall: {}", o.frames_before);
-    println!(
-        "  stall noticed -> restart() called: {stall_to_restart:?} (restart_after was 200 ms)"
-    );
-    println!("  restart() call -> return (STREAMOFF, re-prime, STREAMON): {restart_cost:?}");
-    println!("  restart() return -> first frame: {restart_to_frame:?}");
+    println!("  stall noticed -> restart called: {stall_to_restart:?} (restart_after was 200 ms)");
+    println!("  restart call -> return (STREAMOFF, re-prime, STREAMON): {restart_cost:?}");
+    println!("  restart return -> first frame: {restart_to_frame:?}");
     println!("  frames after the restart: {}", o.frames_after);
     println!(
         "  V4l2Source::stream_rebuilds after the restart: {}",
@@ -477,23 +426,12 @@ fn hb1_a_stalled_stream_is_restarted_and_frames_come_back() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// H-B2 — replug of the video device (§6.1 S2-4)
-// ---------------------------------------------------------------------------------------------
+// Video device removal and rediscovery.
 
-/// **H-B2.** The kernel takes `/dev/video4` away and gives it back; the pipeline must reopen it
-/// on its own, with no leaked buffers and without stopping (§6.1 S2-2/S2-4).
-///
-/// The replug is performed by `scripts/usb-replug.py` (slice D1), which resolves the dongle
-/// through sysfs, refuses to touch anything that is not on its `345f:2133`/`1a86:55d3`/`1a40:0101`
-/// allowlist, and exits 0 only once every affected node is back. The method — `reset` or
-/// `rebind` — comes from `NANOKVM_REPLUG_METHOD` so the orchestrator can select whichever one
-/// actually takes the node away on this hardware: a driver that implements `pre_reset`/
-/// `post_reset` can survive a `reset` in place, and if it does, this test says so rather than
-/// pretending the recovery was exercised.
-///
-/// Assertions are all on consequences: a node that went away, a frame that arrived, a mapping
-/// count that came back to where it started.
+/// Remove and recreate the video node with `scripts/usb-replug.py`. Measure
+/// rediscovery, resumed frames, mode settling, and mapped-buffer cleanup.
+/// The reset tool checks video 345f:2133, serial 1a86:55d3, and hub 1a40:0101;
+/// this test requires explicit USB reset authorization.
 #[test]
 #[ignore = "replugs the dongle: needs scripts/usb-replug.py and the orchestrator's go-ahead"]
 fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
@@ -502,15 +440,13 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
     let script = root.join("scripts/usb-replug.py");
     assert!(
         script.exists(),
-        "{} is missing; H-B2 cannot replug the device without it (slice D1)",
+        "{} is missing; H-B2 cannot replug the device without it",
         script.display()
     );
     let method = std::env::var("NANOKVM_REPLUG_METHOD").unwrap_or_else(|_| "reset".to_string());
 
-    // §8, not a name: the replug is exactly when the kernel can hand the node back as something
-    // else, so every open here resolves the dongle by USB identity the way `src/main.rs` does.
-    // The wrapper records what that resolved to, because the leak check below has to count
-    // mappings of the node actually opened rather than of a constant.
+    // Resolve USB identity on every open because replug can renumber the node.
+    // Record each path so mapping counts include both old and replacement devices.
     let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let post: Arc<Mutex<PostReopen>> = Arc::new(Mutex::new(PostReopen::default()));
     let opener = Box::new(RecordingOpener {
@@ -526,7 +462,7 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
     let config = PipelineConfig::default();
     let settle = settle_window(&config);
     println!(
-        "-- H-B2: replug of the §8-resolved video node with --method {method} --\n  \
+        "-- H-B2: replug of the -resolved video node with --method {method} --\n  \
          reopen backoff {:?} doubling to {:?}, restart_after {:?}\n  \
          format watchdog: {} mismatched frame(s) and a {:?} grace, at most {} restart(s) per \
          budget, one escalation reopen\n  \
@@ -555,7 +491,7 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
         .last()
         .cloned()
         .expect("the pipeline opened something to have produced those frames");
-    println!("  §8 resolved the video node to {node_before} for the first open");
+    println!("   resolved the video node to {node_before} for the first open");
     if node_before != NODE {
         println!(
             "  note: that is not {NODE}, which is what this desk usually calls it (CLAUDE.md). \
@@ -570,7 +506,7 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
     println!("  {node_before} mappings while streaming: {mappings_before}");
 
     // The script prints its own timeline on our stdout; it exits 0 only when the node is back.
-    // Through a `ChildGuard`: every assertion below this line unwinds past the `wait()` at the
+    // Through a `ChildGuard`: every assertion below this line unwinds past the `wait` at the
     // bottom, and a `usb-replug.py` left running unsupervised is the worst thing this file could
     // leak. The most likely failure of the lot — "the node never went away with this method" —
     // is precisely the one that used to leak it.
@@ -590,9 +526,9 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
     // The device goes away. If it does not, say so plainly: that is a finding about the method,
     // not a failure of the recovery under test.
     //
-    // Nothing here watches for `PipelineState::Stopped`. Only `stop()` and a failed thread spawn
-    // can set it (`pipeline.rs`), neither of which can happen between here and the `stop()` at
-    // the bottom, so a poll for it would assert nothing. What actually proves the pipeline did
+    // Nothing here watches for `PipelineState::Stopped`. Only `stop` and a failed thread spawn
+    // can set it (`pipeline.rs`), neither of which can happen between here and the `stop` at
+    // the bottom, so a poll for it would assert nothing. What proves the pipeline did
     // not give up on the device is the 30 frames after the reopen, below.
     let mut errors_during_the_gap: Vec<String> = Vec::new();
     let disconnect_deadline = Instant::now() + Duration::from_secs(30);
@@ -616,7 +552,7 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
         st.state
     );
 
-    // Frames must survive the gap: the renderer keeps the last image (§6.1 S1-2).
+    // Frames must survive the gap: the renderer keeps the last image.
     assert!(
         out.is_pending(),
         "the last decoded frame was discarded during the gap"
@@ -639,14 +575,8 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
         "the device was not reopened exactly once: {st:?}"
     );
 
-    // **The assertion that would have caught the 2026-09-11 bug.** The reopen can succeed —
-    // node rediscovered, `S_FMT` MJPG 1920x1080, `S_PARM` 60 fps, "reopened after N attempt(s)"
-    // — and still leave the *stream* in the device's power-on 640x480 with the UVC commit lost,
-    // for as long as the client runs. A6 keeps the SOF header as the authority, so the only
-    // honest check is on the frames: they must settle at the negotiated size, and they must do
-    // it within a bound. The bound is `settle_window(&config)`, derived from the watchdog's own
-    // ladder rather than asserted — see that function for the arithmetic. On the 2026-09-11 live
-    // run the whole recovery took ~1.2 s of it.
+    // Successful open and format negotiation do not prove the firmware applied the
+    // mode. Check SOF dimensions until the recovery deadline.
     let settle_deadline = Instant::now() + settle;
     while Instant::now() < settle_deadline && lock(&post).first_match.is_none() {
         std::thread::sleep(Duration::from_millis(5));
@@ -777,13 +707,8 @@ fn hb2_a_replugged_device_is_reopened_with_no_leaked_buffers() {
         mappings_after, mappings_before,
         "the reopen leaked {node_after} mappings: {mappings_before} before, {mappings_after} after"
     );
-    // **Both names, whenever they differ.** Comparing one count against the other is blind in
-    // exactly the C6 case: an arena still mapped on the old `/dev/videoN` contributes nothing to
-    // `mappings_of` for the new name, so a leak of the whole old arena reads as "same count,
-    // nothing leaked" and §6.1 S2-2 goes unverified precisely where it is interesting. The old
-    // node must hold nothing — it no longer exists, and `release_source()` runs before any
-    // backoff (`pipeline.rs`) — and the new one must hold what the pipeline holds, which the
-    // assertion above already pins.
+    // Check both node names after renumbering: counting only the new path would
+    // miss an entire arena still mapped against the old device.
     if renumbered {
         let stale = mappings_of(&node_before);
         println!("  {node_before} mappings after recovery: {stale} (must be zero)");

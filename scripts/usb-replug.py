@@ -1,56 +1,24 @@
 #!/usr/bin/env python3
-"""Make the kernel unplug and replug the NanoKVM-USB dongle, so recovery is testable.
+"""Reset or rebind NanoKVM-USB interfaces for recovery tests.
 
-NATIVE_CLIENT_PLAN §6.1 S2-4 and §12 require the client to survive "device unplug and replug
-— both nodes, in either order". Nobody can pull a cable from inside an automated test, and a
-recovery test that cannot be repeated is not a test. The user owns the dongle's usbfs nodes,
-so the kernel can do the replug for us: usbfs can reset a device (USBDEVFS_RESET) or unbind
-and rebind its drivers (USBDEVFS_DISCONNECT/CONNECT). The Stage 2 Rust hardware tests shell
-out to this script; it is a test fixture, not part of the client.
+A reset may leave driver nodes intact when the driver handles it in place.
+Rebind removes and recreates them. The timeline reports which nodes disappeared
+and their replacement names; successful return requires every affected node.
 
-Why two methods: a reset is the closer analogue of a cable pull, but a driver that implements
-`pre_reset`/`post_reset` survives one in place and its /dev node never disappears — which is a
-measurement, not a failure. A rebind always tears the driver down. Run both and use whichever
-actually produces a disconnect for the node under test.
+Selection uses the sysfs port path and the dongle's video, serial, and internal
+hub IDs. Before each ioctl, read the usbfs descriptor and verify it matches the
+selected device. This catches stale device numbers between selection and open.
 
-Identity, and what "back" means (review R1, R4, R5):
+Rebind restores interfaces in a finally block with SIGINT/SIGTERM blocked during
+the unbound interval. Errors affect both the timeline and exit status.
 
-  * A device's identity is its **sysfs port path** (`3-2.2.2`), never its /dev name. v4l2 and
-    cdc_acm hand out the lowest free minor at registration, so the very replug this script
-    performs can bring the dongle back as /dev/video0 + /dev/ttyACM0. "Back" therefore means
-    *the USB device re-enumerated at the same port path and its class nodes exist*, whatever
-    they are now called; the new names are printed, loudly, because every hardware test in this
-    repo hardcodes /dev/video4 and /dev/ttyACM1.
-  * Nothing is refused by /dev name. The rule is topological: every device acted on must hang
-    off the dongle's own 1a40:0101 hub, and a `--video`/`--serial` argument that resolves to a
-    USB device outside the allowlist is refused. That covers the user's unrelated hardware
-    however the kernel happens to have numbered it today.
-  * Immediately before any ioctl, the **device descriptor is read back from the usbfs node
-    itself** (its first 18 bytes) and must equal the vid:pid `resolve()` approved. sysfs says
-    which node to open; the descriptor proves what answered. That closes both the
-    `--sysfs-root` hole and the resolve→open devnum race.
+--dry-run resolves and prints selection without opening usbfs. --sysfs-root is
+restricted to dry runs and self-tests; hardware operations require real /sys.
+Run --self-test for fake-backend checks without hardware.
 
-Other safety rules (CLAUDE.md, and the contract for this script):
-
-  * Everything is resolved through sysfs at run time; usbfs device numbers change on every
-    re-enumeration, so a path captured earlier is a path to somebody else's hardware.
-  * A rebind reconnects on **every** exit path, including Ctrl-C in the gap — the same rule as
-    the release-all guards on the input tests. SIGINT/SIGTERM are blocked while the interfaces
-    are unbound, and the CONNECT loop is in a `finally`.
-  * An ioctl that failed is a failed operation: the errors reach the timeline and the exit code.
-  * --dry-run resolves, prints, and exits without opening a usbfs node at all.
-  * --sysfs-root is for --self-test. Acting on hardware with a root that is not /sys is refused
-    before anything is opened; the descriptor check makes even that belt and braces.
-
-Exit codes: 0 every affected node present at the end, 1 a node still missing after --wait or an
-ioctl failed, 2 a refusal.
-
-Usage:
-  scripts/usb-replug.py <video|serial|dongle|both|both-reversed> [--method reset|rebind]
-                        [--gap SECS] [--wait SECS] [--dry-run]
-                        [--video /dev/videoN] [--serial /dev/ttyACMN] [--port 3-2.2.2]
-  scripts/usb-replug.py --self-test
-"""
+Exit codes: 0 all affected nodes present; 1 operation failed or return timed out;
+2 invalid arguments or device selection. Hardware use requires explicit reset
+authorization and the identity checks described in docs/development.md."""
 import argparse
 import errno
 import fcntl
@@ -83,7 +51,7 @@ REAL_SYSFS = "/sys"
 USBFS_PREFIX = "/dev/bus/usb/"
 
 POLL_S = 0.005  # 5 ms; the resolution of every "gone"/"back" timestamp below
-SETTLE_S = 2.0  # how long a disconnect gets to *begin* after the ioctl returns (review R3)
+SETTLE_S = 2.0  # how long a disconnect gets to *begin* after the ioctl returns
 DESCRIPTOR_LEN = 18  # sizeof(struct usb_device_descriptor)
 
 TARGETS = ("video", "serial", "dongle", "both", "both-reversed")
@@ -99,7 +67,7 @@ class Refused(Exception):
 
 
 class Kernel:
-    """Everything this script does to the machine, in one injectable object (review R9).
+    """Everything this script does to the machine, in one injectable object.
 
     The real implementation is these eight one-liners. `--self-test` substitutes a fake that
     records ioctls, owns a virtual set of /dev nodes and can drive its own clock, which is how
@@ -171,7 +139,7 @@ def _class_link(sysfs_root, node):
 def _usb_device_of(sysfs_root, link):
     """Walk up from a class device to the first ancestor that is a USB device.
 
-    Same rule device-health.py uses (§8): the first directory carrying an `idVendor` attr.
+    Same rule as device-health.py: the first directory carrying an `idVendor` attr.
     """
     root = os.path.realpath(sysfs_root)
     dev = os.path.realpath(link)
@@ -186,7 +154,7 @@ def _device_by_port(sysfs_root, port):
     """Find a USB device by its sysfs port path (`3-2.2.2`) — the identity that survives a replug.
 
     This is what `--port` names, and it is the only way in when both /dev nodes are missing,
-    which is exactly the state this script exists to get out of (review R7).
+    which is exactly the state this script exists to get out of.
     """
     name = os.path.basename(port.rstrip("/"))
     direct = os.path.join(sysfs_root, "bus", "usb", "devices", name)
@@ -203,7 +171,7 @@ def _interfaces_of(dev):
     """Interface numbers of a USB device, read from the `<dev>:C.N` children.
 
     The kernel writes bInterfaceNumber as %02x, so this parses base 16 — and the fake trees in
-    the self-test write it the same way, or the self-test would bless either base (review R8).
+    the self-test write it the same way, or the self-test would bless either base.
     """
     name = os.path.basename(dev)
     out = []
@@ -296,12 +264,12 @@ def resolve(sysfs_root, video_node, serial_node, port=None):
 
     Returns (video, serial, hub); video or serial may be None when that half has not
     enumerated — `dongle` can still put it back, which is the point of naming devices by port
-    path rather than by /dev node (review R7). Raises Refused. Opens nothing.
+    path rather than by /dev node. Raises Refused. Opens nothing.
 
     The refusals, in order:
       1. an explicit --video/--serial that resolves to a USB device outside the allowlist —
          this is what stands between the script and the user's unrelated hardware, and it is a
-         statement about the *device*, not about a name the kernel may reassign (review R5);
+         statement about the *device*, not about a name the kernel may reassign;
       2. anything not hanging off the dongle's own 1a40:0101 hub;
       3. two nodes that do not share that one hub — they are not one dongle.
     """
@@ -377,7 +345,7 @@ def _hold_signals():
 
     A rebind leaves the dongle's drivers unbound between DISCONNECT and CONNECT. A signal
     delivered in that window must not be able to end the process there, or the nodes stay gone
-    until somebody physically replugs the dongle (review R2). The `finally` around the gap is
+    until somebody physically replugs the dongle. The `finally` around the gap is
     the other half: this stops the signal arriving, that copes if it arrives anyway.
     """
     try:
@@ -467,7 +435,7 @@ class Watcher(threading.Thread):
 
 
 def _verify_descriptor(kernel, fd, dev, usbfs, t0):
-    """Prove the fd we are about to ioctl is the device resolve() approved (review R1).
+    """Prove the fd we are about to ioctl is the device resolve() approved.
 
     The first 18 bytes of a usbfs node are the USB device descriptor: idVendor at bytes 8-9,
     idProduct at 10-11, both little-endian. sysfs told us which node to open; only this says
@@ -502,7 +470,7 @@ def _verify_descriptor(kernel, fd, dev, usbfs, t0):
 
 
 def _current_nodes(dev):
-    """The /dev nodes this device owns *now*, whatever they are called (review R4/R5).
+    """The /dev nodes this device owns *now*, whatever they are called.
 
     The port path is the authority. v4l2 and cdc_acm hand out the lowest free minor at
     registration, so the names captured before the operation are a guess about the future, not
@@ -548,7 +516,7 @@ def do_operation(label, dev, nodes, method, gap, wait, sysfs_root, kernel=None):
             kernel.close(fd)
 
         # The disconnect may only begin after the ioctl returns, so give it a bounded window
-        # before concluding the driver survived in place (review R3).
+        # before concluding the driver survived in place.
         settle = min(SETTLE_S, wait)
         settle_deadline = kernel.monotonic() + settle
         while kernel.monotonic() < settle_deadline and not watcher.any_gone():
@@ -582,7 +550,7 @@ def _reset(kernel, fd, usbfs, t0):
     except OSError as e:
         # ENODEV here means the device re-enumerated out from under the fd, which is a
         # successful unplug, not an error. Anything else is a real failure and has to reach
-        # the exit code (review R6).
+        # the exit code.
         if e.errno == errno.ENODEV:
             _stamp(kernel, t0, "USBDEVFS_RESET returned ENODEV (device re-enumerated)")
             return []
@@ -596,7 +564,7 @@ def _rebind(kernel, fd, dev, usbfs, gap, t0):
 
     The CONNECT loop is in a `finally` and signals are blocked around the whole window: an
     interrupt between the two halves would otherwise leave the dongle's drivers unbound, which
-    is the one failure this fixture must not be able to cause (review R2).
+    is the one failure this fixture must not be able to cause.
     """
     errors = []
     ifaces = _interfaces_of(dev.sysfs)
@@ -711,7 +679,7 @@ def run(args, kernel=None):
 
     # --sysfs-root is a test parameter. Acting on the machine with a tree that is not /sys
     # would let it name any bus and devnum on the box, so it is refused before anything is
-    # opened; the descriptor check in do_operation is the second line of defence (review R1).
+    # opened; the descriptor check in do_operation is the second line of defence.
     if kernel.real and os.path.realpath(args.sysfs_root) != REAL_SYSFS:
         raise Refused(f"--sysfs-root {args.sysfs_root} is not {REAL_SYSFS}: a fake tree may "
                       f"only be used with --dry-run or --self-test, never to aim an ioctl")

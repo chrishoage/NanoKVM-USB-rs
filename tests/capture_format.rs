@@ -1,22 +1,4 @@
-//! The runtime format switch the chrome's Video popover needs (plan §12 Stage 4b).
-//!
-//! `PipelineHandle::request_format` is the smallest thing that makes "choose a resolution" mean
-//! anything: it records a request, the capture thread hands it to the [`SourceOpener`], and the
-//! opener's answer decides whether the device is reopened. Everything here is asserted against
-//! [`SyntheticSource`] replaying **real frames off this device** (`fixtures/frames/`, §9.1), so
-//! the resolution the pipeline reports is read from a genuine JPEG start-of-frame header (§6, A6)
-//! rather than from a number a fake made up.
-//!
-//! No hardware, no `/dev`, no `/sys`.
-//!
-//! # The corpus is gitignored, so every test here can skip
-//!
-//! `fixtures/frames/` is build output (`fixtures/frames/MANIFEST.md` says how to re-record it) and
-//! is not in the repository. A fresh checkout therefore has no corpus, and a new test file that
-//! panicked without one would break `cargo test` for anyone who has just cloned this. Each test
-//! below asks [`corpus`] first and **returns with a message** when it is missing. Several
-//! *pre-existing* tests in `src/capture/` still panic in that situation; that is a separate
-//! decision and is not changed here.
+//! Runtime format changes through the capture opener, including refusal and recovery.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,7 +17,7 @@ fn frames_dir() -> PathBuf {
 
 /// Whether the recorded corpus is present, saying so once per test when it is not.
 ///
-/// Every test here starts with `if !corpus() { return; }`. The corpus is gitignored build output,
+/// Every test here starts with `if !corpus { return; }`. The corpus is gitignored build output,
 /// and a fresh checkout must still be able to run `cargo test`.
 fn corpus() -> bool {
     let dir = frames_dir();
@@ -91,14 +73,14 @@ fn frames_at(width: u32, height: u32) -> Vec<Vec<u8>> {
 ///
 /// This is the whole point of the test: a *real* `V4l2Opener` renegotiates by reopening the node,
 /// and what the caller can observe from outside is that frames start arriving at the new size.
-/// This opener reproduces exactly that observable behaviour with no device.
+/// This opener reproduces that observable behaviour with no device.
 struct ModeOpener {
     width: u32,
     height: u32,
     opens: Arc<AtomicU32>,
 }
 
-/// A synthetic source that also **reports what it negotiated**, the way `V4l2Source` does from
+/// A synthetic source that also reports what it negotiated, the way `V4l2Source` does from
 /// `G_FMT`. `SyntheticSource` itself answers `None`, which is the truth for it; the pipeline's
 /// `PipelineStats::negotiated_dimensions` is fed from this answer and is what the chrome's Video
 /// popover marks as the current mode (`App::tick`).

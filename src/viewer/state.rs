@@ -1,49 +1,8 @@
-//! The capture state machine, as a pure reducer (plan §2.6, §2.8, §12 Stage 1).
+//! Pure input-capture state machine.
 //!
-//! §2.6 lists the release-all triggers and §12 adds the compositor-driven one. That list is the
-//! correctness surface of this module, so it is written as `reduce(session, trigger) -> (session,
-//! actions)` with no window, no producer and no clock in scope: every trigger and every action can
-//! be asserted in a unit test that needs no display.
-//!
-//! Three capture phases:
-//!
-//! ```text
-//!            left-click in window / Enter                 engage() == Ok
-//!   Released ────────────────────────────▶ Engaging ─────────────────────────▶ Captured
-//!      ▲                                      │  ▲                                 │
-//!      │                                      └──┘ engage() == NotYetAcked         │
-//!      │        focus lost │ inhibitor inactive │ Pause │ submit failed │ close     │
-//!      └───────────────────────────────────────────────────────────────────────────┘
-//!                        always: request_release_all(reason), disarm, ungrab
-//! ```
-//!
-//! **`Engaging` exists because acknowledgement is asynchronous.** §2.6: "a new session must not
-//! emit input until it observes `acked_epoch >=` its own epoch", and [`crate::input::Producer::engage`]
-//! enforces that by failing with `NotYetAcked`. Waiting for it on the event loop would block input
-//! handling, so the state machine holds `Engaging` and retries — including on any input event that
-//! arrives while it waits, so re-capture does not sit out a whole 250 ms tick.
-//!
-//! **No input is forwarded outside `Captured`.** That is not a convention observed by the caller;
-//! it is a property of this reducer, asserted directly by its tests.
-//!
-//! # Why the consumed-edge bookkeeping lives here
-//!
-//! The click and the `Enter` that *enter* capture must not reach the target — a blind click on a
-//! live console can launch or destroy something (`CLAUDE.md`) — and neither may their matching
-//! release, or the target sees half a transition. That is a two-edge rule, and a two-edge rule
-//! kept outside the state machine is a second, unsynchronised state machine: the event loop used
-//! to hold a `consumed_left_press` flag that a button-up in `Released`/`Engaging` never cleared,
-//! so the *next* genuine click had its press forwarded and its release eaten, leaving LEFT held on
-//! the target. The flags are therefore part of [`Session`], and the reducer maintains this
-//! invariant across every state:
-//!
-//! > **A press that was forwarded always has a release that is forwardable.**
-//!
-//! It follows from three rules, each visible in one place below: a consumed edge clears its flag
-//! on the matching up *in any state*; every transition to `Released` clears both flags (the
-//! release-all has zeroed the target's masks anyway, §2.6); and a press arriving while a consume
-//! is still pending clears the flag before forwarding, because the up it was waiting for can no
-//! longer arrive.
+//! Capture waits for the previous release to be acknowledged locally. The click or Enter
+//! that engages capture is consumed, including its release edge. Focus loss, explicit
+//! release, overflow, and link loss cancel the session and preserve the reason for display.
 
 use crate::input::{Event, ReleaseOutcome, ReleaseReason, ReleaseRecord, SubmitError};
 use crate::proto::report::button;
@@ -56,15 +15,14 @@ pub enum CaptureState {
     #[default]
     Released,
     /// The user asked to capture; the inhibitor and the grab are up but the writer has not yet
-    /// acknowledged the previous release-all, so nothing may be sent (§2.6).
+    /// acknowledged the previous release-all, so nothing may be sent.
     Engaging,
     /// Input is forwarded to the target.
     Captured,
 }
 
 impl CaptureState {
-    /// Short text for the window title, including how to get out — §12 Stage 1 requires the
-    /// viewer's own release binding to be shown on screen.
+    /// Window-title capture state and release hint.
     pub fn title_fragment(&self, release_key: &str) -> String {
         match self {
             CaptureState::Released => "[click or Enter to capture]".to_string(),
@@ -76,20 +34,12 @@ impl CaptureState {
     }
 }
 
-/// Why input stopped, kept until the user deliberately re-captures (§2.8).
-///
-/// §2.8 requires an overflow to be "surfaced — not a silent counter", and the Stage 1 viewer did
-/// not meet that: an overflow released the session, logged a warning, and put the title back to
-/// `[click or Enter to capture]`, which is indistinguishable from the user having pressed `Pause`.
-/// A user who never reads the log therefore saw input stop for no stated reason. The notice is
-/// carried in the session so that the *reason the last session ended* is on screen until a new
-/// one starts, and so that a pure reducer test can pin both raising it and clearing it.
+/// Reason input stopped, retained until successful recapture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notice {
     /// [`SubmitError::Overflow`]: coalescing could not make room, so the session was cancelled.
     Overflow,
-    /// [`SubmitError::LinkDown`]: the serial transport went away under the session (§2.7 is
-    /// reconnecting, but nothing may be forwarded until it comes back and the user re-captures).
+    /// The serial link failed; forwarding waits for recovery and recapture.
     LinkDown,
 }
 
@@ -114,15 +64,13 @@ pub struct Session {
     capture: CaptureState,
     /// A left button-down was consumed to enter capture, so its matching up must be consumed too.
     consumed_left: bool,
-    /// The same for the `Enter` that entered capture (§12 Stage 1's keyboard capture binding).
+    /// The same for the `Enter` that entered capture.
     consumed_enter: bool,
     /// A close has already been requested. Closing releases once, not once per tick: `App::tick`
     /// feeds `CloseRequested` while `interrupted` is set, and a release-all per tick would bump
-    /// `requested_epoch` every 250 ms until the loop actually stops (§2.6).
+    /// `requested_epoch` every 250 ms until the loop stops.
     closing: bool,
-    /// Why the last session ended, when it ended for a reason the user needs telling (§2.8).
-    /// Cleared by the next successful engagement — the deliberate recapture §2.8 asks for — and
-    /// by nothing else, so it cannot be missed by looking away for a tick.
+    /// Session-failure notice, cleared only by successful engagement.
     notice: Option<Notice>,
 }
 
@@ -153,7 +101,7 @@ impl Session {
         self.consumed_enter
     }
 
-    /// Why input stopped, if it stopped for a reason worth showing (§2.8).
+    /// Why input stopped, if it stopped for a reason worth showing.
     pub fn notice(&self) -> Option<Notice> {
         self.notice
     }
@@ -163,7 +111,7 @@ impl Session {
 ///
 /// Motion, buttons and keys are triggers rather than a separate "forward this" path so that the
 /// no-forwarding-outside-`Captured` rule — and the consumed-edge rule above it — are enforced in
-/// one place. In particular there is **no** separate "this click captures" trigger: the caller
+/// one place. In particular there is no separate "this click captures" trigger: the caller
 /// reports the button transition it saw and the reducer decides what it means, because deciding
 /// that outside the reducer is what let the two views of a click drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,18 +122,16 @@ pub enum Trigger {
     Button { mask: u8, down: bool },
     /// Pointer or wheel motion, already translated.
     Motion(Event),
-    /// The viewer's own release binding (§12 Stage 1). Never forwarded.
+    /// The viewer's own release binding. Never forwarded.
     ReleaseKey,
     /// `WindowEvent::Focused(false)`. niri does not deactivate the inhibitor on focus loss, so
-    /// this is client-driven (§2.6, §12 Stage 1).
+    /// this is client-driven.
     FocusLost,
     /// The compositor set the shortcut inhibitor `inactive` — on niri, the user's `Mod+Escape`.
     /// A compositor-driven "let me out" signal, and the user's way out that does not depend on
-    /// this client (q6c).
+    /// this client.
     InhibitorInactive,
-    /// [`crate::input::Producer::submit`] refused an event (§2.8: overflow is an explicit failure
-    /// requiring deliberate recapture, not a silent degradation) — or the producer was found
-    /// disengaged, or the link down, on a tick with no event having been refused at all.
+    /// Input refusal or producer-driven loss of the captured session.
     SubmitFailed(SubmitError),
     /// The window manager or the user asked to close.
     CloseRequested,
@@ -210,7 +156,7 @@ impl Trigger {
 /// What the caller must do as a result. The reducer never performs any of these itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Create the `zwp_keyboard_shortcuts_inhibitor_v1` (§1.5).
+    /// Create the `zwp_keyboard_shortcuts_inhibitor_v1`.
     ArmInhibitor,
     /// Destroy it.
     DisarmInhibitor,
@@ -220,7 +166,7 @@ pub enum Action {
     ReleasePointer,
     /// Call [`crate::input::Producer::engage`] and feed the answer back in.
     TryEngage,
-    /// Call [`crate::input::Producer::request_release_all`] with this reason (§2.6).
+    /// Call [`crate::input::Producer::request_release_all`] with this reason.
     ReleaseAll(ReleaseReason),
     /// Submit this event to the target.
     Forward(Event),
@@ -232,7 +178,7 @@ pub enum Action {
 ///
 /// A `Vec` rather than an inline array: it does not allocate when empty, which is the common case,
 /// and the one small allocation on a forwarded event is far below the ~100 reports per second the
-/// link can carry (§5.1).
+/// link can carry.
 pub type Actions = Vec<Action>;
 
 /// The release sequence, in order: ask for the release-all first so the writer starts discarding
@@ -253,12 +199,8 @@ fn forward(event: Event) -> Actions {
     vec![Action::Forward(event)]
 }
 
-/// Which §2.8 notice, if any, a refused submission leaves on screen.
-///
-/// Only the two failures the user can neither predict nor undo get one. `Disengaged` does not:
-/// the producer disengages *after* some other cancellation, whose own trigger already carried
-/// whatever notice was owed — and a link failure behind it is already in the title from
-/// [`crate::input::Stats::link_down`]. `ShuttingDown` does not either: the window is going away.
+/// Visible notice for overflow or link loss. Ordinary disengagement already has
+/// a release cause; shutdown closes the window and needs no persistent notice.
 fn notice_for(error: SubmitError) -> Option<Notice> {
     match error {
         SubmitError::Overflow => Some(Notice::Overflow),
@@ -267,11 +209,11 @@ fn notice_for(error: SubmitError) -> Option<Notice> {
     }
 }
 
-/// Which §2.6 reason a refused submission corresponds to.
+/// Cancellation reason corresponding to a refused submission.
 fn reason_for(error: SubmitError) -> ReleaseReason {
     match error {
         // The producer has already triggered this reason itself; asking again coalesces into the
-        // same sequence (§2.6, "setting an already-set flag is a no-op").
+        // same sequence.
         SubmitError::Overflow => ReleaseReason::Overflow,
         SubmitError::LinkDown => ReleaseReason::LinkDown,
         SubmitError::Disengaged => ReleaseReason::CaptureReleased,
@@ -281,8 +223,8 @@ fn reason_for(error: SubmitError) -> ReleaseReason {
     }
 }
 
-/// Leave capture: the full §2.6 sequence, and both consumed edges dropped because the release-all
-/// zeroes the target's key and button masks — there is no held press left for an up to match.
+/// Leave capture and discard consumed-edge bookkeeping. Release-all clears the
+/// target state those release edges would otherwise match.
 fn release(mut session: Session, reason: ReleaseReason) -> (Session, Actions) {
     session.capture = CaptureState::Released;
     session.consumed_left = false;
@@ -293,7 +235,7 @@ fn release(mut session: Session, reason: ReleaseReason) -> (Session, Actions) {
 /// One transition of a key or button whose *press* may be consumed to enter capture.
 ///
 /// `consumed` selects the session flag for this particular edge pair and `event` is what the
-/// target would see were it forwarded. Both `Enter` and the left mouse button follow exactly this
+/// target would see were it forwarded. Both `Enter` and the left mouse button follow this
 /// shape, so they share it rather than each growing their own copy — two copies drifting apart is
 /// the defect this replaces.
 fn capturing_edge(
@@ -323,7 +265,7 @@ fn capturing_edge(
             }
         };
     }
-    // The up. A consumed press eats its up in **any** state, including one reached after the press
+    // The up. A consumed press eats its up in any state, including one reached after the press
     // was consumed — that is the whole point.
     if *consumed(&mut session) {
         *consumed(&mut session) = false;
@@ -346,21 +288,14 @@ fn plain_input(session: Session, event: Event) -> (Session, Actions) {
     }
 }
 
-/// The §2.6.1 release-outcome notice, as a two-field state machine over
-/// [`crate::input::Stats::last_release`].
+/// Track the last release outcome and whether it was already reported.
 ///
-/// An `Unsent` release means the target may still be holding keys and nothing local can fix it,
-/// so it is shown until something contradicts it. What contradicts it is the **next** release
-/// that was actually submitted — which, across a §2.7 reconnect, is the release-all the writer
-/// sends on the replacement link (`Writer::commission`, reason `Reconnected`): the keys really
-/// are released then, and the title must stop claiming otherwise.
-///
-/// It lives here, in the pure module, because "does the notice clear when the reconnect's release
-/// lands?" is a question about this bookkeeping and not about winit. `App` keeps the logging.
+/// An unsent warning persists until a later submitted release, including commissioning
+/// on a replacement link. Local state alone cannot clear target-held keys.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReleaseNotice {
     /// The epoch of the last record acted on, so each release is reported once rather than every
-    /// tick (§2.6.1).
+    /// tick.
     reported_epoch: Option<u64>,
     raised: bool,
 }
@@ -368,8 +303,8 @@ pub struct ReleaseNotice {
 impl ReleaseNotice {
     /// Fold in the latest [`crate::input::Stats::last_release`].
     ///
-    /// Returns the record when it has not been seen before, so the caller logs it exactly once.
-    /// Records are matched by epoch: epochs increase monotonically (§2.6) and every completed
+    /// Returns the record when it has not been seen before, so the caller logs it once.
+    /// Records are matched by epoch: epochs increase monotonically and every completed
     /// sequence has its own, so "same epoch" is "same release" and nothing else.
     pub fn observe(&mut self, last_release: Option<ReleaseRecord>) -> Option<ReleaseRecord> {
         let record = last_release?;
@@ -390,19 +325,8 @@ impl ReleaseNotice {
     }
 }
 
-/// Which release a `Captured` session owes when the producer has gone quiet without ever refusing
-/// a submission, or `None` if it owes none.
-///
-/// The producer can end a session by itself: the writer hits `LinkDown` and triggers its own
-/// cancellation (§2.6), or an overflow raised elsewhere disengages it. No event reaches the event
-/// loop when that happens, so a session that watched only its own submissions would sit in
-/// `Captured` — title claiming capture, inhibitor armed, pointer grabbed — over a producer that can
-/// no longer send anything, and would never run the §2.6 release sequence for it. The tick asks
-/// this instead, and feeds back whatever it returns.
-///
-/// Disengagement is reported ahead of a link failure because it is the more specific fact: the
-/// producer disengages only after a cancellation has already been triggered for some reason, while
-/// `link_down` says no more than that the transport is gone.
+/// Detect an input producer that ended a session without a host submission.
+/// The event loop must release its inhibitor and pointer grab even when idle.
 pub fn self_release_trigger(engaged: bool, link_down: bool) -> Option<Trigger> {
     if !engaged {
         return Some(Trigger::SubmitFailed(SubmitError::Disengaged));
@@ -421,9 +345,9 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
     let mut s = session;
 
     // Closing wins from every state, and still releases first: a window that vanishes while the
-    // target holds a key leaves the key held (§2.6, clean shutdown). It releases exactly **once** —
+    // target holds a key leaves the key held. It releases once —
     // the caller feeds this on every tick while an interrupt is pending, and a release per tick
-    // would bump `requested_epoch` every 250 ms until the loop actually stops.
+    // would bump `requested_epoch` every 250 ms until the loop stops.
     if let CloseRequested = trigger {
         if s.closing {
             return (s, vec![Action::Exit]);
@@ -434,7 +358,7 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
         return (s, actions);
     }
     // After a close, nothing re-captures and nothing is forwarded: the writer's shutdown
-    // release-all is the last thing that may reach the target (§2.6, `SubmitError::ShuttingDown`).
+    // release-all is the last thing that may reach the target.
     if s.closing {
         return (s, Actions::new());
     }
@@ -459,23 +383,21 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
         Button { mask, down } => plain_input(s, Event::Button { button: mask, down }),
         Motion(e) => plain_input(s, e),
 
-        // ---- every release trigger in §2.6 -----------------------------------------------------
         FocusLost if s.capture != Released => release(s, ReleaseReason::FocusLost),
         InhibitorInactive if s.capture != Released => release(s, ReleaseReason::UserRequested),
         ReleaseKey if s.capture != Released => release(s, ReleaseReason::UserRequested),
         SubmitFailed(e) if s.capture != Released => {
             let (mut s, actions) = release(s, reason_for(e));
-            // §2.8: surface it. The notice outlives the release, because the release is over in
-            // a tick and the user may be looking at the target rather than at the title.
+            // Keep the failure notice past the release tick so it remains observable.
             if let Some(notice) = notice_for(e) {
                 s.notice = Some(notice);
             }
             (s, actions)
         }
 
-        // ---- waiting on the writer's acknowledgement (§2.6) -------------------------------------
+        // ---- waiting on the writer's acknowledgement -------------------------------------
         EngageSucceeded if s.capture == Engaging => {
-            // The consumed edges deliberately survive this transition: the click that captured is
+            // The consumed edges survive this transition: the click that captured is
             // very often still held when the acknowledgement lands, and its up must still be
             // eaten.
             s.capture = Captured;
@@ -487,7 +409,7 @@ pub fn reduce(session: Session, trigger: Trigger) -> (Session, Actions) {
         }
         Retry if s.capture == Engaging => (s, vec![Action::TryEngage]),
 
-        // ---- everything else is deliberately inert ----------------------------------------------
+        // ---- everything else is inert ----------------------------------------------
         // Released forwards nothing and releases nothing, and a stray engage answer for a session
         // that has already ended must not resurrect it.
         _ => (s, Actions::new()),
@@ -560,7 +482,7 @@ mod tests {
         }
     }
 
-    /// §2.6's trigger list, one assertion per trigger.
+    /// Every release trigger must clear capture state.
     #[test]
     fn focus_loss_releases() {
         released_by(Trigger::FocusLost, ReleaseReason::FocusLost);
@@ -569,7 +491,7 @@ mod tests {
     #[test]
     fn inhibitor_inactive_releases() {
         // The user's Mod+Escape on niri. The compositor keeps that bind for itself even while
-        // inhibiting, and the client is told by the inhibitor going inactive (q6c).
+        // inhibiting, and the client is told by the inhibitor going inactive.
         released_by(Trigger::InhibitorInactive, ReleaseReason::UserRequested);
     }
 
@@ -645,8 +567,7 @@ mod tests {
 
     #[test]
     fn engagement_retries_until_the_writer_acknowledges() {
-        // §2.6: input must not flow until acked_epoch reaches the session's epoch, and the event
-        // loop must not block waiting for it.
+        // Poll engagement without blocking until the requested epoch is acknowledged.
         let (state, actions) = reduce(engaging(), Trigger::EngageDeferred);
         assert_eq!(state.capture(), CaptureState::Engaging);
         assert!(actions.is_empty());

@@ -1,20 +1,4 @@
-//! The capture state machine driven against the **real** input path (plan §2.6, §2.8, §12 Stage 1).
-//!
-//! `viewer::state::reduce` is pure and `viewer_state.rs` asserts its transition table. This test
-//! closes the other half: that performing the actions it emits, against a real writer thread over a
-//! fake link, produces the behaviour §2.6 describes — nothing is written before capture, a
-//! release-all reaches the link on every trigger, input stays refused until the user deliberately
-//! re-engages and the writer has acknowledged, and a click that captured never leaves a button held
-//! on the target.
-//!
-//! **The driver feeds real events, not pre-classified ones.** It hands the reducer the button
-//! transitions winit would deliver and lets the reducer decide which of them capture. That is
-//! deliberate: the defect this file grew a test for was a copy of the "which click captures" rule
-//! living outside the reducer and drifting out of step with it, and a driver that re-implemented
-//! the same rule would have hidden the drift rather than shown it.
-//!
-//! It needs no display and no hardware: the reducer has no window in it, and the link is
-//! `input::testing::fake_link`.
+//! Capture-state transitions applied through the real input producer and fake transport.
 
 use std::time::Duration;
 
@@ -27,7 +11,7 @@ use nanokvm::viewer::state::{reduce, Action, CaptureState, Session, Trigger};
 
 /// A stand-in for `App::perform`: everything the event loop would do, minus the window.
 ///
-/// Kept deliberately literal rather than shared with the viewer, so that a change to the viewer's
+/// Kept literal rather than shared with the viewer, so that a change to the viewer's
 /// action handling shows up here as a difference rather than being silently mirrored.
 struct Driver {
     producer: Producer,
@@ -90,7 +74,7 @@ impl Driver {
         self.session.capture()
     }
 
-    /// One left-button transition, exactly as `WindowEvent::MouseInput` delivers it.
+    /// One left-button transition, as `WindowEvent::MouseInput` delivers it.
     fn left(&mut self, down: bool) {
         self.feed(Trigger::Button {
             mask: button::LEFT,
@@ -99,7 +83,7 @@ impl Driver {
     }
 
     /// The viewer's engage retry: the event loop never blocks on the acknowledgement, it retries
-    /// on the next tick (§2.6).
+    /// on the next tick.
     fn capture(&mut self) {
         self.left(true);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -168,7 +152,7 @@ fn the_capture_click_is_consumed_and_never_reaches_the_target() {
     driver.capture();
     assert!(driver.inhibitor_armed);
     assert!(driver.pointer_grabbed);
-    // §CLAUDE.md: a blind click on a live desktop can launch or destroy something. Neither the
+    // A capture click must remain local because a target click can launch or modify something. Neither the
     // click that captures nor its release may produce a frame.
     assert_eq!(control.frame_count(), 0);
     assert_eq!(driver.forwarded, 0);
@@ -186,7 +170,7 @@ fn captured_input_reaches_the_link() {
     assert_eq!(driver.forwarded, 1);
 }
 
-/// §2.6's trigger list, each one asserted to release and to disengage the producer.
+/// Every capture exit must release input and disengage the producer.
 #[test]
 fn every_release_trigger_releases_and_disengages() {
     let triggers = [
@@ -215,7 +199,7 @@ fn every_release_trigger_releases_and_disengages() {
             "pointer left grabbed on {trigger:?}"
         );
 
-        // The writer synthesizes the release itself; the local barrier is the ack (§2.6.1).
+        // The writer synthesizes the release itself; the local barrier is the ack.
         assert!(
             driver
                 .producer
@@ -227,8 +211,7 @@ fn every_release_trigger_releases_and_disengages() {
             "no release frames on {trigger:?}"
         );
 
-        // §2.8: input stays disengaged until deliberate recapture. Nothing the viewer does
-        // afterwards may forward anything.
+        // Recovery alone must not resume forwarding; require explicit recapture.
         assert!(
             !driver.producer.is_engaged(),
             "still engaged after {trigger:?}"
@@ -257,7 +240,7 @@ fn a_deliberate_recapture_re_engages() {
     driver.feed(Trigger::FocusLost);
     assert!(!driver.producer.is_engaged());
     // The user clicks again. `engage` fails with `NotYetAcked` until the writer catches up, which
-    // is exactly why `Engaging` exists.
+    // is why `Engaging` exists.
     driver.capture();
     assert!(driver.producer.is_engaged());
     driver.feed(Trigger::Motion(nanokvm::input::Event::PointerAbs {
@@ -267,23 +250,20 @@ fn a_deliberate_recapture_re_engages() {
     assert_eq!(driver.forwarded, 1);
 }
 
-// ---------------------------------------------------------------------------------------------
-// B1, end to end: the bytes the writer hands the transport, not merely the actions the reducer
-// emitted. The failure this guards against is a mouse frame whose button mask never returns to
-// zero — LEFT held down on someone's console with nothing left to release it.
-// ---------------------------------------------------------------------------------------------
+// Verify release bytes reach the transport after a consumed capture click.
+// A reducer-only assertion would miss a target button left held.
 
 #[test]
 fn b1_a_click_released_while_engaging_leaves_no_button_held_on_the_link() {
     let (mut driver, control) = setup();
 
-    // 1. Capture and release, exactly as pressing Pause does.
+    // 1. Capture and release, as pressing Pause does.
     driver.capture();
     driver.feed(Trigger::ReleaseKey);
     assert_eq!(driver.state(), CaptureState::Released);
 
     // 2. The user clicks again straight away. The release-all has not been acknowledged yet, so
-    //    the state machine sits in `Engaging`.
+    // the state machine sits in `Engaging`.
     driver.left(true);
     assert_eq!(
         driver.state(),

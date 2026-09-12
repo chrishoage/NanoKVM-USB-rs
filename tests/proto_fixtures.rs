@@ -1,9 +1,4 @@
-//! The §9.1 packet tests. `fixtures/packets/ch9329.toml` is the authority for byte-level
-//! correctness; these tests read it rather than retyping its bytes, because retyping is exactly
-//! where a transcription bug enters and silently blesses a wrong encoder.
-//!
-//! Also carries the fixed regression corpus from §9.2 item 6, whose three cases are known real
-//! traffic rather than fuzzer material.
+//! Byte-level protocol conformance against `fixtures/packets/ch9329.toml`.
 
 use std::time::Duration;
 
@@ -66,7 +61,7 @@ fn fixtures() -> Fixtures {
     toml::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
-/// Feed `bytes` to a fresh parser and demand exactly one frame and nothing else.
+/// Feed `bytes` to a fresh parser and demand one frame and nothing else.
 fn sole_frame(bytes: &[u8]) -> Frame {
     let mut p = Parser::new();
     p.push(bytes);
@@ -179,8 +174,7 @@ fn every_response_parses_and_answers_its_request() {
         let is_error = e.cmd & 0xC0 == 0xC0;
         assert_eq!(reply.is_error(), is_error, "{}", e.name);
         if is_error {
-            // §3.1: every error frame ends in a non-zero code, which is why upstream's short
-            // checksum discards all of them. Ours must surface the code.
+            // Device error codes must survive full-payload checksum validation.
             let code = reply
                 .error_code()
                 .unwrap_or_else(|| panic!("{}: no error code", e.name));
@@ -210,9 +204,7 @@ fn the_fixture_responses_cover_both_documented_error_codes() {
 
 // -- report builders against the fixture payloads ---------------------------
 
-/// §9.2 item 2 and the Appendix: the mouse payloads carry a leading mode byte and are exactly 5
-/// and 7 bytes. The device ACKs the short form and does nothing, so nothing but a byte-count
-/// assertion in our own encoder catches a regression.
+/// Mouse payload lengths include their required leading mode byte.
 #[test]
 fn every_mouse_packet_is_reproduced_by_its_report_builder() {
     let mut rel = 0;
@@ -258,7 +250,7 @@ fn every_mouse_packet_is_reproduced_by_its_report_builder() {
                     assert_eq!(report.payload()[..], e.data[..], "{}", e.name);
                 } else {
                     // FINDING, not a bug to paper over: `mouse_abs_max_15bit` carries x = 32767 to
-                    // document that the device masks and clamps it (§3.4). Our encoder clamps at
+                    // document that the device masks and clamps it. Our encoder clamps at
                     // construction, so it cannot reproduce those bytes -- deliberately, since an
                     // overshoot past 8191 jumps the pointer to (0,0) on a live console. Assert
                     // the clamp instead, and that it lands where the device would put the pointer.
@@ -397,9 +389,7 @@ fn usb_string_replies() -> Vec<(UsbStringKind, Entry)> {
     .collect()
 }
 
-/// A16 measured the three *strings*; the 2026-09-11 probe run recorded the *bytes*. The parser is
-/// checked against those bytes rather than against a retyped payload (§9.1), which is what makes
-/// this a test of `parse_usb_string` and not of whoever typed the fixture.
+/// Validate USB strings against the reply bytes recorded on 2026-09-11.
 #[test]
 fn every_usb_string_reply_fixture_parses_to_the_string_a16_measured() {
     let want = ["Sipeed", "NanoKVM-USB", "BA1612624UJPW2RUJ"];
@@ -423,9 +413,7 @@ fn every_usb_string_reply_fixture_parses_to_the_string_a16_measured() {
     }
 }
 
-/// §9.3: the fake is only worth testing against if it answers what the device answers. Now that
-/// the replies are pinned, that is checkable — byte for byte, over the pty, through the real
-/// `SerialLink`.
+/// The pseudo-terminal bridge must return the recorded identification payloads.
 #[test]
 fn the_fake_answers_get_usb_string_with_the_fixture_bytes() {
     let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn the fake CH9329");
@@ -447,11 +435,7 @@ fn the_fake_answers_get_usb_string_with_the_fixture_bytes() {
     fake.stop();
 }
 
-// -- regression corpus, §9.2 item 6 -----------------------------------------
-
-/// §3.2. Real traffic: the reply to an undefined command is five bytes with no checksum byte.
-/// Standalone it is undecidable until the caller's read timeout fires, at which point it retires
-/// as `Truncated`. A parser that indexes `frame[5 + len]` panics here instead.
+/// The recorded five-byte reply remains incomplete until expiration.
 #[test]
 fn regression_s3_2_five_byte_reply_with_no_checksum_byte() {
     let bytes = [0x57, 0xAB, 0x00, 0xFE, 0x00];
@@ -468,9 +452,7 @@ fn regression_s3_2_five_byte_reply_with_no_checksum_byte() {
     assert_eq!(p.pending_len(), 0);
 }
 
-/// §3.2 again, in the shape that actually costs a reply: the malformed frame immediately followed
-/// by a real one. The next frame's `0x57` is consumed as the missing checksum byte, so byte-wise
-/// resync is the only thing that gets the following reply back.
+/// Byte-wise resynchronization must recover a valid frame after the missing checksum.
 #[test]
 fn regression_s3_2_no_checksum_reply_does_not_eat_the_next_reply() {
     let reply = fixtures()
@@ -503,8 +485,7 @@ fn regression_s3_2_no_checksum_reply_does_not_eat_the_next_reply() {
     );
 }
 
-/// §3.1. Upstream's short receive checksum rejects every error frame, so it cannot tell a reported
-/// device error from silence. Ours parses them and hands the code up.
+/// Valid error frames must expose their device error code.
 #[test]
 fn regression_s3_1_error_frames_are_surfaced_not_dropped() {
     for e in fixtures()
@@ -523,7 +504,7 @@ fn regression_s3_1_error_frames_are_surfaced_not_dropped() {
         assert_ne!(
             (upstream_sum & 0xFF) as u8,
             bytes[bytes.len() - 1],
-            "{}: this fixture no longer demonstrates the §3.1 rejection",
+            "{}: this fixture no longer demonstrates the  rejection",
             e.name
         );
     }

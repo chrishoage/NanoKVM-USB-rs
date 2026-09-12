@@ -1,33 +1,8 @@
-//! Keyboard scripts: turning user text into keyboard reports, and nothing else.
+//! Pure compilation of chords, text, and macros into keyboard reports.
 //!
-//! This module is what `key`, `type` and `macro` are made of (§12 Stage 3). It is **pure** — no
-//! I/O, no device, no clap, no signals. It produces a [`Script`], a list of [`Step`]s the caller
-//! sends through the `link` seam at its own pace (§2.9), and a dry-run rendering of one.
-//!
-//! # Key forwarding and text injection are different operations (§10.2)
-//!
-//! A chord is *key forwarding*: `ctrl+alt+t` names physical keys, and the HID usage comes from
-//! [`crate::proto::keymap`] — the same table the viewer forwards through, so there is one
-//! authority for usages and nothing here retypes one. That is layout-independent.
-//!
-//! `type` is *text injection*, and it is not layout-independent: producing a character means
-//! choosing a key plus modifiers valid on the **target's** layout, which this host cannot observe.
-//! So the layout is declared ([`Layout`], default US QWERTY, stated in help rather than assumed),
-//! and a character it cannot reach is an error naming that character — never an approximation.
-//!
-//! # Fully resolvable, or nothing (§2.8 item 3)
-//!
-//! Every `compile_*` function returns either a script whose every step is already a report, or an
-//! error. There is no resolution left to do at send time, so a caller cannot discover halfway
-//! through a `sudo reboot` that the next character has no key. A partially delivered sequence on a
-//! live console is exactly what §2.8 forbids, and the structure here is what rules it out: the
-//! port is opened after the compile, not before.
-//!
-//! # There is no mouse here
-//!
-//! No file under `src/script/` builds a mouse report, names either mouse command byte or mentions
-//! a mouse report type. A click on a live desktop can launch or destroy something (CLAUDE.md), and
-//! a keyboard script has no business emitting one. `tests/script.rs` greps for it.
+//! Compilation collects input errors before device access. Text mapping uses a declared
+//! target layout and rejects unsupported characters. The viewer and CLI share this mapper;
+//! the CLI sends compiled reports directly, while the viewer submits key transitions.
 
 pub mod chord;
 pub mod compile;
@@ -46,17 +21,9 @@ pub use dry_run::render;
 pub use fixtures::{Fixture, FixtureError, Fixtures};
 pub use layout::{Layout, LayoutError};
 
-/// Milliseconds between two reports of a script, and the one authority for that number.
-///
-/// **40 ms, and it paces the *target*, not the chip.** A keyboard ack round trip measured
-/// 4.16–4.19 ms on this desk (`docs/STAGE1_FINDINGS.md` "hardware numbers", A11), so the link
-/// could take reports ten times faster; desktops drop keys delivered faster than a human types
-/// them. It is the default of `--delay-ms` on `key`, `type` and `macro` (`cli::keys`), and the
-/// rate the viewer's clipboard paste runs at (§12 Stage 4c: "at the paced rate Stage 3 measured").
-///
-/// It lives here, in the pure module both callers already depend on, so that "the paste runs at
-/// the rate `type` runs at" is a fact the compiler keeps rather than two literals that agree
-/// today.
+/// Default milliseconds between CLI reports and between viewer paste transitions.
+/// The 40 ms pacing gives the target desktop time to process input; bridge
+/// acknowledgements alone can arrive faster than the target accepts typing.
 pub const REPORT_DELAY_MS: u64 = 40;
 
 /// The chord and macro grammar, as the user reads it.
@@ -65,25 +32,25 @@ pub const REPORT_DELAY_MS: u64 = 40;
 /// otherwise drift, and help text that describes a grammar the compiler does not accept is worse
 /// than none.
 pub const GRAMMAR: &str = "\
-CHORD grammar, e.g. ctrl+alt+t, shift+f10, super, ctrl+c:
+Key chords, for example ctrl+alt+t, shift+f10, super, ctrl+c:
   modifiers:  ctrl alt shift super  (right-hand: rctrl ralt rshift rsuper)
   keys:       a-z 0-9 f1-f24 enter esc tab space backspace delete insert home end
               pgup pgdn up down left right capslock numlock scrolllock printscreen
               pause menu kp0-kp9 kpenter kpplus kpminus kpmultiply kpdivide kpdecimal
               minus equal bracketleft bracketright backslash semicolon quote backquote
               comma period slash plus, or any single printable character on the layout
-  A chord of only modifiers taps them (super opens the target's menu).
+  A chord of only modifiers taps them (the target decides their action).
 
-MACRO file, one step per line, `#` comments, blank lines ignored:
+Macro files use one step per line, `#` comments, blank lines ignored:
   layout us            # optional, first non-comment line; must agree with --layout if given
   key ctrl+alt+t       # one chord
-  type sudo reboot     # text after one space, to end of line, verbatim
+  type hello     # text after one space, to end of line, verbatim
   wait 500             # milliseconds
 ";
 
 /// One report and the script fragment that produced it, so a failure can name the keystroke —
 /// "it failed" and "it failed after typing `sudo reb`" are different facts to the person holding
-/// the console (§2.8 item 3).
+/// the console.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
     pub label: String,
@@ -97,7 +64,7 @@ pub enum Step {
     Wait(Duration),
 }
 
-/// A compiled script: every step already resolved to a report (§2.8 item 3).
+/// A compiled script: every step already resolved to a report.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Script {
     pub steps: Vec<Step>,
@@ -114,7 +81,7 @@ impl Script {
 
     /// Press with `modifiers` held, then release everything. Two steps, always in that order: the
     /// release is not optional, because a script that aborts between them leaves the key held on
-    /// the target (§2.6).
+    /// the target.
     ///
     /// A `usage` of zero is the report's "no key", which is what a modifier-only chord presses.
     pub(crate) fn tap(&mut self, usage: u8, modifiers: u8, label: String) {
@@ -166,16 +133,11 @@ mod tests {
             assert!(GRAMMAR.contains(name), "the grammar should list {name}");
             assert!(keynames::modifier_by_name(name).is_some(), "{name}");
         }
-        for step in [
-            "layout us",
-            "key ctrl+alt+t",
-            "type sudo reboot",
-            "wait 500",
-        ] {
+        for step in ["layout us", "key ctrl+alt+t", "type hello", "wait 500"] {
             assert!(GRAMMAR.contains(step), "the grammar should show {step}");
         }
         assert!(compile_macro(
-            "layout us\nkey ctrl+alt+t\ntype sudo reboot\nwait 500\n",
+            "layout us\nkey ctrl+alt+t\ntype hello\nwait 500\n",
             None,
             CapsLock::Off
         )

@@ -1,37 +1,7 @@
-//! A scripted CH9329 on a pty, so the real [`SerialLink`](super::SerialLink) can be exercised
-//! unmodified with no hardware (§9.3: "a fake CH9329 over `openpty` exercises the real serial
-//! module unmodified").
+//! CH9329 emulator for serial and process-level tests.
 //!
-//! It lives in the library rather than behind `cfg(test)` because the integration tests in
-//! `tests/` need it, and a `cfg(test)` module is not visible to them. It is `#[doc(hidden)]` and
-//! is not part of the crate's supported surface.
-//!
-//! # What it reproduces
-//!
-//! The default behaviour is the device as measured, not the device as documented — including the
-//! parts of it that are wrong:
-//!
-//! - `GET_INFO` → the fixture `get_info_reply` payload (Appendix);
-//! - keyboard and mouse commands → the one-byte `0x00` acknowledgement with `cmd | 0x80`
-//!   (fixtures `kb_ack`, `mouse_abs_ack`, `mouse_rel_ack`). **It acknowledges anything of the
-//!   right shape**, which is exactly the trap in §3.4/A17: the ack proves parsing, not effect;
-//! - a frame whose checksum does not verify → the error frame `cmd | 0xC0` with `0xE4`
-//!   (fixture `err_checksum_on_get_info`, §3.1/A14);
-//! - `GET_USB_STRING` with an empty payload, or a string type outside 0..=2 → `0xCA` with `0xE5`
-//!   (fixture `err_param_on_get_usb_string`); types 0, 1 and 2 → the three strings A16 measured,
-//!   in the datasheet's `[type, len, ascii…]` shape (A16 read the strings, not the bytes);
-//! - **any other command → the five-byte reply `57 AB 00 (cmd|0x80) 00` with no checksum byte**
-//!   (§3.2, A13, fixture disagreement `unknown_command_reply_has_no_checksum_byte`). This is the
-//!   one that hangs a naive host reader for ever, so the fake must be able to produce it.
-//!
-//! # What it does not reproduce
-//!
-//! Pacing. The device's acknowledged round trip is 4.15 ms for a keyboard report and 17.0 ms for
-//! a mouse report (A11), and overload corrupts silently rather than blocking (§5.1). The fake
-//! answers immediately unless told to delay, so it cannot be used to justify a rate.
-//!
-//! The fake never panics, on any input. A panic in its thread would surface in an unrelated test
-//! as a mysterious timeout.
+//! The fake uses a pseudo-terminal and can delay, corrupt, or withhold replies. Tests
+//! observe reports and lock state without writing to a physical bridge.
 
 use std::io;
 use std::os::unix::io::RawFd;
@@ -45,14 +15,13 @@ use crate::proto::cmd;
 use crate::proto::frame::{encode, Event, Frame, Parser, ADDR, HEAD};
 use crate::proto::usb_string::{UsbStringKind, UsbStrings};
 
-/// The `get_info_reply` payload (Appendix, fixture `get_info_reply`): version 1.8, target
+/// The `get_info_reply` payload: version 1.8, target
 /// connected, all lock bits off. Tests that assert on byte-level correctness should load the
 /// fixture file instead of relying on this constant; it exists so `Behaviour::default` has an
 /// answer without doing I/O.
 pub const DEFAULT_GET_INFO_PAYLOAD: [u8; 8] = [0x38, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-/// The three `GET_USB_STRING` answers A16 measured on this unit. The last one is unit-unique and
-/// unrelated to either USB `iSerial`, which is what makes it worth printing in a listing.
+/// Recorded manufacturer, product, and bridge serial strings.
 pub const DEFAULT_USB_STRINGS: [&str; 3] = ["Sipeed", "NanoKVM-USB", "BA1612624UJPW2RUJ"];
 
 /// Checksum-error code, as the device sends it (fixture `err_checksum_on_get_info`).
@@ -73,19 +42,19 @@ const FRAGMENT_GAP: Duration = Duration::from_millis(1);
 /// [`FakeCh9329`].
 #[derive(Debug, Clone)]
 pub struct Behaviour {
-    /// Payload of the `GET_INFO` reply (Appendix).
+    /// Payload of the `GET_INFO` reply.
     pub get_info_payload: Vec<u8>,
-    /// The `GET_USB_STRING` answers, manufacturer then product then serial (A16).
+    /// The `GET_USB_STRING` answers, manufacturer then product then serial.
     pub usb_strings: UsbStrings,
     /// Commands answered with an error frame `cmd | 0xC0` carrying this code, instead of the
-    /// normal reply (§3.1).
+    /// normal reply.
     pub reject: Vec<(u8, u8)>,
-    /// Write replies one byte at a time with a gap, so the host must reassemble them (§9.2 item 6).
+    /// Write replies one byte at a time with a gap, so the host must reassemble them.
     pub fragment_replies: bool,
     /// Wait this long after receiving a request before answering it.
     pub delay_reply: Duration,
     /// Bytes emitted immediately before every reply, which the host must discard as garbage
-    /// (§9.2 item 6).
+    /// .
     pub prefix_garbage: Vec<u8>,
 }
 
@@ -111,8 +80,7 @@ impl Default for Behaviour {
 #[derive(Debug)]
 struct Knobs {
     script: Behaviour,
-    /// One-shot: bytes written between receiving the next request and answering it. This is the
-    /// A12 case — an unsolicited `0x81` landing inside a request/reply pair.
+    /// Bytes injected between receiving the next request and sending its reply.
     inject_before_reply: Option<Vec<u8>>,
     /// Bytes to write at the next opportunity, unprompted.
     inject_now: Vec<u8>,
@@ -223,26 +191,26 @@ impl FakeCh9329 {
 
     /// Wait this long between receiving a request and answering it.
     ///
-    /// Latched when the request is parsed, which happens **before** the request appears in
+    /// Latched when the request is parsed, which happens before the request appears in
     /// [`FakeCh9329::received`]. So a test that has observed a request may change this knob
     /// immediately without racing that request's reply — it will apply to the next one.
     pub fn delay_reply(&self, delay: Duration) {
         self.state.knobs().script.delay_reply = delay;
     }
 
-    /// Answer subsequent `GET_INFO` requests with this payload (Appendix).
+    /// Answer subsequent `GET_INFO` requests with this payload.
     ///
     /// Latched when a request is parsed, like every other knob, so a test that has observed one
     /// request may change the answer to the next without racing this one. Two `GET_INFO` replies
     /// that differ in their payload are the only way a test can tell a late reply from a fresh
     /// one: on the wire the two frames are otherwise identical, which is the whole difficulty the
-    /// resynchronisation window exists to handle (§3.1).
+    /// resynchronisation window exists to handle.
     pub fn set_get_info_payload(&self, payload: &[u8]) {
         self.state.knobs().script.get_info_payload = payload.to_vec();
     }
 
     /// Emit these bytes immediately before every reply. They are not a frame; the host must
-    /// discard them and still find the reply (§9.2 item 6).
+    /// discard them and still find the reply.
     pub fn prefix_garbage(&self, bytes: &[u8]) {
         self.state.knobs().script.prefix_garbage = bytes.to_vec();
     }
@@ -265,11 +233,8 @@ impl FakeCh9329 {
         self.state.knobs().inject_now.extend_from_slice(bytes);
     }
 
-    /// Push raw bytes at the host **between receiving the next request and answering it**.
-    ///
-    /// This is the A12 ordering the reader has to survive: a `0x81` lock-state frame arriving
-    /// inside a request/reply pair. Unlike [`FakeCh9329::inject_unsolicited`] it is exact rather
-    /// than merely soon, so a test built on it cannot flake.
+    /// Inject bytes after the next request and before its reply, providing deterministic
+    /// ordering for unsolicited-frame tests.
     pub fn inject_before_reply(&self, bytes: &[u8]) {
         self.state.knobs().inject_before_reply = Some(bytes.to_vec());
     }
@@ -280,7 +245,7 @@ impl FakeCh9329 {
     }
 
     /// Close the master side, so the host's slave fd sees a hang-up — `POLLHUP`, and then a
-    /// `read` that returns **0**, not `EIO`. Closing a pty master vhangups the slave exactly as
+    /// `read` that returns 0, not `EIO`. Closing a pty master vhangups the slave as
     /// `acm_disconnect` vhangups the dongle's tty, and a hung-up tty answers `read` with EOF
     /// (`hung_up_tty_read`); measured on this kernel, `poll` returns `POLLIN|POLLERR|POLLHUP` and
     /// the following `read(2)` returns 0. So this is a faithful unplug and not an approximation of
@@ -299,13 +264,8 @@ impl FakeCh9329 {
         self.state.record().frames.clone()
     }
 
-    /// Every byte received, concatenated in arrival order.
-    ///
-    /// A test asserts "the request arrived as one contiguous well-formed frame" against this: the
-    /// stream must equal the expected frames end to end, with nothing between them and nothing
-    /// left over. That is the property §5.1/A15 actually requires — the chip has no inter-byte
-    /// timeout, so a stray or missing byte anywhere in the stream corrupts the next command —
-    /// and unlike "arrived in one `read`" it does not depend on scheduling.
+    /// All received bytes in stream order, for checking contiguous frames independently
+    /// of how the kernel splits reads.
     pub fn raw_rx(&self) -> Vec<u8> {
         self.state.record().raw.clone()
     }
@@ -397,8 +357,7 @@ fn run(state: Arc<FakeState>, master: RawFd) {
 /// lock so that no knob can change halfway through a reply.
 #[derive(Debug)]
 struct Plan {
-    /// Bytes to write *before* the reply — the A12 case, an unsolicited frame inside a
-    /// request/reply pair.
+    /// Inject before the reply to exercise unsolicited-frame ordering.
     inject: Option<Vec<u8>>,
     /// The reply itself, or `None` for `drop_next_reply`.
     bytes: Option<Vec<u8>>,
@@ -407,26 +366,25 @@ struct Plan {
     prefix: Vec<u8>,
 }
 
-/// Act on one parsed event exactly as the device does.
+/// Act on one parsed event as the device does.
 fn answer(state: &FakeState, master: RawFd, event: Event) {
     let request = match event {
         Event::Frame(frame) => frame,
         // A candidate whose checksum did not verify. The device answers `cmd | 0xC0` with 0xE4 and
-        // then carries on normally (§3.1, Appendix). `raw[3]` is the command byte it blames.
+        // then carries on normally. `raw[3]` is the command byte it blames.
         Event::BadChecksum { ref raw } => {
             if let Some(&cmd) = raw.get(3) {
                 write_all(master, &error_frame(cmd, ERR_CHECKSUM));
             }
             return;
         }
-        // The host tore a write, or sent noise. The real chip would silently keep counting (A15),
+        // The host tore a write, or sent noise. The real chip would silently keep counting,
         // so the fake says nothing either.
         Event::Truncated { .. } | Event::Garbage { .. } => return,
     };
 
-    // Latch the whole plan *before* the frame becomes visible to `received`. That ordering is what
-    // makes `wait_for_received` a real synchronisation point: once a test can see the request, the
-    // knobs that answered it are already read, so changing one cannot race this reply.
+    // Latch reply behavior before publishing the request so test synchronization cannot
+    // race a change to the response configuration.
     let plan = script_reply(state, &request);
     state.record().frames.push(request);
     write_reply(master, plan);
@@ -466,16 +424,12 @@ fn script_reply(state: &FakeState, request: &Frame) -> Plan {
         | cmd::SEND_MS_ABS_DATA
         | cmd::SEND_MS_REL_DATA
         | cmd::SEND_MY_HID_DATA => frame_bytes(request.cmd | 0x80, &[0x00]),
-        // Observed: an empty payload is a parameter error, not a string (fixture
-        // `err_param_on_get_usb_string`), and so is a type byte outside the three strings A16
-        // read. The reply shape is the datasheet's `[type, len, ascii…]`: A16 recorded the
-        // strings but not the bytes, so this is the fake's assumption and not a measurement —
-        // which is why `SerialLink::get_usb_strings` accepts both shapes and logs the raw reply.
+        // Match the recorded invalid-selector errors and `[type, len, ascii…] reply format.
         cmd::GET_USB_STRING => match usb_string_reply(&knobs.script.usb_strings, &request.data) {
             Some(payload) => frame_bytes(request.cmd | 0x80, &payload),
             None => error_frame(request.cmd, ERR_PARAM),
         },
-        // §3.2, A13: five bytes, no checksum byte, for ever.
+        // Undefined-command replies are five bytes with no checksum on the recorded device.
         other => vec![HEAD[0], HEAD[1], ADDR, other | 0x80, 0x00],
     };
     plan(Some(bytes))
@@ -533,7 +487,7 @@ fn frame_bytes(cmd: u8, payload: &[u8]) -> Vec<u8> {
     encode(cmd, payload).unwrap_or_default()
 }
 
-/// `cmd | 0xC0` with a one-byte code (Appendix, §3.1).
+/// `cmd | 0xC0` with a one-byte code.
 fn error_frame(cmd: u8, code: u8) -> Vec<u8> {
     frame_bytes(cmd | 0xC0, &[code])
 }
@@ -576,7 +530,7 @@ fn make_raw(fd: RawFd) -> io::Result<()> {
     // an all-zero value is a valid one to hand to `tcgetattr`, which overwrites it wholesale.
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is an open terminal (it came from `openpty`) and `termios` is a live local of
-    // exactly the type the call expects.
+    // the type the call expects.
     if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -593,7 +547,7 @@ fn make_raw(fd: RawFd) -> io::Result<()> {
 fn ptsname(master: RawFd) -> io::Result<PathBuf> {
     let mut buf = [0 as libc::c_char; 128];
     // SAFETY: `ptsname_r` writes at most `buf.len()` bytes, including the terminator, into `buf`,
-    // which is a live local of exactly that length. The `_r` form is used precisely because
+    // which is a live local of that length. The `_r` form is used precisely because
     // `ptsname` returns a shared static buffer that is not safe across threads.
     let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
     if rc != 0 {
@@ -627,7 +581,7 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
         revents: 0,
     };
     let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-    // SAFETY: `&mut pfd` is a live array of exactly the one `pollfd` the count claims.
+    // SAFETY: `&mut pfd` is a live array of the one `pollfd` the count claims.
     let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
     if rc < 0 {
         let e = io::Error::last_os_error();

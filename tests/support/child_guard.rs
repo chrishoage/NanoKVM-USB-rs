@@ -1,19 +1,7 @@
-//! A child process that cannot outlive the scope that spawned it.
+//! Child-process guard that kills and reaps on drop.
 //!
-//! `00-common.md`: "Kill every process you start. Leave nothing running when you finish." That is
-//! not automatic — `std::process::Child` says in its own documentation that it does **not** kill
-//! on drop — and a test asserts its way to the `wait()` at the bottom through a dozen `assert!`s,
-//! any one of which unwinds straight past it. For `tests/capture_recovery_hardware.rs`'s H-B2 the
-//! child is `scripts/usb-replug.py`, a script that resets USB devices; leaving one of those
-//! running unsupervised because an assertion about the *method* failed is exactly the outcome the
-//! rule exists to prevent, and it is the most likely failure that test has.
-//!
-//! So every child in this test suite is spawned through [`ChildGuard`], which kills and reaps in
-//! its `Drop` — the same shape `tests/serial_hardware.rs` uses for its release-all guard.
-//!
-//! This module is included by more than one test binary (`#[path = "support/child_guard.rs"] mod
-//! child_guard;`), so each binary uses only part of it; `#![allow(dead_code)]` keeps that from
-//! becoming a warning.
+//! `Child` alone does not stop a process when assertions unwind. This guard prevents
+//! failed hardware tests from leaving reset scripts running.
 
 #![allow(dead_code)]
 
@@ -45,7 +33,7 @@ impl ChildGuard {
     /// Take the child's piped stdout, for a caller that wants to read the script's timeline as it
     /// happens rather than after the fact.
     ///
-    /// Only meaningful if the `Command` was given `Stdio::piped()`. The reader **must** be drained
+    /// Only meaningful if the `Command` was given `Stdio::piped`. The reader must be drained
     /// to EOF (or dropped) before [`ChildGuard::wait`], or a script that fills the pipe buffer
     /// blocks on its own `print` and never exits.
     pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
@@ -55,7 +43,7 @@ impl ChildGuard {
     /// Take the child's piped stdin, for a caller that feeds the process its input.
     ///
     /// Taking it is also how the child is told there is no more: the pipe is closed when the
-    /// returned handle is dropped, and a child reading to EOF waits for exactly that.
+    /// returned handle is dropped, and a child reading to EOF waits for that.
     pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
         self.child.as_mut().and_then(|c| c.stdin.take())
     }
@@ -116,7 +104,7 @@ impl Drop for ChildGuard {
             return;
         };
         let pid = child.id();
-        // Both results are deliberately ignored: the child may have exited between the kill and
+        // Both results are ignored: the child may have exited between the kill and
         // the wait, and a `Drop` that panicked while unwinding would abort the process — taking
         // the failure message the test was about to print with it.
         let _ = child.kill();

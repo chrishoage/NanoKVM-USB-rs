@@ -1,12 +1,6 @@
-//! The chrome's widgets, driven with no window and no compositor (plan §12 Stage 4b).
+//! Viewer widgets and tooltips exercised without a window or compositor.
 //!
-//! §12 Stage 4b's exit criterion for the UI is behavioural — *"a tooltip that appears is evidence;
-//! a widget that exists is not"* — so these drive the real `ChromeUi::build` through
-//! `egui_kittest`, which runs egui headless and exposes the result as an AccessKit tree. Hovering
-//! a control and then **finding its tooltip text in the tree** is the evidence; so is finding a
-//! disabled control's *reason* there.
-//!
-//! Nothing here opens a device, a window or a config file.
+//! Ignored snapshot tests require a GPU or software adapter and compare committed images.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -31,7 +25,7 @@ struct Facts {
     capture: CaptureState,
     modes: Vec<(u32, u32)>,
     current_mode: Option<(u32, u32)>,
-    /// The **live** pointer mode, which is the event loop's and not the config file's.
+    /// The live pointer mode, which is the event loop's and not the config file's.
     pointer: MouseMode,
     frame_size: Option<(u32, u32)>,
     audio: ChromeAudio,
@@ -63,20 +57,13 @@ struct App {
     ui: ChromeUi,
     facts: Facts,
     commands: Vec<ChromeCommand>,
-    /// Whether this harness plays the event loop and performs the commands.
-    ///
-    /// `false` is how "the command is the only thing that changes the setting" is asserted: with
-    /// nobody performing them, a UI that still mutated the shared config behind the command's back
-    /// would show up as a changed setting (review items 2 and 8).
+    /// Whether to apply emitted commands. Disable this to detect widgets that
+    /// mutate shared settings directly instead of requesting an event-loop change.
     perform: bool,
 }
 
-/// Build one frame **and perform what it asked for**, exactly as `App::perform_chrome` does.
-///
-/// Performing the commands here is what makes these tests evidence about the shipped behaviour
-/// rather than about the widgets alone: the live pointer mode and the persisted `cursor_hidden`
-/// are changed by the *event loop*, from the command's payload, and a test that skipped that step
-/// would still pass with the payload thrown away (review items 2 and 8).
+/// Apply emitted commands as the event loop does so tests exercise payloads
+/// and live state changes, not just command emission.
 fn build(ctx: &egui::Context, app: &mut App) {
     let out = app.ui.build(
         ctx,
@@ -99,8 +86,7 @@ fn build(ctx: &egui::Context, app: &mut App) {
             }
             ChromeCommand::SetCursorHidden(hidden) => app.ui.config.cursor_hidden = *hidden,
             ChromeCommand::SetMuted(muted) => {
-                // Both halves, exactly as `App::perform_chrome` does: the remembered setting and
-                // the live flag the 4a playback thread reads once a period.
+                // Update both the saved preference and the playback worker’s live flag.
                 app.ui.config.audio_muted = *muted;
                 app.facts.audio.set_muted(*muted);
             }
@@ -221,9 +207,7 @@ fn hovering_a_control_shows_its_tooltip() {
     );
 }
 
-/// **The requirement in §12 Stage 4b**: every disabled control's tooltip says *why*. The Paste
-/// item has three disabled reasons (§12 Stage 4c) and every one of them is on screen when hovered,
-/// and none of them fires.
+/// Each disabled paste state must explain its reason on hover and remain inert.
 #[test]
 fn the_disabled_paste_items_tooltip_states_the_reason() {
     for (availability, needle) in [
@@ -262,7 +246,7 @@ fn the_disabled_paste_items_tooltip_states_the_reason() {
     }
 }
 
-/// The enabled case: the tooltip states the chord and the declared layout (§12 Stage 4c, §10.2),
+/// The enabled case: the tooltip states the chord and the declared layout,
 /// and a click asks the event loop to paste.
 #[test]
 fn an_enabled_paste_item_states_the_chord_and_the_layout_and_fires() {
@@ -271,16 +255,15 @@ fn an_enabled_paste_item_states_the_chord_and_the_layout_and_fires() {
     open(&mut h, "Keyboard");
     hover(&mut h, "Paste");
     assert!(shows(&h, "Shift+Pause"), "the chord must be discoverable");
-    assert!(shows(&h, "layout us"), "§10.2: the layout is stated");
-    // The 16 MiB read bound is the one limit a user can meet that the plan does not have, so the
-    // item that offers the paste says it (`chrome::clipboard`: a memory bound, not a pacing cap).
+    assert!(shows(&h, "layout us"), "the layout is stated");
+    // Advertise the clipboard read bound before the user encounters it.
     assert!(
         shows(&h, "16 MiB"),
         "the read bound is stated where it is met"
     );
     assert!(
-        shows(&h, "no limit on how much may be pasted"),
-        "and is not mistaken for a cap on the paste"
+        shows(&h, "Maximum clipboard size"),
+        "the limit applies to clipboard size"
     );
 
     h.get_by_label("Paste").click();
@@ -292,7 +275,7 @@ fn an_enabled_paste_item_states_the_chord_and_the_layout_and_fires() {
     );
 }
 
-/// A running paste shows `n / total keys, ~s remaining` and the cancel hint (§12 Stage 4c).
+/// A running paste shows `n / total keys, ~s remaining` and the cancel hint.
 #[test]
 fn a_running_paste_shows_its_progress_and_how_to_cancel() {
     let mut h = harness_with(Facts {
@@ -315,8 +298,8 @@ fn a_running_paste_shows_its_progress_and_how_to_cancel() {
     assert!(shows(&h, "Pause cancels"), "the cancel hint");
 }
 
-/// A refusal names every offending character, on its own line, with where it is (§10.2: "name them
-/// all, so a long clipboard is fixed in one pass"). And it says nothing was sent.
+/// List every unsupported character and its position so the user can fix the
+/// clipboard in one pass. Confirm that validation sent no input.
 #[test]
 fn a_refused_paste_lists_every_offending_character() {
     let refusal = Refusal::Unreachable {
@@ -334,8 +317,8 @@ fn a_refused_paste_lists_every_offending_character() {
     });
     h.run();
     open(&mut h, "Keyboard");
-    assert!(shows(&h, "2 characters are not reachable"), "the sentence");
-    assert!(shows(&h, "no keyboard report was sent"), "§2.8 item 3");
+    assert!(shows(&h, "2 characters are not supported"), "the sentence");
+    assert!(shows(&h, "no keyboard report was sent"));
     assert!(shows(&h, "U+00E9"), "the first offender");
     assert!(shows(&h, "at position 4"), "and where it is");
     assert!(shows(&h, "U+2192"), "the second offender");
@@ -343,7 +326,7 @@ fn a_refused_paste_lists_every_offending_character() {
 }
 
 /// With no refusal outstanding, the last outcome is what the popover shows — and a cancelled or
-/// failed one names how far it got (§2.8 item 3).
+/// failed one names how far it got.
 #[test]
 fn the_last_outcome_is_shown_with_its_progress() {
     for (outcome, needle) in [
@@ -482,7 +465,7 @@ fn collapsing_closes_an_open_popover() {
 }
 
 /// The Audio section shows the counters from a `ChromeAudio` snapshot, and the configured depth
-/// with its provenance (§5.5 — never an end-to-end latency).
+/// with its provenance.
 #[test]
 fn the_audio_section_shows_the_snapshots_counters() {
     let mut h = harness_with(Facts {
@@ -504,16 +487,11 @@ fn the_audio_section_shows_the_snapshots_counters() {
     assert!(shows(&h, "underruns 3"));
     assert!(shows(&h, "drift corrections 11"));
     assert!(shows(&h, "4 x 480"), "the configured depth");
-    assert!(shows(&h, "configured"), "§5.5: say what the number is");
+    assert!(shows(&h, "configured"), "say what the number is");
 }
 
-/// **The 4a seam, end to end.** A real `AudioHandle` over the in-memory PCM fakes moves real
-/// periods; its real `AudioSnapshot` is converted by the shipped `ChromeAudio::from_snapshot`;
-/// and the popover renders *those* numbers. Then the Mute checkbox is clicked and the assertion
-/// is on the **shared atomic the playback thread reads** — not on a command having been emitted.
-///
-/// A test that filled a `ChromeAudio` in by hand would pin nothing about the merge; this one
-/// fails if a counter is wired to the wrong field, or if the mute toggle stops reaching 4a.
+/// Run the real audio handle over fake PCM, then render its snapshot. Assert
+/// counter values and the actual mute atomic to catch incorrect UI wiring.
 #[test]
 fn a_snapshot_from_a_real_audio_handle_renders_and_the_mute_reaches_the_shared_flag() {
     let config = AudioConfig {
@@ -566,7 +544,7 @@ fn a_snapshot_from_a_real_audio_handle_renders_and_the_mute_reaches_the_shared_f
     assert!(shows(&h, "audio: on"), "no condition, so it is on");
     assert!(
         shows(&h, &format!("overruns {}", snapshot.counts.overruns)),
-        "4a's own overrun count"
+        "the audio overrun count"
     );
     assert!(
         shows(&h, &format!("periods played {}", snapshot.periods_played)),
@@ -579,12 +557,12 @@ fn a_snapshot_from_a_real_audio_handle_renders_and_the_mute_reaches_the_shared_f
     h.run();
     assert!(
         mute.load(Ordering::Relaxed),
-        "the toggle must reach the flag the 4a playback thread reads, not only the settings file"
+        "the toggle must reach the flag the playback thread reads, not only the settings file"
     );
     handle.stop();
 }
 
-/// D2: a side that is opening says so and names which side, and the Mute toggle is disabled
+/// a side that is opening says so and names which side, and the Mute toggle is disabled
 /// because there is no stream yet. "Opening" and "on" must never read the same.
 #[test]
 fn an_opening_side_is_named_and_cannot_be_muted() {
@@ -607,8 +585,7 @@ fn an_opening_side_is_named_and_cannot_be_muted() {
     );
 }
 
-/// An absent stream shows 4a's own words and the mute toggle is disabled, with the reason as its
-/// tooltip.
+/// Unavailable audio must explain its cause and disable mute with a tooltip.
 #[test]
 fn absent_audio_disables_the_mute_toggle_and_says_why() {
     let reason = "hw:8 is busy: another client holds the card";
@@ -674,10 +651,7 @@ fn the_mouse_popover_changes_and_remembers_the_settings() {
     );
 }
 
-/// **Review item 2.** The live pointer mode is the one truth. `--pointer rel` changes what the
-/// event loop is doing without touching the settings file, and the popover has to show *that*:
-/// rendering the persisted value showed "Absolute" while the pointer was relative, so the entry
-/// the user was already in fired a mode change, and the stale value could be written back.
+/// A CLI pointer override must appear in the menu without changing saved settings.
 #[test]
 fn the_mouse_popover_marks_the_live_pointer_mode_not_the_persisted_one() {
     // The `--pointer rel` case: live relative, remembered absolute.
@@ -717,9 +691,7 @@ fn the_mouse_popover_marks_the_live_pointer_mode_not_the_persisted_one() {
     assert_eq!(h.state().facts.pointer, MouseMode::Absolute);
 }
 
-/// **Review items 2 and 8.** The UI asks; the event loop performs. With nothing performing the
-/// commands, neither setting moves — which is what makes the command's payload load-bearing rather
-/// than decoration beside a config the UI had already written.
+/// Widgets emit commands; only the event loop applies settings changes.
 #[test]
 fn the_mouse_popover_only_asks_and_never_writes_the_settings_itself() {
     let mut h = harness();
@@ -750,10 +722,7 @@ fn the_mouse_popover_only_asks_and_never_writes_the_settings_itself() {
     );
 }
 
-/// **Review item 5.** A click outside an open popover dismisses it. `route_pointer` sends that
-/// click to the chrome precisely so it cannot land on a live desktop — but until now nothing
-/// closed the menu, so the click was swallowed and the popover stayed up, still taking the
-/// keyboard from the target.
+/// Dismissal clicks must close the popover without reaching the target.
 #[test]
 fn clicking_outside_an_open_popover_closes_it() {
     let mut h = harness();
@@ -799,7 +768,7 @@ fn clicking_inside_an_open_popover_leaves_it_open() {
     );
 }
 
-/// The release key is shown where the title used to show it (§12 Stage 4b), and its tooltip says
+/// The release key is shown where the title used to show it, and its tooltip says
 /// what it does — including that it is never forwarded.
 #[test]
 fn the_pill_shows_the_release_key() {
@@ -807,11 +776,11 @@ fn the_pill_shows_the_release_key() {
     h.run();
     assert!(shows(&h, "release: Pause"));
     hover(&mut h, "release: Pause");
-    assert!(shows(&h, "never forwarded"));
+    assert!(shows(&h, "returns keyboard and mouse control to the host"));
 }
 
 /// A device that enumerated nothing gets a disabled item saying so, not an empty menu and not a
-/// guess at a list (§12 Stage 4b: the modes come from the device).
+/// guess at a list.
 #[test]
 fn no_enumerated_modes_is_stated_rather_than_guessed() {
     let mut h = harness_with(Facts {
@@ -822,10 +791,10 @@ fn no_enumerated_modes_is_stated_rather_than_guessed() {
     h.run();
     open(&mut h, "Video");
     hover(&mut h, "No modes enumerated");
-    assert!(shows(&h, "VIDIOC_ENUM_FRAMESIZES"));
+    assert!(shows(&h, "Capture resolutions are unavailable"));
 }
 
-/// **Every control on the pill and in every popover has a tooltip.** Asserted by walking each
+/// Every control on the pill and in every popover has a tooltip. Asserted by walking each
 /// popover and hovering every button and checkbox in it, rather than by a list here that could
 /// drift from the UI — a control added without a tooltip fails this.
 #[test]
@@ -891,9 +860,9 @@ fn every_control_has_a_tooltip() {
 // -- --ignored` rewrites them after a deliberate visual change; the `.new.png` and `.diff.png`
 // files a failure leaves behind are gitignored.
 //
-// **They are `#[ignore]`d**, and the fourteen behavioural tests above are not. These four ask
+// They are `#[ignore]`d, and the fourteen behavioural tests above are not. These four ask
 // `wgpu` for an adapter and render on it: on a machine with no GPU and no software rasteriser —
-// a container, a CI runner without lavapipe — `Harness::builder().wgpu()` fails, and a test
+// a container, a CI runner without lavapipe — `Harness::builder.wgpu` fails, and a test
 // suite that cannot run without a display is not one `cargo test` should be running by default.
 // Everything above is headless and needs nothing. Run these deliberately:
 //

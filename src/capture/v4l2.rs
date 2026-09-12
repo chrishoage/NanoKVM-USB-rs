@@ -1,66 +1,14 @@
-//! The real capture source: V4L2 MJPEG, mmap streaming, owned frames (§6, §5.2).
+//! V4L2 MJPEG capture with bounded polling and stream recovery.
 //!
-//! Negotiation is deliberately unforgiving. `S_FMT` is a best-effort ioctl — the driver may
-//! return something other than what was asked for — so the returned format is checked and a
-//! mismatch is a [`CaptureError::Config`], never a silent downgrade (§6). `S_PARM` is called
-//! explicitly and its reply checked, because `S_FMT` alone leaves 1080p at the driver's own
-//! default (A7); on a USB 3 link that default is 240 fps.
+//! The v4l stream requeues its previous buffer before attempting a dequeue. A failed
+//! dequeue leaves its buffer index stale, so subsequent calls can fail indefinitely.
+//! Poll the descriptor ourselves and rebuild the mmap stream after dequeue errors.
 //!
-//! Frame handling follows §5.2 exactly: copy the compressed frame out, return the buffer to the
-//! driver, hand on the owned copy. A19 measured that copy at 0.002 ms against 2.40 ms of decode,
-//! so the lifetime complexity of keeping mmap buffers checked out buys nothing.
+//! `POLLHUP`, `POLLNVAL`, and `ENODEV` indicate disconnection. `POLLERR` requires a
+//! stream rebuild. Teardown can panic inside v4l; callers must contain that panic.
 //!
-//! ## Four things about the `v4l` 0.14 API that are load-bearing
-//!
-//! 1. **`CaptureStream::next` requeues the previously dequeued buffer at the top of the *next*
-//!    call**, not when the borrow ends. So one of the four buffers is held between calls. That
-//!    is correct for us — the copy is already done and nothing references the mapping — but it
-//!    means "requeue immediately" is honoured by the copy, not by the ioctl order.
-//!
-//! 2. **Any failing `next` corrupts the stream permanently, not just a timeout.** This corrects
-//!    B2, which named `Stream::set_timeout` as the problem. The timeout is one instance of a
-//!    general fault: `next` queues its private `arena_index` *first*, then dequeues, and only
-//!    assigns `arena_index` **after** `VIDIOC_DQBUF` returns success. So on *any* error out of
-//!    `dequeue` — the crate's own timeout, or `EIO`, which V4L2 documents for temporary problems
-//!    like signal loss — `arena_index` is left naming a buffer the driver now owns. The next
-//!    call requeues that index, the driver answers `EINVAL`, and every call after that fails
-//!    forever. One `EIO` would kill capture permanently, which is what §6.1 S1-2 forbids.
-//!
-//!    Two defences, and both are needed. This module polls the fd itself before calling `next`,
-//!    so a stall issues no ioctl at all and cannot reach the fault (that is B2's fix, and it
-//!    covers the timeout case only). And any error out of `next` other than `ENODEV` marks the
-//!    stream **broken**; the following [`FrameSource::next_frame`] drops the `MmapStream` —
-//!    whose `Drop` issues `STREAMOFF`, which also clears vb2's sticky queue-error state — and
-//!    rebuilds it with `with_buffers`, re-primes and `STREAMON`s, counting the rebuild in
-//!    [`V4l2Source::stream_rebuilds`]. `ENODEV` is a disconnection and is never rebuilt: the
-//!    node is gone and Stage 2 owns rediscovery (§6.1).
-//!
-//! 3. **`Handle::poll` throws `revents` away.** It returns only the fd count, so `POLLERR`,
-//!    `POLLHUP` and `POLLNVAL` are indistinguishable from `POLLIN`. Those conditions are
-//!    level-triggered and sticky: a real stream error (vb2 sets the queue error and `DQBUF`
-//!    returns `EIO`; uvcvideo raises `POLLERR` on disconnect) would make every poll return
-//!    instantly and the capture loop spin at 100 % CPU while reporting `Stalled`. This module
-//!    therefore calls `libc::poll` on the raw fd itself and reads `revents`: `POLLNVAL` or
-//!    `POLLHUP` is [`CaptureError::Disconnected`]; `POLLERR` without `POLLIN` is
-//!    [`CaptureError::Io`] with `EIO` and **no** `next` call; only `POLLIN` proceeds.
-//!
-//!    A sticky `POLLERR` is vb2's level-triggered queue error and repeats until `STREAMOFF`,
-//!    so `next_frame` also marks the stream broken on it: the next call performs the same
-//!    rebuild as item 2, which is the `STREAMOFF` that clears the condition. Until the rebuild
-//!    succeeds the pipeline counts the error, backs off, and reports the stall (§6.1 S1-2).
-//!
-//! 4. **The crate's `Drop` impls panic**, and they run on the capture thread. `Stream::drop`
-//!    calls `STREAMOFF` and `Arena::drop` calls `munmap` plus `REQBUFS(0)`; both ignore `ENODEV`
-//!    and `panic!` on every other error. There is nothing to fix here — the alternative is
-//!    leaking mappings — but it means a rebuild, or simply dropping a [`V4l2Source`], can
-//!    unwind. `capture::pipeline`'s capture thread runs its loop body under `catch_unwind` for
-//!    exactly this reason and turns a panic into [`CaptureError::Disconnected`] rather than
-//!    letting one take the process down (§6.1 S1-1).
-//!
-//! The priming in [`V4l2Source::open`] exists for reason 1: queue every buffer but index 0 and
-//! `STREAMON` up front, so the crate's `active` flag is set and its first `next` call requeues
-//! the one buffer we deliberately left out rather than re-queueing all of them. `REQBUFS` may
-//! grant fewer buffers than asked for, so the count is read back rather than assumed.
+//! Set the frame interval explicitly: this device otherwise defaults to 240 fps at
+//! 1080p. Read actual dimensions from the JPEG header, not the negotiated format.
 
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
@@ -79,25 +27,22 @@ use super::{
     jpeg, CaptureError, CompressedFrame, FrameSource, SourceOpener, MAX_HEIGHT, MAX_WIDTH,
 };
 
-/// The pixel format. §6/A1: the device advertises exactly one, and there is no uncompressed
-/// path at any resolution.
+/// MJPEG is the only format advertised by the measured device.
 pub const FOURCC_MJPG: &[u8; 4] = b"MJPG";
 
-/// Buffer count. The Stage 0 spike used four and measured every advertised mode at its
-/// advertised rate with it (§6).
+/// Buffer count. The spike used four and measured every advertised mode at its
+/// advertised rate with it.
 pub const BUFFER_COUNT: u32 = 4;
 
 /// Default dequeue timeout. Long enough not to fire between frames at any advertised rate
-/// (the slowest, 25 fps, is 40 ms) and short enough that a stall is noticed promptly (§6.1).
+/// (the slowest, 25 fps, is 40 ms) and short enough that a stall is noticed promptly.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How many buffer indices [`granted_buffers`] probes before giving up. `REQBUFS` may grant more
 /// than requested; nothing sane grants more than this.
 const BUFFER_PROBE_LIMIT: u32 = 64;
 
-/// `bytesused` statistics. §1.3 and A19 both carry "instrument `bytesused` in Stage 1" forward:
-/// the decode margins were measured against an idle, low-entropy desktop and nobody has yet
-/// measured what a *working* target produces.
+/// Compressed-frame byte statistics for content-dependent decode measurements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BytesUsedStats {
     /// Number of frames observed.
@@ -150,11 +95,11 @@ impl std::fmt::Display for BytesUsedStats {
     }
 }
 
-/// A live V4L2 MJPEG capture device (§6).
+/// A live V4L2 MJPEG capture device.
 ///
 /// Streaming starts in [`V4l2Source::open`] and stops when this is dropped.
 ///
-/// **Dropping this can panic.** The `v4l` crate's `Stream` and `Arena` destructors `panic!` on
+/// Dropping this can panic. The `v4l` crate's `Stream` and `Arena` destructors `panic!` on
 /// any `STREAMOFF`/`munmap`/`REQBUFS` failure other than `ENODEV` — see module docs item 4 — and
 /// they run wherever this value is dropped, which in production is the capture thread.
 pub struct V4l2Source {
@@ -171,11 +116,11 @@ pub struct V4l2Source {
     fps: u32,
     timeout: Duration,
     bytes: BytesUsedStats,
-    /// Flags from the most recent buffer, so a caller can confirm A6's `TIMESTAMP_MONOTONIC |
-    /// TSTAMP_SRC_SOE` claim rather than assume it (§5.5).
+    /// Flags from the most recent buffer, so a caller can confirm `TIMESTAMP_MONOTONIC |
+    /// TSTAMP_SRC_SOE` claim rather than assume it.
     last_flags: Flags,
     frames: u64,
-    /// Buffers `REQBUFS` actually granted, which may be fewer than [`BUFFER_COUNT`].
+    /// Buffers `REQBUFS` granted, which may be fewer than [`BUFFER_COUNT`].
     buffers: u32,
     /// Set when `CaptureStream::next` failed. The next [`FrameSource::next_frame`] rebuilds the
     /// stream before touching it, because the crate has left `arena_index` naming a
@@ -200,9 +145,9 @@ impl V4l2Source {
     ///
     /// Both negotiations are verified:
     ///
-    /// - `S_FMT` must return `MJPG` at exactly the requested size. A driver that substitutes a
-    ///   different mode gets a [`CaptureError::Config`], not a shrug (§6).
-    /// - `S_PARM` must return the requested interval. A7: without this call 1080p silently runs
+    /// - `S_FMT` must return `MJPG` at the requested size. A driver that substitutes a
+    ///   different mode gets a [`CaptureError::Config`], not a shrug.
+    /// - `S_PARM` must return the requested interval. without this call 1080p silently runs
     ///   at the driver default, so the interval before and after is logged either way.
     ///
     /// # Errors
@@ -227,7 +172,7 @@ impl V4l2Source {
             )));
         }
 
-        // A7: log what the driver was going to do on its own, then override it.
+        // Retain the driver’s initial rate for comparison with the requested interval.
         let before = dev.params().map_err(map_io)?;
         log::info!(
             "{}: S_FMT gave MJPG {}x{} sizeimage={}; frame interval before S_PARM {}/{} ({:.3} fps)",
@@ -282,50 +227,31 @@ impl V4l2Source {
         self.timeout = timeout;
     }
 
-    /// `bytesused` statistics so far (§1.3: instrument this in Stage 1).
+    /// `bytesused` statistics so far.
     pub fn bytes_stats(&self) -> BytesUsedStats {
         self.bytes
     }
 
-    /// The format the driver actually gave us. Note this is **not** where frame dimensions come
-    /// from — A6 says only the JPEG header of each frame is trustworthy — it is here for logs.
+    /// The format the driver gave us. Note this is not where frame dimensions come
+    /// from — only the JPEG header of each frame is trustworthy — it is here for logs.
     pub fn negotiated_format(&self) -> Format {
         self.format
     }
 
-    /// `G_FMT` **now**, on the live fd, rather than the copy taken at open time.
-    ///
-    /// This exists to answer §11 q13 ("does a target resolution change alter the negotiated UVC
-    /// format, or does the device rescale internally?"). **Answered on 2026-09-11: it does not.**
-    /// Through a 720p window on the target, `G_FMT` and the SOF dimensions both stayed
-    /// `MJPG 1920x1080` — the device rescales internally (`docs/STAGE2_FINDINGS.md` §6 item 3).
-    /// The call stays, because that answer is one unit on one link and is worth re-checking.
-    /// A6 forbids taking frame dimensions from
-    /// `G_FMT`, and that stands — this is not a source of dimensions, it is a *measurement of
-    /// the driver's own opinion*, to be logged next to the SOF dimensions so the two can be seen
-    /// to agree or disagree. `examples/capture-probe.rs` is the instrument that does it.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the ioctl reports, classified by [`map_io`]: [`CaptureError::Disconnected`] once
-    /// the node is gone.
+    /// Query the live negotiated format for diagnostics. Actual frame dimensions
+    /// still come from JPEG headers; the device may emit a different size.
     pub fn query_negotiated_format(&self) -> Result<Format, CaptureError> {
         self.dev.format().map_err(map_io)
     }
 
-    /// `G_PARM`'s current frame interval as `(numerator, denominator)`, read now.
-    ///
-    /// The companion to [`V4l2Source::query_negotiated_format`] for the same q13 measurement:
-    /// A7 says the driver keeps its own rate unless `S_PARM` is called, so a rate that has
-    /// changed underneath us is worth seeing rather than assuming. Measured over a target reboot
-    /// and a target mode change, it never moved off `1/60`.
+    /// Read the current `G_PARM` frame interval as `(numerator, denominator)`.
     pub fn query_frame_interval(&self) -> Result<(u32, u32), CaptureError> {
         let p = self.dev.params().map_err(map_io)?;
         Ok((p.interval.numerator, p.interval.denominator))
     }
 
-    /// Buffer flags from the most recent frame. Stage 0 verified every buffer reports
-    /// `TIMESTAMP_MONOTONIC | TSTAMP_SRC_SOE` with the error bit clear (§5.5); this lets a
+    /// Buffer flags from the most recent frame. verified every buffer reports
+    /// `TIMESTAMP_MONOTONIC | TSTAMP_SRC_SOE` with the error bit clear; this lets a
     /// hardware test assert that rather than take it on trust.
     pub fn last_flags(&self) -> Flags {
         self.last_flags
@@ -343,7 +269,7 @@ impl V4l2Source {
         self.stream_rebuilds
     }
 
-    /// **Test hook.** Drop the stream and mark it broken, so the next [`FrameSource::next_frame`]
+    /// Test hook. Drop the stream and mark it broken, so the next [`FrameSource::next_frame`]
     /// takes the rebuild path. This is the only way to exercise that path against real hardware
     /// without inducing a genuine `EIO`, which needs an unplug.
     ///
@@ -356,9 +282,9 @@ impl V4l2Source {
 
     /// Tear the stream down and build a fresh one (module docs item 2).
     ///
-    /// The old stream is dropped **first**: its `Drop` issues `STREAMOFF`, which is what clears
+    /// The old stream is dropped first: its `Drop` issues `STREAMOFF`, which is what clears
     /// vb2's sticky queue-error state, and `Arena::drop` unmaps the buffers and releases them
-    /// with `REQBUFS(0)`. Only then is a new arena allocated, primed and started, exactly as
+    /// with `REQBUFS(0)`. Only then is a new arena allocated, primed and started, as
     /// [`V4l2Source::open`] does.
     ///
     /// On failure the source stays marked broken with no stream, so the following call tries
@@ -401,7 +327,7 @@ impl V4l2Source {
         let (buf, meta) = CaptureStream::next(stream).map_err(map_io)?;
         let used = meta.bytesused as usize;
         let copied = used.min(buf.len());
-        // The one copy §5.2 asks for. 0.002 ms at 1080p (A19), against 2.40 ms of decode.
+        // Copy before requeue so downstream workers cannot observe reused mmap storage.
         let mut owned = Vec::with_capacity(copied);
         owned.extend_from_slice(&buf[..copied]);
         Ok(Dequeued {
@@ -439,7 +365,7 @@ fn expired(deadline: Option<Instant>) -> bool {
 ///
 /// - `POLLNVAL` or `POLLHUP` — the fd is closed or the device hung up: [`CaptureError::Disconnected`].
 /// - `POLLERR` without `POLLIN` — a stream error with no buffer to collect: [`CaptureError::Io`]
-///   with `EIO`, and the caller must **not** call `next`, which would only fail and corrupt the
+///   with `EIO`, and the caller must not call `next`, which would only fail and corrupt the
 ///   ring.
 /// - `POLLIN` — proceed, even if `POLLERR` is set alongside it: there is a buffer to take.
 ///
@@ -459,7 +385,7 @@ fn poll_readable(fd: c_int, timeout: Duration) -> Result<bool, CaptureError> {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `poll` reads and writes exactly the one `pollfd` we pass, and `pfd` is a
+        // SAFETY: `poll` reads and writes the one `pollfd` we pass, and `pfd` is a
         // live, correctly typed, exclusively borrowed local; the count of 1 matches the single
         // element. `fd` is owned by the `Arc<Handle>` this source holds (or, in tests, by the
         // caller) and stays open for the duration of the call. A closed or invalid fd is not
@@ -499,9 +425,9 @@ fn poll_readable(fd: c_int, timeout: Duration) -> Result<bool, CaptureError> {
     }
 }
 
-/// Allocate, prime and start a capture stream on `dev` (§6, module docs item 1).
+/// Allocate, prime and start a capture stream on `dev`.
 ///
-/// Returns the stream and the number of buffers `REQBUFS` actually granted. Every buffer but
+/// Returns the stream and the number of buffers `REQBUFS` granted. Every buffer but
 /// index 0 is queued and `STREAMON` is issued, which puts the crate's stream into the steady
 /// state where `next` requeues the one buffer we hold and then dequeues.
 ///
@@ -548,7 +474,7 @@ fn granted_buffers(fd: c_int) -> Result<u32, CaptureError> {
     while count < BUFFER_PROBE_LIMIT {
         // SAFETY: `v4l2_buffer` is a plain C struct of integers and a union of integers, so an
         // all-zero value is a valid instance of it — that is how the `v4l` crate builds one
-        // itself. `VIDIOC_QUERYBUF` is `_IOWR` over exactly this type, and the pointer is to a
+        // itself. `VIDIOC_QUERYBUF` is `_IOWR` over this type, and the pointer is to a
         // live, exclusively borrowed local of that type, so the kernel reads and writes only
         // within it. `fd` is open for the duration of the call.
         let r = unsafe {
@@ -592,22 +518,13 @@ impl std::fmt::Debug for V4l2Source {
 }
 
 impl FrameSource for V4l2Source {
-    /// Dequeue one frame, copy it out, and read its dimensions from its own JPEG header.
-    ///
-    /// Order matters and follows §5.2: poll, dequeue, copy into an owned `Vec`, release the
-    /// mapping, *then* parse. The returned frame shares nothing with the driver's buffers, so
-    /// §9.2 item 8 — "no pending frame references a requeued mmap buffer" — holds structurally
-    /// rather than by discipline.
+    /// Poll, dequeue, and copy one frame into owned memory before parsing its header.
     ///
     /// # Errors
     ///
-    /// [`CaptureError::Timeout`] when no buffer became ready: the capture stalled, which is
-    /// **not** evidence that the signal is gone (§6.1, A5). [`CaptureError::Disconnected`] on
-    /// `ENODEV` or a `POLLHUP`/`POLLNVAL` on the node. [`CaptureError::BadFrame`] when the frame
-    /// carries no parseable start-of-frame header, or claims a size over the
-    /// [`MAX_WIDTH`]x[`MAX_HEIGHT`] ceiling. [`CaptureError::Io`] for a stream error, after
-    /// which the stream is marked broken and the *next* call rebuilds it (module docs item 2).
-    /// All but `Disconnected` are survivable and the caller should keep polling.
+    /// Returns timeout when no buffer is ready, disconnection on a lost device, and
+    /// bad-frame for invalid or oversized JPEG headers. Other dequeue errors require
+    /// a stream rebuild before further reads.
     fn next_frame(&mut self) -> Result<CompressedFrame, CaptureError> {
         // A previous dequeue failed and left the crate's `arena_index` naming a driver-owned
         // buffer. Nothing can be dequeued until the stream is rebuilt (module docs item 2).
@@ -619,10 +536,7 @@ impl FrameSource for V4l2Source {
             Ok(true) => {}
             Ok(false) => return Err(CaptureError::Timeout(self.timeout)),
             Err(CaptureError::Io(e)) => {
-                // A level-triggered `POLLERR` is vb2's sticky queue error: it repeats until
-                // `STREAMOFF`, which is exactly what the rebuild path performs (module docs
-                // item 3). Rebuilding here keeps S1-2's "survive and report" from degrading into
-                // a permanent stall the moment the device hiccups.
+                // A sticky queue error repeats until STREAMOFF. Rebuild before the next dequeue.
                 self.stream_broken = true;
                 log::warn!(
                     "{}: poll reported a stream error ({e}); the stream will be rebuilt on the next frame",
@@ -655,8 +569,7 @@ impl FrameSource for V4l2Source {
         self.last_flags = dq.flags;
         self.frames += 1;
         if self.frames == 1 {
-            // Stage 0 verified these bits on this device; say so once rather than assume it
-            // silently, and never fail on it — §6.1 forbids inventing signal state.
+            // Report timestamp flags once so age measurements can be interpreted correctly.
             log::info!(
                 "{}: first buffer flags {:#010x} (expect TIMESTAMP_MONOTONIC|TSTAMP_SRC_SOE)",
                 self.path.display(),
@@ -682,12 +595,11 @@ impl FrameSource for V4l2Source {
             return Err(CaptureError::BadFrame("zero-length frame".into()));
         }
 
-        // A6: the frame's own header, every frame, never `G_FMT`.
+        // Negotiated dimensions can be stale; parse each frame’s header.
         let (width, height) = jpeg::dimensions(&dq.jpeg).map_err(|e| {
             CaptureError::BadFrame(format!("sequence {sequence}, {} bytes: {e}", dq.bytesused))
         })?;
-        // The ceiling. A6 keeps the header as the authority on the size; this only refuses a
-        // size the device cannot produce, which is what a flipped SOF byte looks like.
+        // Reject corrupt dimensions before allocating decode storage.
         if !super::dimensions_in_range(width, height) {
             return Err(CaptureError::BadFrame(format!(
                 "sequence {sequence}: header claims {width}x{height}, over the                  {MAX_WIDTH}x{MAX_HEIGHT} ceiling"
@@ -703,31 +615,23 @@ impl FrameSource for V4l2Source {
         })
     }
 
-    /// Stop and restart streaming on the same fd: the B2 rebuild, on demand (§6.1 "attempt
-    /// restart").
+    /// Rebuild streaming on the same descriptor and count the rebuild.
     ///
-    /// Identical to the rebuild a failed dequeue schedules — `STREAMOFF` (via the old stream's
-    /// `Drop`), a fresh arena, re-prime, `STREAMON` — and counted in the same
-    /// [`V4l2Source::stream_rebuilds`]. The pipeline calls this when no frame has arrived for
-    /// `PipelineConfig::restart_after` and there is no error to explain it: vb2 can be sitting
-    /// on a queue that will never complete another buffer, and only `STREAMOFF` clears that.
-    ///
-    /// **This can panic** for the reason in module docs item 4: dropping the old stream runs the
-    /// crate's destructors on the calling thread. The capture thread's `catch_unwind` is what
-    /// makes that survivable.
+    /// The old mmap stream is dropped, then buffers are recreated and streaming restarts.
+    /// This clears sticky queue errors. v4l teardown may panic; pipeline callers contain it.
     fn restart(&mut self) -> Result<(), CaptureError> {
         self.stream_broken = true;
         self.rebuild_stream()
     }
 
-    /// The mode `S_FMT` committed to at open time (§6: never accept a different mode silently).
+    /// The mode `S_FMT` committed to at open time.
     ///
-    /// Deliberately the stored copy rather than a fresh `G_FMT`: this is on the frame path, and
+    /// the stored copy rather than a fresh `G_FMT`: this is on the frame path, and
     /// the live `G_FMT` is the *driver's* opinion, which the 2026-09-11 measurement showed can
     /// keep saying 1920x1080 while the device streams 640x480. What the pipeline's watchdog
-    /// needs is what was asked for and acknowledged, which is exactly this.
+    /// needs is what was asked for and acknowledged, which is this.
     ///
-    /// **Constant for the life of this source.** `self.format` is set once, by the `S_FMT` in
+    /// Constant for the life of this source. `self.format` is set once, by the `S_FMT` in
     /// [`V4l2Source::open`], and nothing else writes it: [`FrameSource::restart`] is
     /// `REQBUFS`/`QBUF`/`STREAMON` on the same fd with no `S_FMT` and no `S_PARM`, so a restart
     /// cannot renegotiate anything. The only way this value changes is a new `open()`, which is
@@ -749,17 +653,10 @@ impl FrameSource for V4l2Source {
     }
 }
 
-/// Opens [`V4l2Source`] on a fixed node, again and again (§6.1: "attempt rediscovery").
+/// Repeatedly open one fixed path with the configured mode and rate.
 ///
-/// This is the path-based opener, and deliberately the dumb one: it knows a node, a mode and a
-/// rate, and it re-runs exactly the negotiation [`V4l2Source::open`] performs. It does **not**
-/// search for the device — §8's pairing rules are `discovery`'s job, and an opener that guessed
-/// at a different node after a replug would be the "guessing" §8 forbids. A discovery-backed
-/// opener wraps this one rather than replacing it.
-///
-/// Every failure mode of a device that is on its way back is reported rather than retried here:
-/// the pipeline owns the backoff, so `open` returning `ENOENT`/`ENODEV`/`EBUSY` is the normal
-/// answer while the driver probes, not an error worth special-casing.
+/// Discovery adapters resolve paths separately. Open failures are returned to the
+/// pipeline, which owns retry timing.
 pub struct V4l2Opener {
     path: PathBuf,
     width: u32,
@@ -804,7 +701,7 @@ impl SourceOpener for V4l2Opener {
     }
 
     /// Describes the *intent*, because this has to read sensibly with no device present — which
-    /// is exactly when the pipeline is logging it.
+    /// is when the pipeline is logging it.
     fn describe(&self) -> String {
         format!(
             "V4L2 {} MJPG {}x{} @{} fps",
@@ -815,9 +712,9 @@ impl SourceOpener for V4l2Opener {
         )
     }
 
-    /// Renegotiate at the next open (§12 Stage 4b). Nothing is committed here: `S_FMT` happens in
+    /// Renegotiate at the next open. Nothing is committed here: `S_FMT` happens in
     /// [`V4l2Source::open`], where its reply is already checked against what was asked for and a
-    /// mismatch is a [`CaptureError::Config`] rather than a silent downgrade (§6).
+    /// mismatch is a [`CaptureError::Config`] rather than a silent downgrade.
     fn set_format(&mut self, width: u32, height: u32, fps: u32) -> bool {
         self.width = width;
         self.height = height;
@@ -826,26 +723,10 @@ impl SourceOpener for V4l2Opener {
     }
 }
 
-/// The MJPEG frame sizes the device at `path` enumerates (§12 Stage 4b).
+/// Enumerate supported MJPEG sizes using a separate, non-streaming handle.
 ///
-/// `VIDIOC_ENUM_FRAMESIZES` for [`FOURCC_MJPG`] on a **second, non-streaming** handle, exactly as
-/// [`query_format`] does and for the same reason: V4L2 allows many opens and one streaming owner,
-/// this ioctl is read-only, and the pipeline may be mid-reopen. The handle is opened and closed
-/// per call.
-///
-/// The chrome's resolution list is this, and not a list written down anywhere in this client (§12
-/// Stage 4b: "resolutions *enumerated from the device*, not the reference's fixed list"). Sizes
-/// past the [`MAX_WIDTH`]/[`MAX_HEIGHT`] sanity ceiling are dropped rather than offered: the
-/// decoder would refuse a frame that big, so offering the mode would be offering a failure.
-///
-/// Stepwise and continuous ranges are reduced to their **maximum** only. The device advertises
-/// discrete sizes (§6, measured), so this arm exists to be honest rather than to be used: a
-/// continuous range has no natural list of entries and inventing one would put modes in the menu
-/// that nothing measured.
-///
-/// # Errors
-///
-/// [`CaptureError::Disconnected`] when the node is gone, which is the answer during a replug.
+/// Discard sizes above decoder bounds. Discrete modes are retained; stepwise and
+/// continuous ranges contribute only their maximum to avoid expanding huge lists.
 pub fn enumerate_modes(path: &Path) -> Result<Vec<(u32, u32)>, CaptureError> {
     let dev = Device::with_path(path).map_err(map_io)?;
     let sizes = dev
@@ -873,21 +754,11 @@ pub fn enumerate_modes(path: &Path) -> Result<Vec<(u32, u32)>, CaptureError> {
     Ok(out)
 }
 
-/// `G_FMT` and `G_PARM` on a **second, non-streaming** handle to `path`.
+/// Read format and frame interval through a temporary, non-streaming handle.
 ///
-/// The q13 instrument (`examples/capture-probe.rs`) has to report the negotiated format once a
-/// second while the pipeline owns the streaming fd behind a `Box<dyn FrameSource>`, and while
-/// that fd may be in the middle of being reopened. V4L2 allows many opens of a node and only
-/// one streaming owner; both ioctls here are read-only, so this observes the driver without
-/// touching the capture. The handle is opened and closed per call, so a probe that is killed
-/// mid-query leaves nothing holding the node.
-///
-/// Returns the format and the frame interval as `(numerator, denominator)`.
-///
-/// # Errors
-///
-/// [`CaptureError::Disconnected`] when the node is gone — which is the answer during a replug,
-/// and is why the probe prints `no device` rather than exiting.
+/// The capture probe needs these values while the pipeline owns or reopens its
+/// streaming handle. Queries do not alter capture, and the temporary handle
+/// closes before return. Returns format and `(numerator, denominator)`.
 pub fn query_format(path: &Path) -> Result<(Format, (u32, u32)), CaptureError> {
     let dev = Device::with_path(path).map_err(map_io)?;
     let format = dev.format().map_err(map_io)?;
@@ -898,9 +769,9 @@ pub fn query_format(path: &Path) -> Result<(Format, (u32, u32)), CaptureError> {
     ))
 }
 
-/// `v4l2_buffer.timestamp` to a `Duration` on `CLOCK_MONOTONIC` (§5.5).
+/// `v4l2_buffer.timestamp` to a `Duration` on `CLOCK_MONOTONIC`.
 ///
-/// Stage 0 verified the stamp is always `TIMESTAMP_MONOTONIC | TSTAMP_SRC_SOE`, so this is
+/// verified the stamp is always `TIMESTAMP_MONOTONIC | TSTAMP_SRC_SOE`, so this is
 /// directly comparable with a local `CLOCK_MONOTONIC` read. Negative components cannot occur on
 /// a monotonic clock; they are clamped rather than allowed to wrap a `u64`.
 fn timestamp_to_duration(ts: v4l::timestamp::Timestamp) -> Duration {
@@ -918,8 +789,7 @@ fn fps_of(numerator: u32, denominator: u32) -> f64 {
     }
 }
 
-/// Classify an `io::Error` from an ioctl (§6.1: disconnection and stall are different things
-/// and must be reported as themselves).
+/// Classify ioctl failure as disconnection or another capture error.
 fn map_io(e: std::io::Error) -> CaptureError {
     match e.raw_os_error() {
         // The node went away: unplug, or the USB link dropped.
@@ -931,11 +801,8 @@ fn map_io(e: std::io::Error) -> CaptureError {
     }
 }
 
-/// Read `CLOCK_MONOTONIC` as a `Duration`, for comparing against a frame's `captured_at`.
-///
-/// This is the "capture-to-dequeue age" clock. §5.5 is emphatic that such a number is **not**
-/// presentation latency, and that it carries a floor of about one frame period of USB transfer
-/// time; label it accordingly wherever it is reported.
+/// Read `CLOCK_MONOTONIC` for comparison with capture timestamps. The resulting
+/// age is measured before presentation and must be labeled accordingly.
 pub fn now_monotonic() -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -1037,7 +904,7 @@ mod tests {
     impl Pipe {
         fn new() -> Self {
             let mut fds = [0 as c_int; 2];
-            // SAFETY: `pipe` writes exactly two `int`s through the pointer, and `fds` is a live,
+            // SAFETY: `pipe` writes two `int`s through the pointer, and `fds` is a live,
             // correctly typed, exclusively borrowed local array of two of them.
             let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
             assert_eq!(r, 0, "pipe(): {}", std::io::Error::last_os_error());
@@ -1187,7 +1054,7 @@ mod tests {
     }
 
     /// The opener has to be usable, and honest, with no device present — that is the state it
-    /// exists for. A `describe()` that needed a live source would print nothing exactly when the
+    /// exists for. A `describe()` that needed a live source would print nothing when the
     /// pipeline is logging "still trying".
     #[test]
     fn an_opener_on_an_absent_node_describes_itself_and_reports_disconnection() {

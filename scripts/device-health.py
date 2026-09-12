@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""Confirm the NanoKVM-USB is present, correctly paired, and answering.
+"""Check device identity, pairing, and CH9329 information replies.
 
-Run this before blaming your code. It checks, in order: both device nodes exist and are
-usable, they belong to the same physical dongle, the dongle's sound card is on that same USB
-device and offers the one format this client opens, and the CH9329 answers GET_INFO with a
-frame whose checksum recomputes.
+Usage: scripts/device-health.py [video-node] [tty-node]
+Defaults: video4 ttyACM1. Verify device identities before using these defaults.
 
-Uses only the standard library, and deliberately does not depend on anything under spikes/,
-which is throwaway Stage 0 code. Read-only apart from one GET_INFO request.
+Reads sysfs and device metadata, then sends GET_INFO. Node, pairing, and serial
+failures return nonzero. Audio format checks are informational because a missing
+sound card does not prevent video or keyboard control.
 
-Exits non-zero for the nodes, the pairing and GET_INFO. **The audio checks are informational**
-and never fail the run: audio is a side channel (plan §4.1 rev 5), and a dongle with no sound
-card is a working KVM.
-
-Usage:  scripts/device-health.py [video-node] [tty-node]      (defaults: video4 ttyACM1)
-
-If a node is missing or the link has wedged, scripts/usb-replug.py makes the kernel unplug and
-replug the dongle (plan §6.1 S2-4); run this again afterwards to confirm it came back. It works
-with the node already gone — name the dongle by sysfs port path, e.g. `--port 3-2.2 dongle` —
-and it reports the new /dev names if the kernel hands out different minors.
-"""
+Requires only Python's standard library. For reset/rebind diagnostics, see
+usb-replug.py; this script does not reset devices."""
 import os
 import sys
 import termios
@@ -67,21 +57,11 @@ def usb_id(d):
 
 
 def check_pairing(video, tty, report):
-    """NATIVE_CLIENT_PLAN §8, as implemented by src/discovery. Same USB device is proof; failing
-    that, the kernel's port `peer` link proves the two sit on one physical connector; failing
-    that, both being direct children of the dongle's own internal hub.
+    """Check same-device identity, port-peer links, then internal-hub containment.
 
-    The third case is not proof and does not say it is. §8 itself calls it a degradation: on a
-    USB 2.0-only port "the check degrades to a common-ancestor test, which is sound *because the
-    shared ancestor is inside the dongle*" -- and nothing in sysfs asserts that it is. It is also
-    narrower here than §8's wording, deliberately: `1a40:0101` is an unbranded generic hub chip,
-    so "shared ancestor is a hub" would pair any two devices behind any cheap hub -- a webcam and
-    an unrelated CDC-ACM device on one dock do exactly that. All three ids are therefore required,
-    and all three are commodity part numbers, which is what "degraded" in its verdict is saying.
-
-    The evidence strings printed below are the ones `discovery::Evidence::kind()` and its
-    `Display` produce, word for word, so this check and the client can be compared directly.
-    `src/discovery/mod.rs` has a unit test that fails if this file stops containing them."""
+    Containment requires matching video, serial, and hub IDs, but those commodity
+    IDs remain weaker evidence than a kernel identity or peer link. Keep verdict
+    strings consistent with discovery::Evidence; Rust tests check that agreement."""
     v = usb_device_of(f"/sys/class/video4linux/{video}/device")
     s = usb_device_of(f"/sys/class/tty/{tty}/device")
     if not v or not s:
@@ -119,7 +99,7 @@ def check_pairing(video, tty, report):
         report(True, "pairing",
                f"internal hub (degraded): both are direct children of the dongle's own hub "
                f"{os.path.basename(hub)} {attr(hub,'idVendor')}:{attr(hub,'idProduct')} "
-               f"— §8's common-ancestor test, contained by that hub and by all three vendor ids, "
+               f"— an internal-hub containment test, contained by that hub and by all three vendor ids, "
                f"which are commodity part numbers rather than a kernel assertion")
         return True
 
@@ -128,15 +108,10 @@ def check_pairing(video, tty, report):
 
 
 def sound_card_of(usb_device):
-    """The ALSA card whose sysfs device is an interface of this USB device (plan §12 Stage 4a).
+    """Return the first (cardN, sysfs path) on the video USB device, or None.
 
-    §8's evidence 1, and the only rule `discovery::audio_for` implements: the dongle's UAC
-    interfaces are interfaces of the *capture device itself*, so the card's `device` link resolves
-    up to the same USB device as the video node's. Not containment -- anything else plugged into
-    the dongle's own internal hub is contained by that hub too.
-
-    Returns (cardN, sysfs path) or None. Card numbers renumber on replug exactly as /dev names do,
-    so the number is read out of the directory name here and never assumed."""
+    Hub containment is insufficient: another device under that hub may own audio.
+    Read card numbers at runtime because replug can change them."""
     base = "/sys/class/sound"
     if not os.path.isdir(base):
         return None
@@ -159,17 +134,10 @@ AUDIO_FORMAT = (("Format: S16_LE", "S16_LE"),
 
 
 def check_audio(video, report):
-    """The paired sound card exists and offers the one format §12 Stage 4a expects.
+    """Report the paired card's advertised capture format without opening PCM.
 
-    Read-only, and it opens **nothing**: the card's identity comes from sysfs and its format from
-    /proc/asound, neither of which disturbs a device. Opening the PCM would take it away from
-    whatever is recording from it, which is the opposite of a health check.
-
-    **Informational, whatever it finds.** `report` here is the caller's `note`, not its `report`:
-    plan §4.1 rev 5 makes audio a side channel, and a dongle whose audio interface is unbound, or
-    a kernel without snd-usb-audio, is a fully working KVM. Exiting non-zero for it would make
-    this script refuse to bless a desk that is fine, and would train whoever runs it to ignore the
-    exit code. Video, serial and GET_INFO are what decide that."""
+    Read sysfs and /proc/asound to avoid taking a busy card from its current user.
+    Audio findings are informational and do not determine the script's exit code."""
     usb = usb_device_of(f"/sys/class/video4linux/{video}/device")
     if not usb:
         report(False, "audio card", "could not resolve the video node to its USB device")

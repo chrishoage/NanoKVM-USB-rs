@@ -1,20 +1,8 @@
-//! Native Linux client for the Sipeed NanoKVM-USB dongle.
+//! Native Linux client for the Sipeed NanoKVM-USB.
 //!
-//! Design of record: `docs/NATIVE_CLIENT_PLAN.md` (rev 4). Evidence: `docs/STAGE0_FINDINGS.md`.
-//! Module layout follows plan §4:
-//!
-//! - [`proto`]   — CH9329 framing, HID report builders, keymap. Pure, no I/O.
-//! - [`link`]    — the `Link` trait: the one seam between the input writer and a transport.
-//! - [`input`]   — event classes, coalescing, held-state projection, release-all cancellation (§2).
-//! - [`serial`]  — port open, reader thread matching replies by command byte, `Link` impl.
-//! - [`capture`] — V4L2 streaming, owned frames, JPEG-header dimensions, decode, handoffs (§5, §6).
-//! - [`viewer`]  — winit window, render thread, Wayland shortcut inhibit, input capture.
-//! - [`discovery`] — pairing the two device nodes by USB topology, from sysfs alone (§8).
-//! - [`script`]  — the pure keyboard-script layer behind `key`, `type` and `macro` (§10.2, §12).
-//! - [`cli`]      — the subcommands and their argument definitions (§12 Stage 3).
-//! - [`audio`]   — the dongle's USB Audio Class capture stream, a bounded period ring, and
-//!   playback to ALSA `default` (§4.1 rev 5, §12 Stage 4a). A side channel: nothing in it may
-//!   touch video or input, and `tests/audio_isolation.rs` enforces that.
+//! The protocol and script compilers are independent of device I/O. The viewer combines
+//! serial input, MJPEG capture, audio playback, and a Wayland window. See
+//! `docs/architecture.md` for subsystem ownership and failure handling.
 
 pub mod audio;
 pub mod capture;

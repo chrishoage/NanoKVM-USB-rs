@@ -1,30 +1,12 @@
-//! The Stage 2 hardware tests for §2.7 (reconnect) and §5.1 (torn-write resynchronisation).
-//! Feature-gated and `#[ignore]`d, never gating CI (§9.3).
+//! CH9329 torn-frame resynchronization and serial USB replug tests.
 //!
-//! ```text
-//! # H-A1..H-A3 — safe to run at any time; they write only to /dev/ttyACM1.
-//! cargo test --features hardware --test serial_reconnect_hardware -- \
-//!     --ignored --nocapture --test-threads=1 --skip h_a4
+//! Bridge identity is 1a86:55d3 under the 1a40:0101 internal hub. The recorded path
+//! is `/dev/ttyACM1`; verify it before direct-path tests. H-A4 resolves replacement
+//! nodes by identity and requires explicit USB reset authorization. Run one binary
+//! at a time with `--test-threads=1`. Never open unrelated bus-5 hardware.
 //!
-//! # H-A4 — takes the serial node away and puts it back. Ask before running it.
-//! NANOKVM_REPLUG_METHOD=reset cargo test --features hardware \
-//!     --test serial_reconnect_hardware -- --ignored --nocapture --test-threads=1 h_a4
-//! ```
-//!
-//! **Verified by consequence, never by acknowledgement** (§3.4, A17). The consequences asserted
-//! here are: a `GET_INFO` reply that arrives (the chip's receive parser is realigned), the lock
-//! bits it carries (unchanged by anything these tests do), and — in H-A4 — the target's CapsLock
-//! bit flipping and flipping back, which originates in the *target's* own HID output report and is
-//! therefore proof the target processed the keystroke.
-//!
-//! **They leave the target as they found it.** CapsLock is tapped twice or not at all, and every
-//! test releases everything on every path out, including a panic. **No test sends a mouse
-//! button**: a click on a live desktop can launch or destroy something.
-//!
-//! **The malformed bytes come from the fixture file, not from this source.**
-//! `fixtures/packets/ch9329.toml`'s `device_receive_parser_has_no_inter_byte_timeout` records the
-//! exact trigger Stage 0 measured, and retyping it here is how a test quietly stops testing the
-//! anomaly it names (§9.1).
+//! Assertions use returned device information and target lock-state changes. Torn
+//! input comes from packet fixtures; cleanup attempts to release held input.
 
 #![cfg(feature = "hardware")]
 
@@ -51,17 +33,11 @@ use serde::Deserialize;
 #[path = "support/child_guard.rs"]
 mod child_guard;
 
-/// The dongle's serial node on this desk (CLAUDE.md): the `1a86:55d3` CDC-ACM child of the
-/// dongle's own `1a40:0101` hub. `/dev/ttyACM0` is the dock's unrelated CDC-ACM device and is
-/// never opened.
-///
-/// H-A1..H-A3 open this name directly, which is honest: they neither take the device away nor
-/// expect it back, so the name cannot change under them, and a run on a renumbered desk fails
-/// with this comment as the explanation. **H-A4 does not use it except as the expectation it
-/// prints**: it reopens by identity (§8), because a replug is exactly when the name moves — and
-/// on the run that produced this slice it moved to `/dev/ttyACM2` and stayed there.
+/// Recorded serial path for bridge 1a86:55d3 under hub 1a40:0101. Verify identity
+/// before direct-path tests. Never open the unrelated ttyACM0 device on bus 5.
+/// Replug tests discover replacement paths instead.
 const PORT: &str = "/dev/ttyACM1";
-/// The reply deadline every assertion here uses. §2.7's `get_info_timeout` default.
+/// Use the writer’s default 500 ms information-request deadline.
 const TIMEOUT: Duration = Duration::from_millis(500);
 /// CapsLock's HID usage (fixture `kb_capslock_press`).
 const CAPS_LOCK: u8 = 0x39;
@@ -117,7 +93,7 @@ fn payload(name: &str) -> Vec<u8> {
         .data
 }
 
-/// The bytes Stage 0 measured as leaving the chip's parser mid-frame: a header claiming `LEN 8`
+/// The bytes measured as leaving the chip's parser mid-frame: a header claiming `LEN 8`
 /// with only two payload bytes sent, which is what a `write_all` that failed after seven bytes
 /// leaves on the wire (fixture `device_receive_parser_has_no_inter_byte_timeout`).
 fn torn_frame() -> Vec<u8> {
@@ -140,13 +116,8 @@ fn torn_frame() -> Vec<u8> {
 
 // -- the release-all guard --------------------------------------------------
 
-/// Owns the link and leaves the chip clean when it goes out of scope, however it goes out of scope
-/// (§2.6: release-all on clean shutdown; the same applies to a failed test).
-///
-/// It runs the §2.7 order: **preamble first, then the release**. These tests deliberately tear
-/// frames, so a release-all sent without the preamble in front of it is exactly the frame that
-/// gets eaten as the remainder — which would leave the target holding keys precisely when the test
-/// failed.
+/// Pad torn frames before release on every exit path. Without padding, the
+/// release itself may be consumed as the unfinished frame.
 struct Released(SerialLink);
 
 impl Deref for Released {
@@ -175,7 +146,7 @@ impl Drop for Released {
         ] {
             match self.0.transact(command, data, TIMEOUT) {
                 Ok(_) => eprintln!("[release-all] {name} report sent"),
-                // §2.6.1: an unsent release is worth saying out loud, not hiding.
+                // Report cleanup failure because the target may still hold input.
                 Err(e) => eprintln!("[release-all] {name} report UNSENT: {e}"),
             }
         }
@@ -186,9 +157,7 @@ fn open() -> Released {
     Released(SerialLink::open(Path::new(PORT)).expect("open /dev/ttyACM1"))
 }
 
-/// Drain and print everything the device pushed that nothing asked for. Both a diagnostic and the
-/// A12 evidence channel: a `0xC2`/`0xE4` here is the chip reporting the checksum error a
-/// zero-completed frame produces, which is the outcome the preamble's safety argument predicts.
+/// Print unsolicited packets to retain lock-state and checksum-error evidence.
 fn drain_unsolicited(link: &Released, label: &str) -> Vec<Reply> {
     let mut seen = Vec::new();
     while let Ok(reply) = link.unsolicited().try_recv() {
@@ -213,11 +182,9 @@ fn locks(info: &DeviceInfo) -> (bool, bool, bool) {
     (info.num_lock, info.caps_lock, info.scroll_lock)
 }
 
-// -- H-A1 -------------------------------------------------------------------
+// Preamble on a healthy link.
 
-/// **H-A1 — zeros are harmless.** The preamble in front of a healthy link changes nothing the
-/// device reports: `GET_INFO` still answers inside the deadline and the lock bits are the ones it
-/// gave before.
+/// Padding a healthy link must preserve information replies and lock state.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle"]
 fn h_a1_a_zero_preamble_leaves_a_healthy_link_untouched() {
@@ -253,11 +220,10 @@ fn h_a1_a_zero_preamble_leaves_a_healthy_link_untouched() {
     assert_eq!(link.is_down(), None);
 }
 
-// -- H-A2 -------------------------------------------------------------------
+// Recovery from a torn keyboard frame.
 
-/// **H-A2 — a torn frame is recovered.** Tear a keyboard frame on purpose with the raw port, write
-/// the preamble, and `GET_INFO` must answer inside the deadline. Then release everything and check
-/// the lock bits are where they started.
+/// Tear a frame, pad it, and verify information replies resume. Release input
+/// and confirm the original lock state afterward.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle"]
 fn h_a2_the_preamble_recovers_a_deliberately_torn_frame() {
@@ -312,15 +278,11 @@ fn h_a2_the_preamble_recovers_a_deliberately_torn_frame() {
     assert_eq!(link.is_down(), None);
 }
 
-// -- H-A3 -------------------------------------------------------------------
+// Torn-frame negative control.
 
-/// **H-A3 — the negative control.** A torn frame with *no* preamble: §5.1 says the next command is
-/// eaten and the request times out. Then the preamble, and the same request must answer. That
-/// second half is what shows the preamble is doing the work rather than time passing.
-///
-/// If the negative control does **not** time out, §5.1's claim is wrong for this firmware. That is
-/// a finding, not a test failure: it is printed loudly and the preamble stays, because H-A1 has
-/// already shown it costs nothing.
+/// Without padding, record whether the torn frame consumes the next request.
+/// Then verify padding restores replies. A different negative-control result is
+/// reported as a firmware observation; successful recovery is still required.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle"]
 fn h_a3_a_torn_frame_without_a_preamble_eats_the_next_command() {
@@ -338,25 +300,19 @@ fn h_a3_a_torn_frame_without_a_preamble_eats_the_next_command() {
     let rtt = t.elapsed();
     match &swallowed {
         Err(LinkError::Timeout { .. }) => println!(
-            "[H-A3] as §5.1 predicts: the torn frame ate the GET_INFO; it timed out after {rtt:?}"
+            "[H-A3] as  predicts: the torn frame ate the GET_INFO; it timed out after {rtt:?}"
         ),
         other => println!(
-            "[H-A3] FINDING: §5.1 says this request should have been eaten, but the device \
+            "[H-A3] FINDING:  says this request should have been eaten, but the device \
              answered in {rtt:?}: {other:?}. The preamble is kept regardless — H-A1 shows it is \
-             free — but §5.1's claim does not hold for this firmware as stated."
+             free — but 's claim does not hold for this firmware as stated."
         ),
     }
     drain_unsolicited(&link, "H-A3");
 
-    // The repair. Two `GET_INFO`s, not one, and the reason is the reader rather than the chip: the
-    // timeout above armed `Inner::timed_out` for command `0x01` (§3.1, B6 defect 4), so the first
-    // `0x81` frame to arrive afterwards is diverted as *that* request's late reply and this
-    // transact times out too. That diversion is itself the evidence — an `0x81` arriving at all
-    // means the chip's receive parser is realigned — so the test looks for it either way and then
-    // asks again, which must be answered normally.
-    //
-    // Nothing in the reconnect path meets this: §2.7 builds a **new** `SerialLink`, whose matcher
-    // has no armed slot, so its `GET_INFO` is matched on the first attempt.
+    // The first information reply after timeout is diverted to the expired request.
+    // A second request verifies the repaired parser independently of that late-reply slot.
+    // Reconnect creates a new link and therefore has no expired slot to drain.
     let t = Instant::now();
     link.resync().expect("the preamble is written");
     let first = link.get_info(TIMEOUT);
@@ -399,10 +355,10 @@ fn h_a3_a_torn_frame_without_a_preamble_eats_the_next_command() {
     assert_eq!(link.is_down(), None);
 }
 
-// -- H-A4 -------------------------------------------------------------------
+// Serial removal and rediscovery.
 
 /// How the serial node is taken away. `reset` is the default; the orchestrator sets this to
-/// whichever method actually makes `/dev/ttyACM1` disappear on this host.
+/// whichever method makes `/dev/ttyACM1` disappear on this host.
 fn replug_method() -> String {
     std::env::var("NANOKVM_REPLUG_METHOD").unwrap_or_else(|_| "reset".to_string())
 }
@@ -411,7 +367,7 @@ fn replug_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/usb-replug.py")
 }
 
-/// Owns the writer and shuts it down — which is a §2.6 release-all — on every path out.
+/// Shut down and release input on every exit path.
 struct ReleasedWriter(Option<WriterHandle>);
 
 impl Drop for ReleasedWriter {
@@ -442,7 +398,7 @@ fn within<F: FnMut() -> bool>(limit: Duration, mut done: F) -> Option<Duration> 
 
 /// What the sampling thread saw of one outage.
 ///
-/// `Stats::link_down` is an **edge**, not a level: the writer raises it and the reconnect clears
+/// `Stats::link_down` is an edge, not a level: the writer raises it and the reconnect clears
 /// it. Anything that samples it only after the outage is over — which is what polling it after
 /// `usb-replug.py` returns amounts to, since the script returns once the node is *back* — reads
 /// `false` on a run where every part of the mechanism worked. So the edges are caught by a thread
@@ -459,7 +415,7 @@ struct Edges {
 }
 
 /// How often the sampler reads `Stats`. Two orders of magnitude below the writer's 100 ms health
-/// poll, so the down edge cannot be missed between samples, and cheap: `stats()` takes no lock the
+/// poll, so the down edge cannot be missed between samples, and cheap: `stats` takes no lock the
 /// writer holds across I/O.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -484,7 +440,7 @@ fn await_edge<F: Fn(Edges) -> Option<Instant>>(
 ///
 /// That number is relative to the script's own `t0`, which is taken inside `do_operation`, *after*
 /// the process has started and resolved its arguments. Added to the instant the child was spawned
-/// it is therefore an **early** estimate of when the node really went away, which makes every
+/// it is therefore an early estimate of when the node really went away, which makes every
 /// latency measured from it an upper bound. Labelled as one wherever it is printed.
 fn gone_stamp_ms(line: &str) -> Option<u64> {
     let mut fields = line.split_whitespace();
@@ -499,10 +455,8 @@ fn gone_stamp_ms(line: &str) -> Option<u64> {
     ms.parse().ok()
 }
 
-/// The parser above, against the exact shapes `scripts/usb-replug.py::_stamp` emits. Needs no
-/// hardware and is not `#[ignore]`d: a silent mis-parse would not fail H-A4, it would quietly
-/// degrade its notice bound to the looser "from the spawn" one, which is the kind of rot a
-/// measurement never announces.
+/// Parse the reset tool’s actual stamp formats. A missed stamp would silently
+/// weaken the notice measurement from removal time to process-spawn time.
 #[test]
 fn the_replug_scripts_gone_stamp_is_parsed_and_nothing_else_is() {
     assert_eq!(gone_stamp_ms("+1234 ms   /dev/ttyACM1 gone"), Some(1234));
@@ -520,9 +474,9 @@ fn the_replug_scripts_gone_stamp_is_parsed_and_nothing_else_is() {
     assert_eq!(gone_stamp_ms(""), None);
 }
 
-/// Wait for a `0x81` push reporting `want` on CapsLock (A12) — the target's own HID output report,
+/// Wait for a `0x81` push reporting `want` on CapsLock — the target's own HID output report,
 /// and therefore proof the *target* processed the keystroke rather than proof the chip parsed a
-/// frame (§3.4, A17).
+/// frame.
 fn await_caps_push(rx: &Receiver<Reply>, want: bool, limit: Duration) -> Option<Duration> {
     let started = Instant::now();
     while started.elapsed() < limit {
@@ -542,40 +496,8 @@ fn await_caps_push(rx: &Receiver<Reply>, want: bool, limit: Duration) -> Option<
     None
 }
 
-/// **H-A4 — end to end on the real dongle.** Build the input path on a `DiscoveringLinkSource`,
-/// take the serial node away with `scripts/usb-replug.py`, and watch the writer put it back
-/// together: `link_down` true then false, exactly one reconnect, the release recorded
-/// `Reconnected` / `Submitted`, device info re-queried — and then the consequence check, a
-/// CapsLock tap through the *reconnected* writer that flips the target's lock bit and flips it
-/// back.
-///
-/// **It reopens by identity, not by name** (§8, C6), because the first run of this test proved it
-/// has to: the idle writer held `/dev/ttyACM1` open across the replug, so the kernel could not
-/// free the tty index and the device came back as `/dev/ttyACM2`. A fixed-path source would have
-/// retried a node that no longer existed for ever. The resolved path is printed either side, so a
-/// rename is *recorded* rather than fatal.
-///
-/// **The two numbers it prints are the point of running it**, and how they are taken is most of
-/// why this test is shaped the way it is. `ReconnectConfig::default`'s backoff is a guess until
-/// this test says how long the writer takes to notice the loss and how long the device is away
-/// (see the TODO on `src/input/mod.rs`).
-///
-/// `Stats::link_down` is an **edge**: the writer raises it and the reconnect clears it. So it is
-/// sampled by a thread started *before* the replug, which timestamps both transitions — not
-/// polled afterwards, which is what the first version of this test did and which measured nothing
-/// at all. `usb-replug.py` returns once the node is *back*, so a poll that starts there can find
-/// `link_down` already cleared on a run where every part of the mechanism worked, and the
-/// "latency" it prints has its zero seconds after the hang-up rather than at it.
-///
-/// The notice latency is therefore reported as an **upper bound**, measured from the script's own
-/// `+N ms  <node> gone` stamp (read off its piped stdout) added to the instant the child was
-/// spawned — an instant that is necessarily no later than the real one, so the true latency is
-/// smaller than the number printed. The second number, the outage itself, is the interval between
-/// the two sampled edges. The bound is asserted against 5 s: the health poll is 100 ms, so
-/// anything near that means the bounded idle wait is not working.
-///
-/// It never sends a mouse button and it taps CapsLock exactly twice, so the target ends where it
-/// began.
+/// Remove the serial node, observe automatic commissioning, then tap CapsLock
+/// through the replacement link. The lock-state change verifies target effect.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle and takes its serial node away; ask before running"]
 fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
@@ -587,15 +509,14 @@ fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
     );
     let method = replug_method();
 
-    // Identity, not name: `NodeResolver::real` re-runs the whole of §8 on every open attempt, which
-    // is what `src/main.rs` does and the only thing that survives the node being renumbered.
+    // Rediscover on every open so node renumbering cannot strand the writer.
     let reporter = NodeResolver::real(NodeKind::Serial, Constraints::default());
     let before_path = reporter
         .resolve()
-        .expect("§8 must name the dongle's serial node before the replug")
+        .expect(" must name the dongle's serial node before the replug")
         .path;
     println!(
-        "[H-A4] §8 resolves the serial node to {} now",
+        "[H-A4]  resolves the serial node to {} now",
         before_path.display()
     );
     if before_path != Path::new(PORT) {
@@ -655,18 +576,7 @@ fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
         })
     };
 
-    // -- take it away ------------------------------------------------------
-    // `--serial` carries the node §8 just resolved. Without it the script falls back to its
-    // `/dev/ttyACM1` default — the one name this test is written not to trust, and the one that
-    // moved to `/dev/ttyACM2` on the run that produced this slice. It is not a safety hazard
-    // either way (`resolve()` refuses anything outside the allowlist), but a test that fails
-    // because it handed the script a stale name has failed for the wrong reason, in exactly the
-    // scenario it exists to survive. H-B2 passes `--video` for the same reason.
-    //
-    // Through a `ChildGuard` and a pipe: the guard so an assertion that unwinds past the `wait()`
-    // cannot leave a USB-resetting script running unsupervised, and the pipe so the script's own
-    // timeline — including the `+N ms  <node> gone` stamp the notice bound is measured from — is
-    // read here as well as printed.
+    // Pass the resolved node to the reset tool; its default may name an old path.
     println!(
         "[H-A4] running usb-replug.py serial --method {method} --serial {}",
         before_path.display()
@@ -733,7 +643,7 @@ fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
     // The two numbers `ReconnectConfig::default` is waiting on. Printed together, and labelled,
     // so they can be read off one run: do not change the defaults from anything else.
     //
-    // The notice latency is an **upper bound**. Its zero is the script's own "gone" stamp added
+    // The notice latency is an upper bound. Its zero is the script's own "gone" stamp added
     // to the instant the child was spawned, and the script's `t0` is later than that spawn by
     // however long python took to start and resolve its arguments — so the true latency is
     // smaller than what is printed, never larger.
@@ -763,10 +673,10 @@ fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
     );
     let after_path = reporter
         .resolve()
-        .expect("§8 must name the serial node again once the device is back")
+        .expect(" must name the serial node again once the device is back")
         .path;
     println!(
-        "[H-A4] §8 resolves the serial node to {} after the replug (was {})",
+        "[H-A4]  resolves the serial node to {} after the replug (was {})",
         after_path.display(),
         before_path.display()
     );
@@ -795,7 +705,7 @@ fn h_a4_the_writer_reconnects_after_a_real_replug_and_drives_the_target() {
     // Anything the device pushed while the link was coming back is stale for this purpose.
     while unsolicited.try_recv().is_ok() {}
 
-    producer.engage().expect("deliberate recapture after §2.8");
+    producer.engage().expect("deliberate recapture after ");
     let started_caps = info.caps_lock;
     for (round, want) in [(1, !started_caps), (2, started_caps)] {
         for down in [true, false] {

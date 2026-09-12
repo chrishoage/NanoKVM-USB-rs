@@ -1,14 +1,7 @@
-//! The compiler: user text in, a whole [`Script`] or an error out.
+//! Keyboard script compilation and complete input diagnostics.
 //!
-//! **Compile everything before opening anything** (§2.8 item 3). Every function here is pure and
-//! returns either a script that is fully resolvable to reports or an error that names every
-//! problem it found; the caller opens the port only after an `Ok`. That is what makes "fully
-//! typeable or not attempted" structural rather than a promise — a half-typed `sudo reboot` on a
-//! live console is exactly the partially delivered sequence §2.8 forbids.
-//!
-//! The unreachable-character policy is §10.2's: fail loudly, name the characters, never
-//! approximate — and name *all* of them, so a long line is fixed in one pass rather than one
-//! character per run.
+//! All errors are collected before reports can be sent. CapsLock compensation changes
+//! Shift only for letters; unsupported characters are never approximated.
 
 use std::time::Duration;
 
@@ -21,13 +14,8 @@ use crate::script::chord::{parse_chord_with, Chord, ChordError};
 use crate::script::layout::{Layout, LayoutError};
 use crate::script::{Script, Step};
 
-/// Longest a single `wait` step may ask for.
-///
-/// An hour, which is far past any pacing a macro has a use for — the measured need is 300–500 ms
-/// between steps that open a window. The bound is here rather than in the sender because §2.8
-/// item 3 puts every refusal *before* the port is opened, and because it is what keeps every
-/// deadline the send loop computes representable: `Instant::now() + Duration::from_millis(u64::MAX)`
-/// overflows and panics, mid-script, with a key possibly held.
+/// Maximum duration of one macro wait. Validate before device access so an
+/// unrepresentable deadline cannot panic during delivery.
 pub const MAX_WAIT: Duration = Duration::from_millis(3_600_000);
 
 /// What the caller decided to do about the target's CapsLock, reduced to the three ways a
@@ -41,7 +29,7 @@ pub enum CapsLock {
     #[default]
     Off,
     /// CapsLock may be on and the caller chose to type anyway, accepting whatever the target
-    /// makes of it. Encoded exactly as [`CapsLock::Off`]; the difference is what the caller was
+    /// makes of it. Encoded as [`CapsLock::Off`]; the difference is what the caller was
     /// told, not what goes on the wire.
     Ignore,
     /// CapsLock is on and is to be worked around: the shift bit is inverted for ASCII letters,
@@ -61,7 +49,7 @@ impl CapsLock {
 }
 
 /// Why a script did not compile. Nothing here is `anyhow`: these are the words the user reads,
-/// and they are part of the contract the tests hold (§2.8 item 3).
+/// and they are part of the contract the tests hold.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompileError {
     #[error(transparent)]
@@ -104,7 +92,7 @@ pub enum CompileError {
 
     /// A `wait` longer than [`MAX_WAIT`]. Refused at *compile* time, with everything else: a
     /// deadline that far out overflows `Instant` and panics inside the send loop, which is a
-    /// crash with a key possibly held rather than an error before anything opened (§2.8 item 3).
+    /// crash with a key possibly held rather than an error before anything opened.
     /// An hour is well past any pacing a macro can want, so the bound costs nothing real.
     #[error(
         "wait {ms} ms is longer than the {} ms (1 hour) maximum for one step",
@@ -135,8 +123,7 @@ pub enum CompileError {
     },
 }
 
-/// The §10.2 message: every unreachable character, where it first occurs, and the reason the
-/// whole thing was refused rather than approximated.
+/// List unsupported characters once each, with their first positions.
 fn unreachable_message(layout: Layout, chars: &[(char, usize)]) -> String {
     let n = chars.len();
     let subject = if n == 1 {
@@ -151,7 +138,7 @@ fn unreachable_message(layout: Layout, chars: &[(char, usize)]) -> String {
         .join(", ");
     format!(
         "{n} {subject} not reachable on layout {layout}: {list}\ntext injection needs a key for \
-         every character (§10.2); nothing was sent."
+         every character; nothing was sent."
     )
 }
 
@@ -181,7 +168,7 @@ fn macro_lines_message(lines: &[(usize, CompileError)]) -> String {
 }
 
 /// The report usage for a physical key. A modifier has no usage — it is a bit of byte 0
-/// (Appendix) — and cannot reach here, because `keynames::key_by_name` does not know the modifier
+/// — and cannot reach here, because `keynames::key_by_name` does not know the modifier
 /// names.
 fn usage_of(key: KeyCode) -> Result<u8, CompileError> {
     match hid_key(key) {
@@ -194,17 +181,17 @@ fn usage_of(key: KeyCode) -> Result<u8, CompileError> {
 fn push_chord(script: &mut Script, chord: Chord, label: String) -> Result<(), CompileError> {
     let usage = match chord.key {
         Some(key) => usage_of(key)?,
-        // A modifier-only chord presses the bits alone (C7).
+        // A modifier-only chord presses the bits alone.
         None => 0,
     };
     script.tap(usage, chord.modifiers, label);
     Ok(())
 }
 
-/// Compile one or more chords, each a press and a release (§2.8 item 3: all of them or none).
+/// Compile one or more chords, each a press and a release.
 ///
-/// **Every** bad chord is reported, not the first: `key ctlr+c ctrl+xyz` names both misspellings
-/// in one run, exactly as an unreachable character does. Stopping at the first would make fixing
+/// Every bad chord is reported, not the first: `key ctlr+c ctrl+xyz` names both misspellings
+/// in one run, as an unreachable character does. Stopping at the first would make fixing
 /// a five-chord line a five-run job, with the port opened and a script half typed in between.
 pub fn compile_key(chords: &[String], layout: Layout) -> Result<Script, CompileError> {
     let mut script = Script::default();
@@ -229,7 +216,7 @@ pub fn compile_key(chords: &[String], layout: Layout) -> Result<Script, CompileE
 
 /// Compile text to one press and one release per character, against the *declared* layout.
 ///
-/// This is text injection, not key forwarding (§10.2): a target on another layout would receive
+/// This is text injection, not key forwarding: a target on another layout would receive
 /// different characters, which is why the layout is declared and named in every error. A
 /// character the layout cannot produce is not approximated — every one is collected and reported
 /// together, so a line is fixed once rather than a character per run.
@@ -267,7 +254,7 @@ pub fn compile_type(text: &str, layout: Layout, caps: CapsLock) -> Result<Script
 /// Compile a macro file: one step per line, `#` comments, blank lines ignored.
 ///
 /// ```text
-/// layout us            # optional, before the first step; must agree with --layout if given
+/// layout us # optional, before the first step; must agree with --layout if given
 /// key ctrl+alt+t
 /// type sudo reboot
 /// wait 500
@@ -275,14 +262,14 @@ pub fn compile_type(text: &str, layout: Layout, caps: CapsLock) -> Result<Script
 ///
 /// `layout` is `Some` when the caller passed `--layout`, in which case a directive that disagrees
 /// is an error rather than a silent override — the two say different things about the target and
-/// only one of them can be true (§10.2). With `None`, the directive decides, and its absence
+/// only one of them can be true. With `None`, the directive decides, and its absence
 /// means [`Layout::default`].
 ///
-/// **A `#` comments out a whole line, never the tail of one.** `type` takes its text verbatim to
+/// A `#` comments out a whole line, never the tail of one. `type` takes its text verbatim to
 /// the end of the line, so a tail comment would be typed on one line and stripped on another;
 /// `type echo #1` types `#1`.
 ///
-/// **Every** bad line is reported, not the first. A macro is written in one pass and should be
+/// Every bad line is reported, not the first. A macro is written in one pass and should be
 /// fixable in one: stopping at line 3 of a file whose lines 3, 7 and 11 are wrong means three
 /// runs, and nothing is sent on any of them, so there is no reason to hurry the failure.
 pub fn compile_macro(
@@ -388,7 +375,7 @@ fn compile_line(
     }
 
     if word.eq_ignore_ascii_case("type") {
-        // Verbatim: exactly one space separates `type` from its text, and everything after it —
+        // Verbatim: one space separates `type` from its text, and everything after it —
         // inner runs of spaces, trailing spaces — is text.
         let typed = compile_type(rest, *active, caps)?;
         script.steps.extend(typed.steps);
@@ -456,7 +443,7 @@ mod tests {
         assert_eq!(script.report_count(), 2);
     }
 
-    /// C7: `super` alone is a tap of the bit with no usage in any slot — and it is followed by a
+    /// `super` alone is a tap of the bit with no usage in any slot — and it is followed by a
     /// release, like every other press.
     #[test]
     fn a_modifier_only_chord_presses_the_bits_alone() {
@@ -487,7 +474,7 @@ mod tests {
         );
     }
 
-    /// §2.8 item 3: one bad chord and the whole invocation produces nothing to half-deliver.
+    /// An invalid chord must prevent the entire invocation from producing a script.
     #[test]
     fn an_unknown_key_name_is_rejected_and_produces_nothing() {
         let err = compile_key(&chords(&["enter", "ctrl+xyz"]), Layout::Us).unwrap_err();
@@ -570,7 +557,7 @@ mod tests {
         assert_eq!(reports(&off), reports(&ignore));
     }
 
-    /// §10.2: every unreachable character, once each, with where it first occurs — and no script.
+    /// Collect all unsupported characters without producing a partial script.
     #[test]
     fn unreachable_characters_are_all_listed_once_with_their_positions() {
         let err = compile_type("abcdé123→ab\u{7}é", Layout::Us, CapsLock::Off).unwrap_err();
@@ -583,9 +570,7 @@ mod tests {
         assert!(msg.contains("'→' (at 9)"), "{msg}");
         assert!(msg.contains("'\\u{7}' (at 12)"), "{msg}");
         assert!(
-            msg.contains(
-                "text injection needs a key for every character (§10.2); nothing was sent."
-            ),
+            msg.contains("text injection needs a key for every character; nothing was sent."),
             "{msg}"
         );
         assert_eq!(msg.matches('é').count(), 1, "deduplicated: {msg}");
@@ -633,7 +618,7 @@ mod tests {
         assert_eq!(script.report_count(), 6);
     }
 
-    /// `type` takes the rest of the line verbatim after exactly one separating space, so leading,
+    /// `type` takes the rest of the line verbatim after one separating space, so leading,
     /// inner and trailing spaces are all text. A tail `#` is text too.
     #[test]
     fn type_text_is_verbatim_after_one_space() {
@@ -747,8 +732,7 @@ mod tests {
         );
     }
 
-    /// C3: a `wait` whose deadline cannot be represented used to panic inside the send loop, with
-    /// a key possibly held. It is refused at compile time instead, and the limit is named.
+    /// Reject unrepresentable wait deadlines before delivery can leave a key held.
     #[test]
     fn a_wait_longer_than_an_hour_is_refused_at_compile_time() {
         for value in ["18446744073709551615", "3600001"] {

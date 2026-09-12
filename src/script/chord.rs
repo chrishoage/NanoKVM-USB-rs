@@ -1,19 +1,7 @@
-//! The chord grammar: `ctrl+alt+t`, `shift+f10`, `ctrl+c`, `super`.
+//! Chord parsing into a key and modifier set.
 //!
-//! Tokens are split on `+`; every token but the last names a modifier, and the last names a key
-//! *or* a modifier. A chord of nothing but modifiers is legal and is a tap of them — `super`
-//! alone opens the target's application menu, which is a real consequence on this desk and not a
-//! no-op (C7).
-//!
-//! The last token is resolved by length: a **single character** through the declared layout,
-//! which is what knows that `A` is shift+`a` and `:` is shift+`;`, and anything longer through the
-//! key-name table. So `ctrl+c`, `shift+=`, `ctrl+:` and `key A` all work without the vocabulary
-//! having to name every glyph, and without a case-insensitive name eating a character's shift. A
-//! literal `+` cannot be a token at all, so it is spelt `plus` and resolves to shift+equal
-//! (`keynames`).
-//!
-//! Pure: this module resolves names, and produces no reports. Turning a [`Chord`] into the two
-//! reports that press and release it is `compile`'s job.
+//! Single-character tokens use the target layout before the case-insensitive name table,
+//! so `A` retains Shift and differs from `a`.
 
 use winit::keyboard::KeyCode;
 
@@ -25,7 +13,7 @@ use crate::script::layout::Layout;
 ///
 /// `key` is `None` for a modifier-only chord. A shift that came from the *layout* (`ctrl+:` on a
 /// US board) or from a name (`plus`) is folded into `modifiers`, because that is where the report
-/// carries it (Appendix).
+/// carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub modifiers: u8,
@@ -33,7 +21,7 @@ pub struct Chord {
 }
 
 /// Why a chord did not resolve. Every variant names the offending token *and* the whole chord: a
-/// macro line names a step, and the user needs both to find it (§2.8 item 3).
+/// macro line names a step, and the user needs both to find it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChordError {
     #[error("an empty string is not a chord")]
@@ -49,7 +37,7 @@ pub enum ChordError {
     NotAModifier { token: String, chord: String },
 }
 
-/// [`parse_chord_with`] against the default layout (US QWERTY, §10.2).
+/// Parse a chord using the default US QWERTY layout.
 pub fn parse_chord(s: &str) -> Result<Chord, ChordError> {
     parse_chord_with(Layout::default(), s)
 }
@@ -97,7 +85,7 @@ pub fn parse_chord_with(layout: Layout, s: &str) -> Result<Chord, ChordError> {
     })
 }
 
-/// A **single character** goes through the layout first; anything longer is a name.
+/// A single character goes through the layout first; anything longer is a name.
 ///
 /// The order matters and used to be the other way round, which made `key A` type `a`: the
 /// key-name table is case-insensitive, so `A` matched the name `a` and the shift the character
@@ -142,8 +130,7 @@ mod tests {
         );
     }
 
-    /// C7: a lone `super` is a tap with a visible consequence on this target, not a no-op, so it
-    /// has to be expressible.
+    /// Modifier-only chords must still produce a press and release.
     #[test]
     fn a_chord_of_only_modifiers_is_legal() {
         assert_eq!(
@@ -286,7 +273,7 @@ mod tests {
     }
 
     /// Case is ignored in every *name* — modifiers and multi-character keys alike. It is not
-    /// ignored in a single character, because there the case **is** the character: `ctrl+alt+T`
+    /// ignored in a single character, because there the case is the character: `ctrl+alt+T`
     /// asks for the shifted key and gets the shift (see
     /// [`an_uppercase_single_character_keeps_its_shift`]).
     #[test]
@@ -313,7 +300,7 @@ mod tests {
     ];
 
     proptest! {
-        /// Built from the vocabulary, a chord always parses, and its bits are exactly the OR of
+        /// Built from the vocabulary, a chord always parses, and its bits are the OR of
         /// the modifiers named — no more (a stray shift) and no fewer (a dropped token).
         #[test]
         fn a_chord_built_from_the_vocabulary_parses_to_the_named_bits(

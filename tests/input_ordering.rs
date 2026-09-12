@@ -1,9 +1,4 @@
-//! §9.2 item 1 — **input ordering**: the §2.3 sequence, transitions never reordered or lost,
-//! deltas accumulated not replaced, split reports on saturation.
-//!
-//! Every assertion is on the frame sequence the fake link recorded, never on internal counters.
-//! Determinism comes from parking the writer inside a transact (`stall_writer`) so that the whole
-//! burst is queued before anything is written; no test sleeps.
+//! Report ordering across coalesced motion and transition barriers.
 
 use std::time::Duration;
 
@@ -22,7 +17,7 @@ fn config() -> Config {
     }
 }
 
-/// The canonical §2.3 sequence: `move to A → press → drag to B → release`.
+/// Move, press, drag, and release must retain their order.
 #[test]
 fn move_press_drag_release_is_intact_by_construction() {
     let (link, ctl) = fake_link();
@@ -69,8 +64,7 @@ fn move_press_drag_release_is_intact_by_construction() {
     let _ = writer.shutdown();
 }
 
-/// §2.2: relative motion is an accumulating delta — summed, never replaced. §2.3: an accumulation
-/// past the report range saturates and splits, never clamps and loses.
+/// Relative motion accumulates and splits without losing in-range deltas.
 #[test]
 fn relative_deltas_are_summed_and_split_at_127() {
     let (link, ctl) = fake_link();
@@ -133,7 +127,7 @@ fn split_preserves_sign_on_both_axes() {
     let _ = writer.shutdown();
 }
 
-/// §2.2: wheel is an accumulating delta too, and it splits the same way.
+/// Wheel deltas accumulate and split like relative motion.
 #[test]
 fn wheel_is_summed_and_split() {
     let (link, ctl) = fake_link();
@@ -190,8 +184,7 @@ fn wheel_only_in_abs_mode_repeats_the_last_position() {
     let _ = writer.shutdown();
 }
 
-/// §2.3: transitions are barriers — never dropped, never merged, never reordered — even when a
-/// stalled writer lets a whole burst of mixed classes pile up behind them.
+/// Mixed input queued behind a stalled writer must retain every transition barrier.
 #[test]
 fn transitions_are_never_reordered_under_a_stalled_writer() {
     const A: u8 = 0x04;
@@ -258,8 +251,7 @@ fn transitions_are_never_reordered_under_a_stalled_writer() {
     let _ = writer.shutdown();
 }
 
-/// §2.3: keyboard reports are never coalesced. A press and its release inside one stall window
-/// still produce two frames — merging them would drop the keystroke entirely.
+/// Coalescing a press with its release would erase the keystroke.
 #[test]
 fn a_fast_press_release_pair_is_never_merged_away() {
     const A: u8 = 0x04;
@@ -295,8 +287,7 @@ fn a_fast_press_release_pair_is_never_merged_away() {
     let _ = writer.shutdown();
 }
 
-/// §2.1: one queue, one order. A modifier press ordered before a click stays that way — this is
-/// the shift-click case the plan names.
+/// A modifier press must remain before the click it modifies.
 #[test]
 fn shift_click_keeps_its_order() {
     use nanokvm::proto::report::modifier;
@@ -346,7 +337,7 @@ fn shift_click_keeps_its_order() {
     let _ = writer.shutdown();
 }
 
-/// Absolute positions are clamped to `ABS_MAX` on the way in (§3.4): an overshoot past 8191
+/// Absolute positions are clamped to `ABS_MAX` on the way in: an overshoot past 8191
 /// would silently jump the pointer to the top-left corner of a live console.
 #[test]
 fn absolute_coordinates_are_clamped_before_they_reach_the_device() {
@@ -394,10 +385,8 @@ fn a_zero_delta_produces_no_frame() {
     let _ = writer.shutdown();
 }
 
-/// §2.3's "saturate and split, never clamp" governs the ±127 **report** range, and it still does:
-/// nothing inside the cap is lost. The **run** is capped separately, at ±4095 per axis, because an
-/// unbounded run is a denial of service against the release-all (§2.6) — see the writer's module
-/// documentation. The truncation is counted rather than silent (§2.8).
+/// Bound accumulated runs separately from report splitting so cancellation cannot
+/// wait behind unlimited motion.
 #[test]
 fn an_oversized_run_is_capped_and_the_truncation_is_counted() {
     let (link, ctl) = fake_link();

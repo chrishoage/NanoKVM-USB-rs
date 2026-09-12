@@ -1,11 +1,7 @@
-//! Rendering a compiled script as the frames it *would* send.
+//! Human-readable compiled reports with protocol-fixture comparisons.
 //!
-//! A dry run opens nothing and sends nothing, so this returns a `String` and prints none of it —
-//! the caller decides where it goes, and the renderer stays pure like the rest of `script`.
-//!
-//! Where the authority file has a packet with these exact bytes the row is named after it, and
-//! where the encoder and the authority disagree the row says `DISAGREES` and prints both (§9.1).
-//! A name that is not the truth would be worse than no name at all.
+//! Known reports are compared with the committed packet fixtures so a dry run can expose
+//! an encoder disagreement without opening hardware.
 
 use std::fmt::Write as _;
 
@@ -104,11 +100,8 @@ mod tests {
         assert!(!text.contains("DISAGREES"), "{text}");
     }
 
-    /// §9.1: the authority wins. If the encoder and the file disagree, the row says so and prints
-    /// what the file has, instead of a name that is not the truth.
-    ///
-    /// The doctored file is derived from the real one — its own frame string, with its last byte
-    /// changed — so no bytes are retyped here.
+    /// An encoder disagreement must show expected fixture bytes. Mutate the fixture
+    /// checksum to exercise that diagnostic independently of the encoder.
     #[test]
     fn a_doctored_fixture_is_reported_as_a_disagreement() {
         let real = std::fs::read_to_string(Fixtures::PATH).expect("the authority file");

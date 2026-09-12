@@ -1,33 +1,7 @@
-//! MJPEG decode: zune-jpeg, RGBA out, strict mode, one reused output buffer (§1.3, A19).
+//! Bounded, single-threaded JPEG decoding into reusable RGBA buffers.
 //!
-//! Every setting here was measured rather than chosen:
-//!
-//! - **RGBA output.** zune emits RGBA through a dedicated AVX2 kernel at no cost. Decoding to
-//!   RGB and repacking on the CPU costs **34 %** — 0.80 ms per frame at 1080p (A19).
-//! - **Strict mode.** Without it a truncated frame decodes as `Ok` with a partial image. A6's
-//!   stale frames and A15's torn writes make silently accepting partial data the wrong default,
-//!   and strict mode costs nothing measurable (A19).
-//! - **A reused output buffer.** `decode_into` on a `Vec` we keep, not `decode()` returning a
-//!   fresh one.
-//! - **One decode thread**, which is §4.1's row: more threads raise aggregate throughput but
-//!   never reduce per-frame latency, and §5.2's one-pending-frame rule leaves them nothing to do.
-//!
-//! Measured budget at the primary mode (A19, Ryzen 9 9950X3D): 1080p median **2.40 ms**, 6.9x
-//! margin at 60 fps.
-//!
-//! ## The dimension ceiling
-//!
-//! A6 says the frame's own SOF header is the only authority on its size, so the header decides
-//! how large the output buffer has to be. That makes two bytes of untrusted device data the
-//! sole input to an allocation, and A6's stale frames and A15's torn transfers are exactly the
-//! things that flip such a byte. zune's own default limit is 16384x16384 — a **1 GiB** zeroed
-//! allocation and a ~1 s decode from one corrupt frame — so this module clamps to
-//! [`MAX_WIDTH`]x[`MAX_HEIGHT`] in two independent places: [`DecoderOptions::set_max_width`]
-//! and `set_max_height` inside zune, and an explicit check in [`Decoder::decode`] that runs
-//! **before** anything is allocated. The capture sources check the same ceiling against the
-//! header at dequeue time, so an oversized frame is normally refused before it ever reaches
-//! here. Note this is a ceiling, not a format check: the dimensions still come from the header
-//! and never from `G_FMT`.
+//! Both header parsing and decoder options enforce the size limit before allocating.
+//! Malformed frames are rejected without replacing the last usable image.
 
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -39,13 +13,10 @@ use super::{CompressedFrame, DecodedFrame, MAX_HEIGHT, MAX_RGBA_BYTES, MAX_WIDTH
 /// Why a frame did not decode.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
-    /// zune refused the frame. In strict mode this is what a truncated or corrupt frame
-    /// produces, which is the point (§1.3).
+    /// The decoder rejected a truncated or corrupt frame.
     #[error("jpeg decode failed: {0}")]
     Jpeg(String),
-    /// The decoder read a different size out of the headers than [`super::jpeg::dimensions`]
-    /// did. The two parsers disagreeing means the frame is not what it claims; refuse it rather
-    /// than hand the renderer a buffer whose shape is uncertain (A6).
+    /// JPEG parsers disagreed about frame dimensions.
     #[error("dimension disagreement: header says {header_w}x{header_h}, decoder says {decoder_w}x{decoder_h}")]
     DimensionMismatch {
         header_w: u32,
@@ -53,8 +24,7 @@ pub enum DecodeError {
         decoder_w: u32,
         decoder_h: u32,
     },
-    /// zune's required output size is not `width * height * 4`, so the colorspace request did
-    /// not take effect. Never expected; refusing beats writing a wrongly-shaped buffer.
+    /// The decoder did not honor the requested RGBA output shape.
     #[error("decoder wants {wanted} bytes for {width}x{height} RGBA, expected {expected}")]
     UnexpectedBufferSize {
         width: u32,
@@ -67,7 +37,7 @@ pub enum DecodeError {
     NoDimensions,
     /// The frame's header claims a size beyond the [`MAX_WIDTH`]x[`MAX_HEIGHT`] sanity ceiling.
     ///
-    /// Refused **before** the output buffer is sized, because the whole point is that the size
+    /// Refused before the output buffer is sized, because the whole point is that the size
     /// is what the corrupt header controls. See the module docs.
     #[error("frame claims {width}x{height}, over the {max_width}x{max_height} ceiling")]
     DimensionsTooLarge {
@@ -78,24 +48,18 @@ pub enum DecodeError {
     },
 }
 
-/// A reusable MJPEG decoder (§1.3).
+/// Reusable decoder options.
 ///
-/// Holds the measured [`DecoderOptions`] and nothing else: zune's `JpegDecoder` borrows its
-/// input, so it is constructed per frame while the *expensive* thing — the RGBA output buffer —
-/// lives in the caller's [`DecodedFrame`] and is reused across frames.
-///
-/// One of these per decode thread. There is exactly one decode thread (§4.1).
+/// A decoder instance is created per input because it borrows that input. The caller
+/// retains the RGBA output allocation across frames.
 pub struct Decoder {
     options: DecoderOptions,
 }
 
 impl Decoder {
-    /// A decoder with the A19 settings — RGBA colorspace, strict mode on — plus the
-    /// [`MAX_WIDTH`]x[`MAX_HEIGHT`] ceiling.
+    /// Create a strict RGBA decoder bounded by [`MAX_WIDTH`] and [`MAX_HEIGHT`].
     ///
-    /// zune's own defaults are 16384x16384, which is 1 GiB of zeroed scratch from one corrupt
-    /// SOF byte. Lowering them here means zune refuses such a header while parsing it, before
-    /// this module has computed anything from it.
+    /// The decoder's larger defaults could allocate excessive memory for a corrupt header.
     pub fn new() -> Self {
         Decoder {
             options: DecoderOptions::default()
@@ -106,39 +70,27 @@ impl Decoder {
         }
     }
 
-    /// The options in force, so a test can assert the A19 settings rather than trust them.
+    /// Active decoder options.
     pub fn options(&self) -> &DecoderOptions {
         &self.options
     }
 
-    /// Decode `frame` into `out`, reusing `out.rgba`'s allocation.
+    /// Decode `frame` into `out`, reusing its RGBA allocation.
     ///
-    /// `out.rgba` is resized to exactly `width * height * 4`; growing within the existing
-    /// capacity does not reallocate, so a steady-state pipeline at a fixed resolution allocates
-    /// once. On success `out` carries the frame's dimensions and its `captured_at`/`sequence`
-    /// copied through unchanged, so freshness is still measured from capture (§5.5).
-    ///
-    /// The decoder's own header dimensions are checked against the [`CompressedFrame`]'s, which
-    /// came from [`super::jpeg::dimensions`] over the same bytes. A6 makes the frame's header
-    /// the only authority on its size, so the two must agree. That cross-check compares two
-    /// parsers of the *same* bytes, so it catches a parser disagreement and nothing else — the
-    /// [`MAX_WIDTH`]x[`MAX_HEIGHT`] ceiling below is what catches a corrupt SOF, and it is
-    /// applied before any allocation.
+    /// On success, the output contains `width * height * 4` bytes and preserves the capture
+    /// timestamp and sequence. Both JPEG parsers must agree on dimensions, and the size
+    /// ceiling is checked before allocation.
     ///
     /// # Errors
     ///
-    /// A truncated frame is an error, not a partial image — that is strict mode doing its job
-    /// (§1.3). A frame over the ceiling is [`DecodeError::DimensionsTooLarge`]. In every error
-    /// case `out` keeps the contents and the capacity it had, so a rejected frame costs nothing
-    /// and leaves the decoder ready for the next one; the caller must not present `out`.
+    /// Truncated or corrupt images are rejected. Oversized dimensions return
+    /// [`DecodeError::DimensionsTooLarge`]. After an error, the caller must not present `out`.
     pub fn decode(
         &mut self,
         frame: &CompressedFrame,
         out: &mut DecodedFrame,
     ) -> Result<(), DecodeError> {
-        // First, and before anything is allocated or parsed: the claimed size. `frame.width`
-        // and `frame.height` came from this frame's own SOF header, which is untrusted device
-        // data (A6), and they are the only input to the allocation below.
+        // Bound untrusted dimensions before allocating the output buffer.
         too_large(frame.width, frame.height)?;
 
         let mut dec = JpegDecoder::new_with_options(ZCursor::new(&frame.jpeg), self.options);
@@ -147,8 +99,7 @@ impl Decoder {
 
         let (dw, dh) = dec.dimensions().ok_or(DecodeError::NoDimensions)?;
         let (dw, dh) = (dw as u32, dh as u32);
-        // zune's own `max_width`/`max_height` should already have refused this; check anyway,
-        // because this is the value the output buffer is sized from.
+        // Recheck the decoder’s output size before allocating even after dimension validation.
         too_large(dw, dh)?;
         if dw != frame.width || dh != frame.height {
             return Err(DecodeError::DimensionMismatch {
@@ -202,7 +153,7 @@ impl Default for Decoder {
     }
 }
 
-/// `Err(DimensionsTooLarge)` if `width`x`height` is over the sanity ceiling (§6, A6).
+/// `Err(DimensionsTooLarge)` if `width`x`height` is over the sanity ceiling.
 fn too_large(width: u32, height: u32) -> Result<(), DecodeError> {
     if super::dimensions_in_range(width, height) {
         Ok(())
@@ -224,7 +175,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Build a `CompressedFrame` the way [`super::super::v4l2::V4l2Source`] does: dimensions
-    /// from this frame's own header (A6).
+    /// from this frame's own header.
     fn frame_from(bytes: Vec<u8>, sequence: u32) -> CompressedFrame {
         let (w, h) = jpeg::dimensions(&bytes).expect("fixture header");
         CompressedFrame {
@@ -254,11 +205,14 @@ mod tests {
     #[test]
     fn options_are_the_a19_settings() {
         let d = Decoder::new();
-        assert!(d.options().strict_mode(), "A19: strict mode must be on");
+        assert!(
+            d.options().strict_mode(),
+            "strict decoding must reject truncated frames"
+        );
         assert_eq!(
             d.options().jpeg_get_out_colorspace(),
             ColorSpace::RGBA,
-            "A19: RGBA out, repacking costs 34 %"
+            "decode directly to RGBA to avoid repacking"
         );
     }
 
@@ -275,13 +229,13 @@ mod tests {
 
     /// Reviewer blocker 1. A single flipped byte in the SOF used to buy a 64 MiB allocation, a
     /// slow decode and a 4096x4096 frame delivered to the renderer with `decode_errors == 0`.
-    /// It must now be refused **before** the scratch buffer is sized.
+    /// It must now be refused before the scratch buffer is sized.
     #[test]
     fn a_sof_over_the_ceiling_is_refused_before_the_scratch_is_allocated() {
         let mut dec = Decoder::new();
         let mut out = DecodedFrame::empty();
 
-        // Decode an honest frame first, so the scratch has a real 1080p allocation to protect.
+        // A successful decode gives the rejection case an existing allocation to preserve.
         let good = frame_from(fixture_bytes(&fixture_paths("absrange")[0]), 0);
         dec.decode(&good, &mut out).expect("honest frame");
         let honest_len = out.rgba.len();
@@ -325,7 +279,7 @@ mod tests {
         assert_eq!(out.rgba.capacity(), honest_cap, "no reallocation happened");
     }
 
-    /// zune's own former ceiling. This is the 1 GiB / ~1 s case; it must now cost nothing.
+    /// Reject the former decoder ceiling without allocating its roughly 1 GiB output.
     #[test]
     fn zunes_own_16384_ceiling_is_never_reached() {
         let mut dec = Decoder::new();
@@ -344,13 +298,12 @@ mod tests {
         );
     }
 
-    /// The ceiling is a ceiling, not a format check: the largest advertised mode still decodes,
-    /// and dimensions still come from the header rather than from `G_FMT` (A6).
+    /// The size ceiling must still admit the largest supported capture mode.
     #[test]
     fn the_largest_advertised_mode_is_inside_the_ceiling() {
         assert!(
             super::super::dimensions_in_range(3840, 2160),
-            "§6: 4K is an advertised mode"
+            "4K is an advertised mode"
         );
         assert!(super::super::dimensions_in_range(MAX_WIDTH, MAX_HEIGHT));
         assert!(!super::super::dimensions_in_range(
@@ -428,8 +381,7 @@ mod tests {
 
     #[test]
     fn a_truncated_frame_is_an_error_not_a_partial_image() {
-        // A19: without strict mode this returns Ok with the bottom of the image left as
-        // whatever was in the buffer, which is exactly the failure the KVM must not show.
+        // Strict mode prevents a truncated image from exposing stale pixels in the output buffer.
         let mut dec = Decoder::new();
         let mut out = DecodedFrame::empty();
         let bytes = fixture_bytes(&fixture_paths("absrange")[0]);
@@ -462,7 +414,7 @@ mod tests {
         let mut dec = Decoder::new();
         let mut out = DecodedFrame::empty();
         let mut frame = frame_from(fixture_bytes(&fixture_paths("absrange")[0]), 0);
-        frame.width = 1280; // as if G_FMT had been trusted (A6)
+        frame.width = 1280; // as if G_FMT had been trusted
         assert!(matches!(
             dec.decode(&frame, &mut out),
             Err(DecodeError::DimensionMismatch { .. })
@@ -483,10 +435,9 @@ mod tests {
         assert!(dec.decode(&frame, &mut out).is_err());
     }
 
-    /// Spot-check of A19's 2.40 ms median at 1080p. Ignored: it is a measurement, not a
-    /// pass/fail property, and a loaded CI box would make any threshold a lie.
+    /// Manual 1080p decode timing measurement; scheduler load makes it unsuitable as a test gate.
     ///
-    /// `cargo test -p nanokvm --lib -- --ignored --nocapture decode_timing`
+    /// `cargo test --lib decode_timing -- --ignored --nocapture`
     #[test]
     #[ignore = "timing measurement, run explicitly"]
     fn decode_timing_spot_check() {
@@ -503,7 +454,7 @@ mod tests {
         }
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         println!(
-            "decode {}x{}: n=100 min {:.3} ms  median {:.3} ms  max {:.3} ms  (A19 median: 2.40 ms)",
+            "decode {}x{}: n=100 min {:.3} ms  median {:.3} ms  max {:.3} ms  (recorded median: 2.40 ms)",
             out.width,
             out.height,
             samples[0],

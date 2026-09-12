@@ -1,63 +1,13 @@
-//! The audio tests that need the dongle, the target and this desk's sound server (§9.3:
-//! feature-gated, `#[ignore]`d, never gating CI; §12 Stage 4a).
+//! Audio capture, playback, and recovery against the real dongle.
 //!
-//! ```text
-//! cargo test --features hardware --test audio_hardware -- --ignored --nocapture --test-threads=1
-//! ```
+//! These tests type commands into a focused target terminal and require the local
+//! PipeWire/PulseAudio tools. Run one binary at a time with `--test-threads=1`.
+//! Playback must be verified on the temporary null sink before emitting a tone.
+//! A requested `PIPEWIRE_NODE` can fall back to the user's speakers.
 //!
-//! **Every test here holds [`DESK`] for its whole body**, the same guard
-//! `tests/capture_hardware.rs` uses on the video node and for the same reason: the harness runs
-//! tests in parallel by default, a sound card admits one opener, `/dev/ttyACM1` admits one
-//! opener, and the null sink and `PIPEWIRE_NODE` are process-wide rather than per-thread. Two of
-//! these running at once produce `Device or resource busy` from whichever lost — which is a
-//! failure that says nothing about the code under test. `--test-threads=1` is still the right way
-//! to run them, because the lock serialises them but does not stop the harness from starting a
-//! twelve-minute test and then blocking another thread on it for twelve minutes.
-//!
-//! # What each test proves, and why by consequence (§12)
-//!
-//! §12 Stage 4a's exit criterion is "**with the target playing a 1 kHz tone, a spectral peak at
-//! 1 kHz is found in the PCM we capture — a consequence, not an open stream — and the same tone
-//! is audible from the host's sink**". Both halves are asserted here on the samples themselves:
-//!
-//! - [`tone_at_1khz_is_captured_from_the_target`] types `speaker-test` on the target through the
-//!   real serial path and finds the peak in what `src/audio/alsa.rs` reads off the card. It
-//!   brackets the measurement with **two negative controls** — a capture before the tone starts
-//!   and one after Ctrl+C — so a peak that was always there (a hum, a desktop sound, a bug in the
-//!   detector) cannot pass for the target's tone.
-//! - [`playback_reaches_the_host_sink`] runs the whole [`AudioHandle`] — both threads, the ring,
-//!   the real ALSA playback open — and then finds the same peak in a recording of **the sink's
-//!   own monitor**. That is "audible from the host's sink" proven mechanically: the samples that
-//!   reached the sink are the evidence, and no sound is ever played on the user's speakers.
-//!
-//! # Nothing is ever played on the user's speakers
-//!
-//! Every test that opens the playback side routes ALSA `default` to a temporary PipeWire null
-//! sink. Two facts make that work, both measured on this desk 2026-09-11:
-//!
-//! 1. `pcm.!default` here is `type pipewire` (`/usr/share/alsa/alsa.conf.d/99-pipewire-default
-//!    .conf`), and the `pipewire` ALSA plugin reads **`PIPEWIRE_NODE`** from the environment and
-//!    uses it as the stream's target. Setting it in this process before opening `default` puts
-//!    our playback on the null sink, which was confirmed by looking at `pactl list sink-inputs`
-//!    while a silent stream ran: `Sink: <nanokvm-test>`.
-//! 2. The sink and the module are owned by [`NullSink`], whose `Drop` unloads the module on
-//!    **every** path out, including a panic, so the desk is left exactly as it was found.
-//!
-//! # Why `parecord` and not `pw-record` for the monitor
-//!
-//! Measured, the same day: `pw-record --target nanokvm-test.monitor` records digital silence — it
-//! does not resolve a `.monitor` name to the sink's monitor port and links nothing — while
-//! `parecord -d nanokvm-test.monitor` records the audio. `pw-record --target <source node name>`
-//! *does* work, and is what [`busy_card_is_reported_once_and_changes_nothing`] uses to hold the
-//! card. Both are used where they were measured to work.
-//!
-//! # The target
-//!
-//! A Raspberry Pi 3B+ running the Raspberry Pi OS desktop at 1080p, with a focused LXTerminal
-//! (CLAUDE.md). It is driven through the built `nanokvm` binary's `type` and `key` subcommands —
-//! the same path `tests/cli_keys.rs` drives — so this file needs no serial code of its own and
-//! inherits their release-all. **No mouse report is ever built here**, by construction: the CLI
-//! has no mouse path at all (`tests/cli_keys.rs`).
+//! Capture checks bracket a 1 kHz tone with silent controls and discard the first
+//! stale period. Playback checks record the sink monitor. USB reset tests require
+//! explicit authorization. See `docs/development.md` for local device restrictions.
 
 #![cfg(feature = "hardware")]
 
@@ -78,12 +28,12 @@ use child_guard::ChildGuard;
 
 /// Held by every test in this file for its whole body: the dongle's card, its serial node, the
 /// temporary null sink and `PIPEWIRE_NODE` are all one-at-a-time resources, and the harness runs
-/// tests in parallel unless told otherwise. `unwrap_or_else(|e| e.into_inner())` because a test
+/// tests in parallel unless told otherwise. `unwrap_or_else(|e| e.into_inner)` because a test
 /// that panicked while holding it has poisoned it and the next one should still run — it takes
 /// the desk as it finds it and every guard in this file has already tidied up on the way out.
 static DESK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The dongle's nodes on this desk (CLAUDE.md), asserted rather than used: every device below is
+/// The dongle's nodes on the recorded test setup (CLAUDE.md), asserted rather than used: every device below is
 /// resolved through `discovery`, and these two only make a renumbered desk fail with an
 /// explanation instead of quietly measuring something else.
 const VIDEO: &str = "/dev/video4";
@@ -97,14 +47,14 @@ const NULL_SINK: &str = "nanokvm-test";
 
 /// How long to wait after Ctrl+C before trusting a capture to be free of the tone.
 ///
-/// Measured on this desk 2026-09-11 and **not** a guess. `speaker-test` negotiates
+/// Measured on the recorded test setup 2026-09-11 and not a guess. `speaker-test` negotiates
 /// `buffer_size = 48000` on the Pi — a full second of tone already queued in the target's own
 /// ALSA buffer when Ctrl+C arrives — and a capture started 1.5 s later still found it at ratio 30.
 /// A 40-second recording taken straight after Ctrl+C, sliced into two-second windows, is at the
 /// noise floor (rms 3.1e-5) in *every* window, so the target itself is quiet within about a
 /// second; eight seconds is generous and costs nothing.
 ///
-/// What is left after that is **not** the target and not a tail: it is the device's own stale
+/// What is left after that is not the target and not a tail: it is the device's own stale
 /// prefix, which [`STALE_PERIODS`] measures and discards.
 const TONE_SETTLE: Duration = Duration::from_secs(8);
 
@@ -122,11 +72,11 @@ fn init_logging() {
 // ---- the desk -------------------------------------------------------------------------------
 
 /// The dongle's sound card, resolved the way the client resolves it: discovery finds the pair,
-/// and the card is the one on the capture node's **own USB device** (§8, `audio_for`).
+/// and the card is the one on the capture node's own USB device.
 ///
 /// Nothing here hardcodes `hw:8`. The card number is read back out of the `card<N>` directory
-/// name on every resolve, because card numbers renumber on replug exactly as `/dev` names do
-/// (C13), and a run on a desk where they have renumbered must still measure the right card.
+/// name on every resolve, because card numbers renumber on replug as `/dev` names do
+/// , and a run on a desk where they have renumbered must still measure the right card.
 fn resolve_card() -> ResolvedCard {
     let sysfs = RealSysfs::default();
     let probe = RealProbe;
@@ -256,12 +206,12 @@ impl NullSink {
             .to_string()
     }
 
-    /// **Assert that this process's own playback actually landed here**, by asking PipeWire where
+    /// Assert that this process's own playback landed here, by asking PipeWire where
     /// it put the stream.
     ///
     /// RULES.md's rule is "never play sound through the user's speakers", and `PIPEWIRE_NODE` is
     /// a *request*: a client whose target cannot be resolved is connected to the default sink
-    /// instead, silently, which on this desk is the user's. That is the one failure in this file
+    /// instead, silently, which on the recorded test setup is the user's. That is the one failure in this file
     /// that would break a rule rather than a test, so it is checked rather than assumed — and it
     /// also tells a silent monitor recording ("we played to the wrong place") apart from a silent
     /// capture ("the target was not making a sound"), which cost a sweep to work out.
@@ -306,7 +256,7 @@ impl NullSink {
 
     /// Record this sink's monitor for `secs`, into a WAV, and return the samples.
     ///
-    /// `parecord`, not `pw-record`: measured on this desk, `pw-record --target <sink>.monitor`
+    /// `parecord`, not `pw-record`: measured on the recorded test setup, `pw-record --target <sink>.monitor`
     /// links nothing and writes digital silence (see the module docs).
     fn record_monitor(&self, path: &Path, secs: u64) -> Vec<i16> {
         let mut cmd = Command::new("timeout");
@@ -358,7 +308,7 @@ impl Drop for NullSink {
 
 /// `speaker-test` running on the target, stopped when this value is dropped.
 ///
-/// Typed through the built binary, exactly as `tests/cli_keys.rs` drives it, so the serial
+/// Typed through the built binary, as `tests/cli_keys.rs` drives it, so the serial
 /// protocol, the layout compiler and the release-all are the shipped ones and not a copy. `key
 /// ctrl+c` and `type` both send a full release on their own way out, which is where this test's
 /// "always send a release-all before exiting" (CLAUDE.md) comes from.
@@ -401,7 +351,7 @@ fn nanokvm(args: &[&str]) -> String {
         .unwrap_or_else(|e| panic!("run nanokvm {args:?}: {e}"));
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     // `Device or resource busy` from the serial node is almost never a bug in what is under test:
-    // it is something else on this desk holding the dongle — another viewer, another agent, a
+    // it is something else on the recorded test setup holding the dongle — another viewer, another agent, a
     // previous run that has not exited. Say that rather than leaving the reader to work it out
     // from an ALSA-shaped test failing on a tty.
     assert!(
@@ -424,11 +374,11 @@ fn nanokvm(args: &[&str]) -> String {
 
 // ---- capture --------------------------------------------------------------------------------
 
-/// How many periods at the start of a freshly opened capture stream are **stale** — audio the
+/// How many periods at the start of a freshly opened capture stream are stale — audio the
 /// device had from before the open.
 ///
-/// Measured on this desk 2026-09-11, and the audio analogue of A6's "up to eight frames at the
-/// previous resolution": in a two-second capture taken eight seconds after the target's tone was
+/// Measured on the recorded test setup 2026-09-11, and the audio analogue of "up to eight frames at the
+/// previous resolution"in a two-second capture taken eight seconds after the target's tone was
 /// stopped, the whole of the remaining energy is in the first 10 ms — about 2 ms of the tone at
 /// full level — and every half-second window after it is the noise floor (rms 3.1e-5). It is a
 /// fixed quantity, not a decaying tail: captures taken 4 s and 8 s after Ctrl+C returned the same
@@ -437,7 +387,7 @@ fn nanokvm(args: &[&str]) -> String {
 /// Two milliseconds fits inside one period, so one period is discarded. It matters because 2 ms
 /// of a loud tone averaged over a two-second capture is a ratio near 100, which is
 /// [`TONE_RATIO`] — a negative control that measures the previous test's tone is not a control at
-/// all, and one sweep produced exactly that (ratio 85, against a threshold of 100).
+/// all, and one sweep produced that (ratio 85, against a threshold of 100).
 const STALE_PERIODS: usize = 1;
 
 /// Read `want` of audio off `device`, one period at a time, through the shipped [`AlsaCapture`],
@@ -501,18 +451,8 @@ fn slug(label: &str) -> String {
         .to_string()
 }
 
-/// [`find_tone`] at 1 kHz against the default references, printed in full — and then again over
-/// half-second windows.
-///
-/// §12 Stage 4a and the `TONE_RATIO` doc both ask the hardware run to **record the ratio it saw**
-/// rather than only that it passed, so the threshold can be confirmed or moved from a number.
-///
-/// The per-window table exists because the first run of this test found something the single
-/// figure hides: a capture taken after the tone has stopped is not uniformly quiet. The dongle
-/// hands over a fraction of a second of *stale* audio at the start of a freshly opened stream —
-/// the audio analogue of the eight stale video frames A6 records — and averaged over two seconds
-/// that showed up as a ratio near the threshold with no way to tell it from a real tone. Split by
-/// window it is unmistakable: loud in window 0, floor in every window after it.
+/// Print aggregate and half-second tone ratios. Short windows expose stale samples
+/// that a whole-recording average can hide.
 fn report_on(label: &str, pcm: &[i16]) -> ToneReport {
     let samples = mono(pcm);
     let report = find_tone(&samples, SAMPLE_RATE, TONE_HZ, &DEFAULT_REFERENCES);
@@ -566,9 +506,9 @@ fn write_wav(path: &Path, pcm: &[i16]) {
 
 /// Read a PCM WAV file as interleaved `i16`.
 ///
-/// Deliberately small and deliberately tolerant of the declared `data` size: a recorder that is
+/// small and tolerant of the declared `data` size: a recorder that is
 /// stopped by a signal may leave the chunk length short or unwritten, and a reader that trusted
-/// it would silently return a fraction of the audio — which would look exactly like "the sink got
+/// it would silently return a fraction of the audio — which would look like "the sink got
 /// silence", the defect this file exists to be able to see.
 fn read_wav(path: &Path) -> Vec<i16> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -598,7 +538,7 @@ fn read_wav(path: &Path) -> Vec<i16> {
                 u16_at(body + 14),
             ));
         } else if id == b"data" {
-            // The declared size, clamped to what is actually there.
+            // The declared size, clamped to what is there.
             let available = bytes.len() - body;
             data = Some((body, size.min(available)));
             break;
@@ -700,12 +640,8 @@ fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> Option<Durati
 
 // ---- the exit criterion ---------------------------------------------------------------------
 
-/// §12 Stage 4a's exit criterion, capture half: the tone the target plays is in the PCM we read
-/// off the dongle's card, and is **not** there when the target is not playing it.
-///
-/// Three measurements, in order: quiet, tone, quiet. The two quiet ones are what make the middle
-/// one mean anything — a detector that said "present" for everything, or a hum at 1 kHz on this
-/// desk, would pass the middle assertion on its own.
+/// Bracket the tone recording with quiet recordings to reject persistent hum and
+/// false-positive detectors.
 #[test]
 #[ignore = "needs the dongle, the target, and the target's HDMI audio"]
 fn tone_at_1khz_is_captured_from_the_target() {
@@ -765,12 +701,8 @@ fn tone_at_1khz_is_captured_from_the_target() {
     );
 }
 
-/// §12 Stage 4a's exit criterion, playback half: the tone reaches the host's sink.
-///
-/// The whole [`AudioHandle`] runs — both threads, the ring, the real ALSA open of `default` — and
-/// the assertion is on a recording of **the sink's own monitor**, which is the samples the sink
-/// received. "Audible from the host's sink" proven mechanically, with nothing played on the
-/// user's speakers: `default` is routed to a temporary null sink for the duration.
+/// Record the host sink monitor while the complete audio path runs. A temporary
+/// null sink verifies playback without sending the test tone to the user’s speakers.
 #[test]
 #[ignore = "needs the dongle, the target, and PipeWire on the host"]
 fn playback_reaches_the_host_sink() {
@@ -856,49 +788,17 @@ fn playback_reaches_the_host_sink() {
     assert_eq!(snapshot.playback_opens, 1, "and the sink exactly once");
     assert!(
         audio_threads().is_empty(),
-        "stop() left an audio thread behind: {:?}",
+        "stop left an audio thread behind: {:?}",
         audio_threads()
     );
 }
 
 // ---- drift ----------------------------------------------------------------------------------
 
-/// §12 Stage 4a: "**Measure the drift rate on hardware over at least ten minutes** and record it,
-/// so the ring size is chosen from a number."
-///
-/// The dongle's capture clock and the host's playback clock are different crystals. Over a long
-/// session the ring either fills or drains, and [`nanokvm::audio::ring::DriftPolicy`] spends one
-/// period at a wall to keep it off. This runs the real path for `NANOKVM_DRIFT_SECS` seconds
-/// (default 600) and computes the rate two ways.
-///
-/// **The conservation law both come from.** Every period the dongle produces is pushed; every
-/// period the sink takes is written. What the two counts differ by has to be accounted for by the
-/// ring:
-///
-/// ```text
-///   Δcaptured − Δwritten  =  Δlevel  +  Δdrift_drops + Δoverruns  −  Δdrift_inserts − Δunderruns
-/// ```
-///
-/// A positive left-hand side means the dongle produced more than the host consumed: **the
-/// dongle's clock is the faster one**, and the surplus was either held in the ring or thrown
-/// away. So:
-///
-/// 1. **Corrections only** — `(Δdrift_drops − Δdrift_inserts) × period_frames / elapsed`, the
-///    part the drift policy acted on. Coarse: one correction is one whole period, so the
-///    resolution over ten minutes is about 14 ppm.
-/// 2. **The full balance** — `(Δcaptured − Δwritten) × period_frames / elapsed`, which is the
-///    same law read from the other side and therefore includes the part that has *not* yet been
-///    corrected: the change in the ring's own level.
-///
-/// **They are not independent, and reporting them as if they were is how the first version of
-/// this test printed two numbers with opposite signs for one event.** Their difference is exactly
-/// `Δlevel + Δoverruns − Δunderruns`, so they agree whenever the ring ends where it started and
-/// nothing xran. When they disagree, the full balance is the one to trust — it is the only one
-/// that sees drift smaller than a whole period — and the gap between them says how much drift was
-/// still sitting in the ring, uncorrected, when the run ended.
-///
-/// No tone is played for this: a period is a period whatever is in it, and ten minutes of
-/// `speaker-test` is ten minutes of the target doing something it need not be doing.
+/// Measure capture/playback drift over `NANOKVM_DRIFT_SECS` seconds (at least ten
+/// minutes by default). Record correction counters and occupancy after warmup;
+/// the separate clocks can fill or drain the ring even without xruns.
+/// See docs/hardware.md for the recorded run and its limitations.
 #[test]
 #[ignore = "takes ten minutes and needs the dongle"]
 fn drift_over_ten_minutes() {
@@ -1008,7 +908,7 @@ fn drift_over_ten_minutes() {
 
     // The one thing the run must not show: a steady state that is not steady. An xrun on either
     // side in a ten-minute run with nothing else happening is a defect, not drift — drift is what
-    // the corrections are for, and `DriftPolicy::reset` deliberately makes an xrun *not* count as
+    // the corrections are for, and `DriftPolicy::reset` makes an xrun *not* count as
     // drift so this number stays readable.
     assert_eq!(
         last.counts.overruns - first.counts.overruns,
@@ -1026,21 +926,15 @@ fn drift_over_ten_minutes() {
     );
     assert!(
         audio_threads().is_empty(),
-        "stop() left an audio thread behind: {:?}",
+        "stop left an audio thread behind: {:?}",
         audio_threads()
     );
 }
 
 // ---- failure isolation on real hardware -------------------------------------------------------
 
-/// §12 Stage 4a: "`EBUSY` (another client holds the card) […] logs once, sets a surfaced
-/// condition, and changes nothing about video or input."
-///
-/// On this PipeWire desk the card is held only while something records from its node, so
-/// `pw-record` on the dongle's source is how the condition is produced. The claims are: the
-/// condition appears and names the device; **exactly one** condition is logged however many times
-/// the open is retried; and when the holder goes away the card is reopened and the condition
-/// clears, all without a panic and with both threads stopping on time.
+/// Hold the capture card with `pw-record` to exercise busy-device reporting,
+/// retry logging, and continued video/input operation.
 #[test]
 #[ignore = "needs the dongle and PipeWire on the host"]
 fn busy_card_is_reported_once_and_changes_nothing() {
@@ -1058,11 +952,11 @@ fn busy_card_is_reported_once_and_changes_nothing() {
             "pw-record",
             Command::new("pw-record")
                 .args(["--target", &source, "/dev/null"])
-                // **Not inherited.** `PIPEWIRE_NODE` is set in this process to keep our own
+                // Not inherited. `PIPEWIRE_NODE` is set in this process to keep our own
                 // playback off the user's speakers, and it overrides `--target` in any PipeWire
                 // client that reads it — so a holder spawned with it inherited records the null
                 // sink's monitor and never touches the card, and the test then measures nothing
-                // while looking like it passed. Found exactly that way on 2026-09-11.
+                // while looking like it passed. Found that way on 2026-09-11.
                 .env_remove("PIPEWIRE_NODE")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
@@ -1151,50 +1045,38 @@ fn busy_card_is_reported_once_and_changes_nothing() {
     let stopping = Instant::now();
     audio.stop();
     let took = stopping.elapsed();
-    println!("[busy] stop() took {took:?}");
+    println!("[busy] stop took {took:?}");
     assert!(
         took < config.stop_deadline + Duration::from_millis(500),
-        "stop() overran its deadline: {took:?}"
+        "stop overran its deadline: {took:?}"
     );
     assert!(
         audio_threads().is_empty(),
-        "stop() left an audio thread behind: {:?}",
+        "stop left an audio thread behind: {:?}",
         audio_threads()
     );
 }
 
-/// §12 Stage 4a's other exit criterion: "**Audio absent (`--no-audio` …) leaves the Stage 3
-/// viewer untouched, by the hardware test.**"
-///
-/// Run the shipped binary with `--no-audio` and assert on the running process, not on the source:
-///
-/// - **no `nanokvm-audio-*` thread exists** while it runs, read out of `/proc/<pid>/task/*/comm`.
-///   `tests/audio_isolation.rs` already checks structurally that `--no-audio` skips the spawn;
-///   this is the same claim made about a process the kernel is actually running, which is the
-///   only form of it that a future refactor cannot talk its way around.
-/// - the Stage 3 threads **are** there, so a run that started nothing at all cannot pass;
-/// - the only line in the log that mentions audio is the one saying it is off, and there is no
-///   `stats audio:` line;
-/// - and it still exits 0 at `--exit-after`.
-///
-/// It opens a window on the user's desk for a few seconds, which is why `--exit-after` is short.
+/// Run the viewer with `--no-audio` and inspect its threads and logs. Capture,
+/// decode, and serial workers must run without audio workers, while normal
+/// statistics and clean shutdown remain available.
 #[test]
 #[ignore = "needs the dongle, the target and a compositor"]
-fn no_audio_leaves_the_stage_3_viewer_untouched() {
+fn no_audio_preserves_video_and_input() {
     let _desk = DESK.lock().unwrap_or_else(|e| e.into_inner());
     init_logging();
     let log = out_dir().join("viewer-no-audio.log");
     let file =
         std::fs::File::create(&log).unwrap_or_else(|e| panic!("create {}: {e}", log.display()));
 
-    // The chrome (§12 Stage 4b) persists its settings to `$XDG_CONFIG_HOME/nanokvm/config.toml`
+    // The chrome persists its settings to `$XDG_CONFIG_HOME/nanokvm/config.toml`
     // and writes once on the first run, so a viewer started without this would leave a file in
-    // the **user's own** `~/.config`. Pointing it at a scratch directory is the same rule every
-    // other run of the viewer on this desk follows; it is here rather than in `out_dir` because
+    // the user's own `~/.config`. Pointing it at a scratch directory is the same rule every
+    // other run of the viewer on the recorded test setup follows; it is here rather than in `out_dir` because
     // this is the only test in this file that starts the shipped binary as a window.
-    // The directory name deliberately contains neither "audio" nor a word this test greps for:
+    // The directory name contains neither "audio" nor a word this test greps for:
     // setting `XDG_CONFIG_HOME` also redirects the Vulkan loader's layer search, which prints the
-    // paths it looked in, and a path with "audio" in it lands in the "exactly one line mentions
+    // paths it looked in, and a path with "audio" in it lands in the "one line mentions
     // audio" assertion below.
     let config_root = out_dir().join("nk-settings-root");
     std::fs::create_dir_all(&config_root)
@@ -1236,18 +1118,18 @@ fn no_audio_leaves_the_stage_3_viewer_untouched() {
     );
     // The kernel truncates a thread name to 15 bytes, so these are the prefixes of
     // `nanokvm-capture`, `nanokvm-decode` and `nanokvm-serial-writer`.
-    for stage3 in ["nanokvm-capture", "nanokvm-decode", "nanokvm-serial-"] {
+    for worker_name in ["nanokvm-capture", "nanokvm-decode", "nanokvm-serial-"] {
         assert!(
-            seen.iter().any(|n| n == stage3),
-            "the Stage 3 thread {stage3} was not running, so the sample above proves nothing \
+            seen.iter().any(|n| n == worker_name),
+            "the viewer thread {worker_name} was not running, so the sample above proves nothing \
              about audio: {seen:?}"
         );
     }
-    // A crash here is almost certainly **not** about audio, and the message says so: with
+    // A crash here is almost certainly not about audio, and the message says so: with
     // `--no-audio` there is no audio thread, no card is opened, and `src/viewer/render.rs` is
-    // untouched by Stage 4a. What this desk produces instead is a Stage 3 shutdown race — see the
+    // untouched by. What the recorded test setup produces instead is a shutdown race — see the
     // hardware-run notes: when the compositor is not scheduling the surface (a locked session),
-    // `present()` blocks, the render thread overruns its 500 ms join deadline and is detached, and
+    // `present` blocks, the render thread overruns its 500 ms join deadline and is detached, and
     // the detached thread then drops the wgpu/EGL instance after the main thread has closed the
     // Wayland connection. Observed once in seven runs, with the core dump naming
     // `wgpu_hal::gles::egl::Inner::drop` under `wl_proxy_marshal_flags`.
@@ -1255,7 +1137,7 @@ fn no_audio_leaves_the_stage_3_viewer_untouched() {
         status.success(),
         "the viewer exited {status}.{}",
         if text.contains("has not finished within") {
-            " Its log contains the render thread's detach warning, so this is the Stage 3 \
+            " Its log contains the render thread's detach warning, so this is the viewer \
              shutdown race and not an audio failure: every audio assertion above passed. \
              `coredumpctl info` on this pid will show whether it died in the detached render \
              thread's wgpu teardown."
@@ -1285,30 +1167,20 @@ fn no_audio_leaves_the_stage_3_viewer_untouched() {
     );
     assert!(
         text.contains("stats capture:") && text.contains("stats input:"),
-        "the Stage 3 statistics lines must still be there, or this proves nothing"
+        "the viewer statistics lines must still be there, or this proves nothing"
     );
     assert!(
-        text.contains("— audio off"),
+        text.contains("audio off"),
         "the title must say audio is off rather than leaving it out"
     );
     println!("[--no-audio] {}", audio_lines[0]);
     println!("[--no-audio] log kept at {}", log.display());
 }
 
-/// The replug half of §12 Stage 4a: "a card unbound with `scripts/usb-replug.py` […] leaves the
-/// Stage 3 viewer untouched", and audio re-pairs through `discovery::reopen` when the card comes
-/// back — possibly renumbered (C13).
-///
-/// **Deferred on this desk, and this test says why rather than passing quietly.** Making the card
-/// vanish means a USBDEVFS ioctl, which means opening `/dev/bus/usb/003/<devnum>` **read-write**;
-/// those nodes are `root:root 0664` with no ACL here, and `sudo` needs a password this run does
-/// not have. A full-device reset is also explicitly off the table while the user's dock is
-/// unplugged: the dongle would come back as `/dev/video0` and `/dev/ttyACM0` and stay there,
-/// which every hardware test in this repository hardcodes against (CLAUDE.md).
-///
-/// So it needs **both**: write access to the dongle's usbfs node, and `NANOKVM_ALLOW_REPLUG=1` to
-/// say the desk can afford a replug. With either missing it prints what is missing and returns —
-/// deliberately, so the rest of this binary stays runnable on a desk that cannot do it.
+/// Verify audio re-pairs after card removal while video and input continue.
+/// Requires `NANOKVM_ALLOW_REPLUG` and write access to the selected usbfs node.
+/// The recorded setup could not run this test because usbfs access required
+/// privilege; do not count that deferred run as a hardware pass.
 #[test]
 #[ignore = "needs write access to usbfs and NANOKVM_ALLOW_REPLUG=1; see the doc comment"]
 fn card_vanishing_mid_session() {

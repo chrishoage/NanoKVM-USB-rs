@@ -1,17 +1,4 @@
-//! The on-demand `GET_INFO` refresh (plan §12 Stage 4c, `docs/STAGE3_FINDINGS.md` D2).
-//!
-//! D2's CapsLock policy needs the target's lock bits, and the viewer's clipboard paste needs them
-//! **fresh**: `Stats::device_info` on its own is whatever the link reported when it was
-//! commissioned, which on a stable link is the value from process start. Deciding whether a page of
-//! letters would arrive inverted from a reading taken minutes ago is exactly the "an
-//! acknowledgement is not evidence of effect" mistake in another costume.
-//!
-//! So [`nanokvm::input::Producer::refresh_device_info`] asks the **writer** — the one thread that
-//! may touch the link (§2.6, §5.1) — for a new one, and `Stats::device_info_generation` is how a
-//! caller knows it is looking at an answer rather than at a memory of one.
-//!
-//! Nothing here asserts the device received anything (§2.6.1); every assertion is about the frames
-//! the writer submitted and about what the snapshot then says.
+//! Fresh device-info requests, generation tracking, and failure completion.
 
 use std::time::{Duration, Instant};
 
@@ -71,7 +58,7 @@ fn a_refresh_transacts_get_info_and_advances_the_generation() {
     assert_eq!(
         commissioning_reads,
         1,
-        "§2.7 step 3d already asked once: {:?}",
+        " already asked once: {:?}",
         links[0].calls()
     );
     assert_eq!(
@@ -109,20 +96,20 @@ fn a_refresh_transacts_get_info_and_advances_the_generation() {
     let _ = writer.shutdown();
 }
 
-/// **The baseline comes back from the request, and a fast writer cannot beat it.**
+/// The baseline comes back from the request, and a fast writer cannot beat it.
 ///
 /// The caller's rule is "wait until the generation passes the one my request was made against",
 /// and the only place that number can be read without a race is inside the critical section the
-/// request is made in. A caller that asked and *then* read `stats()` would, against a writer that
+/// request is made in. A caller that asked and *then* read `stats` would, against a writer that
 /// answered in between, take the answer's own generation for its baseline and wait for a second
 /// answer that nobody asked for — which for the viewer's paste is the whole 3 s preparation
 /// deadline and then a refusal saying the device did not answer, about a device that answered in
 /// milliseconds.
 ///
-/// Here the refresh is deliberately serviced **before** the caller looks at any snapshot, and the
+/// Here the refresh is serviced before the caller looks at any snapshot, and the
 /// baseline it was given still reads as "not yet answered". The discriminating assertion is the
 /// first one: the number handed back is the generation from *before* the request, which is the one
-/// thing a `stats()` taken after the call cannot be relied on to be.
+/// thing a `stats` taken after the call cannot be relied on to be.
 #[test]
 fn a_refresh_serviced_before_the_caller_looks_still_shows_as_a_change() {
     let (producer, writer, _sctl, links) = rig(1);
@@ -151,8 +138,7 @@ fn a_refresh_serviced_before_the_caller_looks_still_shows_as_a_change() {
     let _ = writer.shutdown();
 }
 
-/// Repeated requests coalesce into one transaction, like every other one-slot flag in §2.6: a
-/// menu item clicked twice must not queue two reads onto a link that is also carrying keystrokes.
+/// Repeated refresh requests coalesce instead of competing with keystrokes.
 #[test]
 fn repeated_requests_coalesce_into_one_transaction() {
     let (producer, writer, _sctl, links) = rig(1);
@@ -175,9 +161,7 @@ fn repeated_requests_coalesce_into_one_transaction() {
     let _ = writer.shutdown();
 }
 
-/// **A device that will not answer must not wedge the caller.** The generation advances anyway, so
-/// a viewer waiting on it learns that it asked and that the newest answer there is is the old one
-/// — which the paste then refuses to type letters through (D2, `chrome::paste`).
+/// Failed refresh advances the generation and marks the cached reading stale.
 #[test]
 fn a_device_that_does_not_answer_still_advances_the_generation() {
     let (producer, writer, _sctl, links) = rig(1);
@@ -198,16 +182,11 @@ fn a_device_that_does_not_answer_still_advances_the_generation() {
     let _ = writer.shutdown();
 }
 
-/// **A failed refresh does not end the session.** It is a read-only convenience — nobody's
-/// keystroke depends on it — and one timed-out `GET_INFO` is not evidence that the transport is
-/// gone. Escalating it to a `LinkDown` cancellation would take a user's capture away on behalf of
-/// a menu item that only wanted to know whether CapsLock was on; the stale reading is the whole
-/// consequence of it, and the paste refuses on that (D2, `chrome::paste`).
+/// A query timeout must not cancel otherwise usable input.
 #[test]
 fn a_failed_refresh_leaves_the_session_engaged() {
     let (producer, writer, _sctl, links) = rig(1);
-    // Commissioning a link is a §2.7 sequence and ends disengaged, like every other cancellation;
-    // this is the deliberate recapture that puts a session in front of the refresh.
+    // Recapture after commissioning before testing an in-session refresh.
     producer.engage().expect("deliberate recapture");
     let cancellations = producer.stats().cancellations;
 
@@ -224,8 +203,7 @@ fn a_failed_refresh_leaves_the_session_engaged() {
         "asked, and nobody answered"
     );
 
-    // The consequence, not the acknowledgement: a keystroke is still admitted. `submit` is what
-    // §2.6 closes on a cancellation, so a session that still takes one was never cancelled.
+    // Successful submission establishes that refresh failure did not cancel capture.
     producer
         .submit(nanokvm::input::Event::Key {
             key: nanokvm::proto::HidKey::Usage(0x04),

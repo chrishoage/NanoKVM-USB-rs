@@ -1,62 +1,11 @@
-//! Keyboard shortcut inhibition on winit's own Wayland connection (plan §1.5, §12 Stage 1).
+//! Keyboard-shortcut inhibition on winit's Wayland connection.
 //!
-//! # The technique, and why it is not obvious
+//! A separate event queue owns the inhibitor proxies while winit owns the display and
+//! surface. Its dispatch thread must stop before that display is closed. Foreign-proxy
+//! conversion requires the shared system Wayland backend used by winit.
 //!
-//! No windowing library exposes `wl_seat`, so the inhibit manager has to be bound from a registry
-//! this module owns. The part that fails if guessed at is *which event queue*: libwayland
-//! dispatches per queue, so a **second `wl_event_queue` created on winit's existing `wl_display`**
-//! lets winit's loop and this module's dispatch thread coexist without contention. Sharing
-//! winit's queue is what fails (§1.5). Measured working on niri 26.04; `active` arrives about
-//! 0.2 ms after the request (q6a).
-//!
-//! Steps, in order (q6a 1–6):
-//!
-//! 1. `raw-window-handle` gives the `wl_display` and `wl_surface` pointers.
-//! 2. `Backend::from_foreign_display` wraps winit's display — "foreign" means `Drop` will not
-//!    disconnect it — and `Connection::from_backend` wraps that.
-//! 3. `conn.new_event_queue()` creates the second queue, serviced by `nanokvm-wayland`.
-//! 4. A self-bound `wl_registry` provides `wl_seat` and
-//!    `zwp_keyboard_shortcuts_inhibit_manager_v1`.
-//! 5. winit's surface is re-wrapped as a proxy on this connection via `ObjectId::from_ptr`.
-//! 6. `inhibit_shortcuts(surface, seat)` plus a flush.
-//!
-//! Step 5 requires winit and this crate to resolve to the **same `wayland-backend` build**, or the
-//! foreign proxy is not recognised. There is exactly one `wayland-backend` in this crate's graph
-//! today (winit 0.30 and wayland-client 0.31 both take 0.3). A test that shells out to
-//! `cargo tree -d` would be a build-environment test rather than a code test, so instead the
-//! failure is handled: [`ShortcutInhibit::new`] returns an error, the caller logs it, and the
-//! viewer runs without inhibition.
-//!
-//! # What the events mean
-//!
-//! - **`active` is not a focus signal.** It arrives even for an unfocused surface, and niri does
-//!   *not* deactivate the inhibitor when the window loses focus. Release-on-focus-loss is
-//!   client-driven and hangs off `WindowEvent::Focused` (§2.6, q6c).
-//! - **`inactive` is the user asking to be let out.** niri binds `Mod+Escape` with
-//!   `allow-inhibiting=false`, keeps it for itself even while inhibiting, and flips the
-//!   inhibitor to `inactive`. Treat it as a release trigger (q6c).
-//!
-//! # Lifetime, and why the dispatch thread is joined
-//!
-//! Everything here is borrowed: the `wl_display` and the `wl_surface` belong to winit, and
-//! `Backend::from_foreign_display` exists precisely so this module's `Connection` does not own
-//! them. Borrowed means the borrow has to end first. `winit::event_loop::EventLoop::run_app`
-//! **consumes** the event loop, so winit's connection is gone the moment it returns — and any
-//! Wayland call made after that, from the event loop thread or from a dispatch thread still parked
-//! in a read on that display, is a use-after-free. So [`ShortcutInhibit`] owns its dispatch thread,
-//! that thread polls with a timeout and re-checks a stop flag rather than blocking forever, and
-//! [`ShortcutInhibit`]'s `Drop` destroys the inhibitor, sets the flag and **joins**. The viewer
-//! drops it from `ApplicationHandler::exiting`, which winit runs while the loop — and therefore the
-//! display — is still alive.
-//!
-//! # Single seat
-//!
-//! The registry handler below keeps **one** `wl_seat`: the last one advertised. On a multi-seat
-//! compositor this client would inhibit shortcuts on that seat only, and the compositor would keep
-//! taking them on the others. That is a deliberate Stage 1 simplification — niri, the compositor
-//! this is built for (`CLAUDE.md`), advertises exactly one seat, and choosing among several needs a
-//! policy (which seat holds the keyboard focus? does the user pick?) that no measurement supports
-//! yet. Seat removal is unhandled for the same reason.
+//! Compositor deactivation releases capture. Focus loss also releases explicitly because
+//! the compositor need not deactivate the inhibitor when focus changes.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,10 +26,10 @@ use winit::window::Window;
 /// What the compositor said about the inhibitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InhibitEvent {
-    /// Shortcuts are being delivered to this client. **Not** a statement about focus (q6a).
+    /// Shortcuts are being delivered to this client. Not a statement about focus.
     Active,
     /// The compositor took inhibition back — on niri, the user pressed `Mod+Escape`. This is the
-    /// compositor-driven "let me out" signal (q6c).
+    /// compositor-driven "let me out" signal.
     Inactive,
 }
 
@@ -203,7 +152,7 @@ const POLL_TIMEOUT_MS: libc::c_int = 50;
 /// `EventQueue::blocking_dispatch` cannot be used here because it blocks in the socket read with
 /// no timeout and no way to be woken; a thread inside it outlives the display it is reading (see
 /// the module docs). This is the same sequence with the read broken into the two halves
-/// wayland-client exposes for exactly this: `prepare_read()` registers the intent to read and
+/// wayland-client exposes for this: `prepare_read()` registers the intent to read and
 /// hands over the socket fd, `poll` waits on that fd with a timeout, and `read()` performs the
 /// synchronised read. Dropping the guard instead cancels the prepared read, which is what the
 /// timeout path does before looping round to look at `stop`.
@@ -227,7 +176,7 @@ fn dispatch_loop(queue: &mut EventQueue<WlState>, state: &mut WlState, stop: &At
             revents: 0,
         }];
         // SAFETY: `fds` is one initialised `pollfd` owned by this frame, and the count passed is
-        // exactly its length. The fd is borrowed from `guard`, which is alive for the whole call,
+        // its length. The fd is borrowed from `guard`, which is alive for the whole call,
         // so it cannot be closed underneath `poll`. `poll` does not retain the pointer.
         let ready =
             unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, POLL_TIMEOUT_MS) };
@@ -289,10 +238,9 @@ impl ShortcutInhibit {
 
         // SAFETY: `display_ptr` is the `wl_display` winit created for this window and still owns,
         // read out of a live `DisplayHandle` immediately above. `from_foreign_display` borrows it:
-        // `Drop` will not call `wl_display_disconnect`, so winit's connection is unaffected (§1.5,
-        // q6a step 2). The borrow is only sound while winit's display lives, and winit disconnects
+        // `Drop` will not call `wl_display_disconnect`, so winit's connection is unaffected. The borrow is only sound while winit's display lives, and winit disconnects
         // it when its event loop is dropped — which `run_app` does on return. The invariant this
-        // relies on is therefore **not** the `Arc<Window>` below (a window handle does not keep the
+        // relies on is therefore not the `Arc<Window>` below (a window handle does not keep the
         // connection open): it is that every user of this `Connection` — this struct's methods and
         // the dispatch thread it owns — is finished before the event loop is dropped. `Drop` here
         // enforces the thread half by joining it, and the viewer enforces the other half by
@@ -302,7 +250,7 @@ impl ShortcutInhibit {
         let backend = unsafe { Backend::from_foreign_display(display_ptr.cast()) };
         let conn = Connection::from_backend(backend);
 
-        // q6a step 3: a SECOND queue on the same display. libwayland dispatches per queue, so
+        // Use a separate queue on the same display. libwayland dispatches per queue, so
         // winit's dispatch and ours never collide. Sharing winit's queue is what fails.
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
@@ -331,7 +279,7 @@ impl ShortcutInhibit {
             )
         })?;
 
-        // q6a step 5: re-wrap winit's wl_surface as a proxy on our connection.
+        // Re-wrap winit's wl_surface as a proxy on our connection.
         // SAFETY: `surface_ptr` is the live `wl_surface` winit created for this window and still
         // owns; it is valid for as long as `window`, which this struct holds an `Arc` to. The
         // interface passed matches the object's actual interface. This is only recognised if
@@ -401,7 +349,7 @@ impl ShortcutInhibit {
 
     /// Create the inhibitor, so compositor shortcuts reach this window instead of the compositor.
     ///
-    /// Only ever called while the window is focused and the user has deliberately asked to
+    /// Only ever called while the window is focused and the user has asked to
     /// capture. `active` follows shortly afterwards, but arming is not a claim that inhibition is
     /// in force — see [`ShortcutInhibit::is_active`].
     pub fn arm(&mut self) {
@@ -419,7 +367,7 @@ impl ShortcutInhibit {
         log::debug!("shortcut inhibitor requested");
     }
 
-    /// Destroy the inhibitor. Part of every release (§2.6), and safe to call when not armed.
+    /// Destroy the inhibitor. Part of every release, and safe to call when not armed.
     pub fn disarm(&mut self) {
         let Some(i) = self.inhibitor.take() else {
             return;
@@ -440,7 +388,7 @@ impl ShortcutInhibit {
     /// Whether the compositor last said `active`.
     ///
     /// Never used as a focus signal: it arrives for unfocused surfaces too, and niri leaves it
-    /// `active` across a focus-out/focus-in cycle (q6a, q6c).
+    /// `active` across a focus-out/focus-in cycle.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }

@@ -1,18 +1,4 @@
-//! §2.6 clean shutdown — the trigger that nothing may follow.
-//!
-//! Shutdown is a release-all trigger like the others, plus one property none of them has: **no
-//! session may come after it**. The writer exits once it has written the release, and nothing
-//! drains the queue afterwards, so any event accepted from the moment shutdown begins could only
-//! ever land after the release — or not at all. These tests are the regression suite for the
-//! adversarial review's BLOCKER finding, where `shutdown` triggered the release and only *then*
-//! asked the writer to stop: a producer following §2.8's documented recapture loop (`submit`
-//! fails → `engage()` → `submit`) re-engaged the instant the writer acked the shutdown epoch, its
-//! key-down was written after the final release-all, and `shutdown()` reported `Submitted` while
-//! the target was left holding the key.
-//!
-//! As everywhere in this module's tests, assertions are on the frames the writer *submitted* to
-//! the link, never on delivery (§2.6.1), and determinism comes from parking the writer inside a
-//! transact rather than from sleeping.
+//! Shutdown closes admission before final release so no later input can be sent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,12 +27,8 @@ fn config() -> Config {
     }
 }
 
-/// **The BLOCKER, as a stress test.** A producer hammering the §2.8 recapture loop against a
-/// concurrent `shutdown`. Every run must end with the release-all pair as its last two frames:
-/// `shutting_down` is set in the same critical section as the shutdown's epoch bump, so the
-/// producer cannot re-engage behind the release, and the writer exits only once it has written it.
-///
-/// Three thousand iterations because the original window was roughly one in two hundred.
+/// Concurrent recapture must not submit after shutdown closes admission and sends
+/// its final release.
 #[test]
 fn a_recapture_loop_cannot_write_input_after_the_shutdown_release() {
     let mut leaked = 0u32;
@@ -66,7 +48,7 @@ fn a_recapture_loop_cannot_write_input_after_the_shutdown_release() {
                 })
                 .is_err()
                 {
-                    // §2.8: the session failed, the user re-grabs. Exactly the documented path.
+                    // Exercise ordinary recapture concurrently with shutdown.
                     let _ = p.engage();
                 }
                 down = !down;
@@ -92,7 +74,7 @@ fn a_recapture_loop_cannot_write_input_after_the_shutdown_release() {
     if let Some((i, outcome, tail)) = first {
         panic!(
             "{leaked}/3000 shutdowns wrote no final release-all; the first one that left a KEY \
-             HELD was iteration {i}, shutdown() reported {outcome:?}, last four frames {tail:?}"
+             HELD was iteration {i}, shutdown reported {outcome:?}, last four frames {tail:?}"
         );
     }
     assert_eq!(
@@ -103,7 +85,7 @@ fn a_recapture_loop_cannot_write_input_after_the_shutdown_release() {
 
 /// The control for the test above: the same shape with a producer that never re-engages. It passed
 /// before the fix and must keep passing after it — if this one ever fails, the cause is not the
-/// concurrent `engage()`.
+/// concurrent `engage`.
 #[test]
 fn a_shutdown_with_no_concurrent_recapture_still_ends_in_a_release() {
     let mut leaked = 0u32;
@@ -143,9 +125,7 @@ fn a_shutdown_with_no_concurrent_recapture_still_ends_in_a_release() {
     assert_eq!(leaked, 0, "{leaked}/3000 without re-engage");
 }
 
-/// §9.2 item 4(a) as a property, across an ordinary (non-shutdown) release and a concurrent
-/// producer: no event produced under an epoch `<= E` may be written after the release for `E`.
-/// Each session presses a distinct usage, so a frame identifies its session unambiguously.
+/// Distinct session usages reveal any old-epoch input delivered after release.
 #[test]
 fn no_frame_from_a_cancelled_session_survives_its_release() {
     for _ in 0..200 {
@@ -236,8 +216,7 @@ fn engage_and_submit_fail_with_shutting_down_once_shutdown_has_begun() {
     checker.join().expect("checker thread");
 }
 
-/// …and they keep failing afterwards, when the writer has exited and nobody is draining the queue.
-/// Accepting input here would wedge it invisibly, which is the failure §2.6.1 forbids.
+/// Admission stays closed after the writer exits.
 #[test]
 fn engage_and_submit_keep_failing_after_shutdown_has_finished() {
     let (link, ctl) = fake_link();
@@ -270,7 +249,7 @@ fn engage_and_submit_keep_failing_after_shutdown_has_finished() {
     );
 }
 
-/// `shutdown` reports the outcome of **its own** release, not of whatever release happened to be
+/// `shutdown` reports the outcome of its own release, not of whatever release happened to be
 /// recorded before it. Two sequences run here; the returned record is the second one's.
 #[test]
 fn shutdown_reports_the_outcome_of_its_own_release() {
@@ -305,7 +284,7 @@ fn shutdown_reports_the_outcome_of_its_own_release() {
 }
 
 /// …including when the link dies underneath that release: `Unsent` means the frames never reached
-/// the transport and **the target may still be holding keys** (§2.6.1).
+/// the transport and the target may still be holding keys.
 #[test]
 fn shutdown_reports_unsent_when_the_link_dies_under_its_own_release() {
     let (link, ctl) = fake_link();

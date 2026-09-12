@@ -1,11 +1,4 @@
-//! End-to-end capture pipeline tests against the synthetic source (§9.3).
-//!
-//! §9.3: "a synthetic `FrameSource` covers decode and render and makes latency and
-//! drop-behaviour assertions deterministic." These are the assertions §5.2, §9.2 item 8 and
-//! §6.1 S1-2 ask for, none of which need hardware.
-//!
-//! Nothing here uses a sleep as its only guard. Where a test must wait, it polls a condition
-//! with a deadline: the deadline bounds a hang, and the assertion is on the condition.
+//! Capture/decode integration with synthetic sources and real JPEG fixtures.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +37,7 @@ fn synthetic(interval: Duration) -> SyntheticSource {
     SyntheticSource::from_dir(&fixture_dir(), interval).expect("synthetic source")
 }
 
-/// Rewrite a real frame's start-of-frame Y/X fields, the way a flipped byte in an A6 stale frame
-/// or an A15 torn transfer does. The result is a well-formed JPEG that lies about its size.
+/// Corrupt the SOF dimensions without breaking JPEG marker framing.
 fn patch_sof(bytes: &mut [u8], height: u16, width: u16) {
     let mut at = 2usize; // past SOI
     loop {
@@ -100,10 +92,7 @@ fn checksum(bytes: &[u8]) -> u64 {
     h
 }
 
-/// (1) Frames flow capture → decode → output, and arrive at the device's real resolution.
-///
-/// §4.1's two rows wired together; the dimensions come from each frame's own JPEG header (A6),
-/// so 1920x1080 here is the header speaking, not `G_FMT`.
+/// Use JPEG header dimensions so negotiated metadata cannot mask a wrong-sized frame.
 #[test]
 fn frames_flow_end_to_end_at_the_captured_resolution() {
     let h = Pipeline::start(
@@ -141,11 +130,8 @@ fn frames_flow_end_to_end_at_the_captured_resolution() {
     h.stop();
 }
 
-/// (2) §9.2 item 8: no pending frame references a requeued buffer.
-///
-/// The synthetic source mimics an mmap ring — one internal buffer, overwritten every call — so
-/// this is the same failure shape as a real requeue. The failure is silent corruption, not a
-/// crash, which is exactly why §9.2 calls it out as worth an explicit test.
+/// The source reuses one backing buffer. A queued frame must own its bytes before
+/// the next capture overwrites that buffer.
 #[test]
 fn a_taken_frame_is_unaffected_by_the_source_overwriting_its_buffer() {
     let (a, b) = two_distinct_fixtures();
@@ -193,11 +179,7 @@ fn a_taken_frame_is_unaffected_by_the_source_overwriting_its_buffer() {
     h.stop();
 }
 
-/// (3) §5.2: drop before decoding, and the pending frame is always the newest one.
-///
-/// With the decoder deliberately slower than the source, obsolete compressed frames must be
-/// discarded pre-decode rather than queued — "decoding an already-obsolete frame spends the
-/// most expensive step in the pipeline on output nobody will see".
+/// Slow decoding must discard obsolete compressed frames before spending work on them.
 #[test]
 fn a_slow_decoder_drops_pre_decode_and_never_delivers_an_older_frame() {
     let config = PipelineConfig {
@@ -254,17 +236,8 @@ fn a_slow_decoder_drops_pre_decode_and_never_delivers_an_older_frame() {
     h.stop();
 }
 
-/// (4) §6.1 S1-2: frames stopping neither crashes nor hangs, the tool says frames stopped
-/// arriving, and delivery resumes.
-///
-/// Three consecutive dequeue timeouts. A timeout is a stall, not signal loss (A5) and not a
-/// disconnection: the capture thread counts it and keeps polling.
-///
-/// The scripted failures are **paced** — `SyntheticSource` sleeps out its interval before
-/// failing, as a real dequeue timeout consumes wall clock — so three of them at a 40 ms interval
-/// plus the capture thread's 20 ms error backoff put a real ~180 ms gap in the frame stream.
-/// Before that fix these three "50 ms timeouts" elapsed in microseconds and this test asserted
-/// nothing about stalling at all.
+/// Paced dequeue timeouts simulate a stalled source without a hot error loop.
+/// The pipeline must report the stall and resume delivery when frames return.
 #[test]
 fn the_capture_thread_survives_timeouts_reports_the_stall_and_resumes() {
     let interval = Duration::from_millis(40);
@@ -297,7 +270,7 @@ fn the_capture_thread_survives_timeouts_reports_the_stall_and_resumes() {
     assert_ne!(
         h.state(),
         PipelineState::Disconnected,
-        "a timeout must never be reported as a disconnection (§6.1)"
+        "a timeout must never be reported as a disconnection "
     );
 
     wait_for(
@@ -322,13 +295,13 @@ fn the_capture_thread_survives_timeouts_reports_the_stall_and_resumes() {
     ));
     assert!(stats.frames_decoded > 0);
 
-    // Both threads are still alive: stop() joins them rather than finding them gone.
+    // Both threads are still alive: stop joins them rather than finding them gone.
     let t = Instant::now();
     h.stop();
     assert!(t.elapsed() < Duration::from_secs(2));
 }
 
-/// (5) §6.1: a disconnection is reported as itself, and shutdown stays prompt.
+/// Disconnection must remain distinguishable from a stall, with bounded shutdown.
 #[test]
 fn a_disconnection_is_reported_and_stop_does_not_hang() {
     let mut source = synthetic(Duration::from_millis(2));
@@ -349,7 +322,7 @@ fn a_disconnection_is_reported_and_stop_does_not_hang() {
     let t = Instant::now();
     h.stop();
     let elapsed = t.elapsed();
-    assert!(elapsed < Duration::from_secs(1), "stop() took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "stop took {elapsed:?}");
 }
 
 /// (6) A healthy pipeline stops promptly.
@@ -365,17 +338,11 @@ fn stop_joins_both_threads_within_a_second() {
     let t = Instant::now();
     h.stop();
     let elapsed = t.elapsed();
-    assert!(elapsed < Duration::from_secs(1), "stop() took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "stop took {elapsed:?}");
 }
 
-/// §6.1 S1-1 in miniature: a source that only ever fails must not wedge or kill the pipeline,
-/// must never be reported as a disconnection, and — reviewer finding 3 — must not be retried at
-/// whatever rate the CPU allows.
-///
-/// The real shape this stands in for: `VIDIOC_DQBUF` is documented to return `EIO` for temporary
-/// problems like signal loss, and `POLLERR` on a V4L2 fd is level-triggered and sticky, so the
-/// poll that normally paces `V4l2Source` returns instantly every time. Without a backoff the
-/// capture thread burns a core while `state()` politely says `Stalled`.
+/// Repeated immediate errors must neither kill the pipeline nor spin at CPU speed.
+/// Sticky `POLLERR` and temporary `EIO` can produce this failure pattern.
 #[test]
 fn a_source_that_only_errors_is_retried_at_a_bounded_rate_and_stays_stalled_not_dead() {
     struct AlwaysBad(Arc<AtomicU64>);
@@ -408,7 +375,7 @@ fn a_source_that_only_errors_is_retried_at_a_bounded_rate_and_stays_stalled_not_
     let stats = h.stats();
     assert!(
         during < 200,
-        "{during} next_frame() calls in 200 ms: the error backoff is gone"
+        "{during} next_frame calls in 200 ms: the error backoff is gone"
     );
     assert!(
         during >= 2,
@@ -515,7 +482,7 @@ fn a_corrupt_sof_frame_never_reaches_the_renderer_and_is_counted() {
     );
 }
 
-/// `stop()` must be prompt from every state the pipeline can be in, not just the healthy one.
+/// `stop` must be prompt from every state the pipeline can be in, not just the healthy one.
 #[test]
 fn stop_is_prompt_from_every_state() {
     /// A source that takes `0` to answer, then reports a timeout.
@@ -617,11 +584,8 @@ fn start_and_stop_repeatedly_without_a_race() {
     }
 }
 
-/// `stop()` closes the output slot, which discards whatever the renderer had not yet taken.
-///
-/// §6.1 S1-2's "the last image is preserved" is about the *renderer's* copy — the texture it has
-/// already uploaded — not about the handoff slot. This pins the actual behaviour so a future
-/// change to it is a deliberate one.
+/// Closing the handoff discards pending output. The renderer retains its own
+/// already-uploaded texture independently.
 #[test]
 fn stopping_the_pipeline_discards_the_slots_pending_frame() {
     let h = Pipeline::start(
@@ -633,15 +597,14 @@ fn stopping_the_pipeline_discards_the_slots_pending_frame() {
         out.is_pending()
     });
     h.stop();
-    assert!(out.is_closed(), "the slot was not closed by stop()");
+    assert!(out.is_closed(), "the slot was not closed by stop");
     assert!(
         !out.is_pending(),
-        "the pending frame survived stop(); if that is now intended, update this test"
+        "the pending frame survived stop; if that is now intended, update this test"
     );
 }
 
-/// Decode failures are counted and skipped; one bad frame never takes the thread down (§1.3
-/// strict mode makes truncated frames errors on purpose).
+/// Strict JPEG errors discard one frame without terminating the decode worker.
 #[test]
 fn a_truncated_frame_among_good_ones_is_skipped_not_fatal() {
     let (good, other) = two_distinct_fixtures();

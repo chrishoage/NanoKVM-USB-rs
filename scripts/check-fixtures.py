@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Revalidate fixtures/packets/ch9329.toml from scratch.
+"""Validate packet framing, fields, and checksums in fixtures/packets/ch9329.toml.
 
-These frames are the AUTHORITY for the protocol tests (NATIVE_CLIENT_PLAN §9.1), so nothing
-here trusts the file's own arithmetic. Every checksum is recomputed from the raw frame bytes,
-and every declared field is checked against them.
-
-Needs no hardware. Exits non-zero on any failure.
-"""
+Recompute values from raw bytes rather than trusting the fixture's annotations.
+Requires no hardware and exits nonzero on any mismatch."""
 import re
 import sys
 import tomllib
@@ -15,8 +11,8 @@ from pathlib import Path
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures/packets/ch9329.toml"
 
 HEAD = (0x57, 0xAB)
-# Command -> (payload length, leading mode byte). The mode byte is the correction from
-# STAGE0_FINDINGS A17: the device ACKs a mouse report without it and does nothing.
+# Command -> (payload length, leading mode byte). Missing mode bytes can receive
+# an acknowledgement without producing target input.
 MOUSE = {0x04: (7, 0x02), 0x05: (5, 0x01)}
 KEYBOARD_CMD = 0x02
 KEYBOARD_LEN = 8

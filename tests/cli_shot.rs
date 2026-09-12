@@ -1,18 +1,4 @@
-//! `nanokvm shot`'s frame policy and its output (plan §12 Stage 3, §5.2, §6, §6.1).
-//!
-//! The thing worth testing here is the *policy*, and it is testable because `pick_frame` sees a
-//! [`FrameSource`] and nothing else: every rule below — A6's stale frames, C12's truncated ones,
-//! C14's wrong-size stream and the single restart that fixes it — is a condition this desk
-//! produces once in a blue moon and a `SyntheticSource` produces on demand (§9.3). A test that
-//! needed the dongle to be mid-USB-reset would never be written, and the rules would then be
-//! guesses.
-//!
-//! **No hardware.** The frames are the Stage 0 capture corpus under `fixtures/frames/` (§9.1:
-//! captures are fixtures, read rather than retyped), sizes are faked by rewriting the
-//! start-of-frame header of a real frame, and the only path the binary is pointed at is one that
-//! cannot exist. `/dev/video0`–`3` and `/dev/ttyACM0` are the user's hardware (CLAUDE.md) and are
-//! never named, not even as a path expected to fail. Nothing here opens a serial node, because
-//! `shot` does not have one.
+//! Screenshot frame-selection policy and file/stdout output with injectable sources.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -28,7 +14,7 @@ const ABSENT: &str = "/dev/nanokvm-does-not-exist";
 /// The negotiated size every mismatch test compares against: the mode this client asks for.
 const NEGOTIATED: (u32, u32) = (1920, 1080);
 
-/// The size C14's stuck stream actually delivered.
+/// The size stuck stream delivered.
 const STUCK: (u32, u32) = (640, 480);
 
 // ---- fixtures and doubles --------------------------------------------------------------------
@@ -65,8 +51,8 @@ fn one_fixture() -> Vec<u8> {
 }
 
 /// Rewrite a real frame's start-of-frame Y/X fields, as `tests/capture_pipeline.rs` does. The
-/// result is a well-formed JPEG that lies about its size — which is exactly what C14's stuck
-/// stream and A6's stale frames look like from here.
+/// result is a well-formed JPEG that lies about its size — which is what stuck
+/// stream and stale frames look like from here.
 fn patch_sof(bytes: &mut [u8], height: u16, width: u16) {
     let mut at = 2usize; // past SOI
     loop {
@@ -91,11 +77,11 @@ fn frame_claiming((width, height): (u32, u32)) -> Vec<u8> {
     bytes
 }
 
-/// A source that **negotiated a size** and counts its restarts.
+/// A source that negotiated a size and counts its restarts.
 ///
 /// `SyntheticSource::negotiated_dimensions` is `None` — the truth for a source that negotiated
-/// nothing — which leaves the size comparison inert, exactly as it leaves the pipeline's
-/// watchdog inert. This is the other half of C14's comparison: what `S_FMT` committed to.
+/// nothing — which leaves the size comparison inert, as it leaves the pipeline's
+/// watchdog inert. This is the other half of comparison: what `S_FMT` committed to.
 struct Negotiated<S: FrameSource> {
     inner: S,
     negotiated: Option<(u32, u32)>,
@@ -131,12 +117,12 @@ impl<S: FrameSource> FrameSource for Negotiated<S> {
     }
 }
 
-/// A source that hands out exactly what a test scripted, then times out for ever.
+/// A source that hands out what a test scripted, then times out for ever.
 ///
 /// `SyntheticSource` refuses bytes it cannot parse before they reach the caller, which is right
 /// for it and useless for testing what `pick_frame` does with a frame that arrives *and* is
 /// unusable. This one delivers whatever bytes it is given, with the dimensions fields left as the
-/// source found them — so a test can also show that `pick_frame` reads the header itself (A6)
+/// source found them — so a test can also show that `pick_frame` reads the header itself
 /// rather than trusting those fields.
 struct Scripted {
     queue: VecDeque<Result<Vec<u8>, CaptureError>>,
@@ -245,7 +231,7 @@ impl Drop for Scratch {
 
 // ---- the policy ------------------------------------------------------------------------------
 
-/// A6: the device emits up to eight frames at the *previous* resolution after an idle period, and
+/// the device emits up to eight frames at the *previous* resolution after an idle period, and
 /// a stream that has just started is that case. The skipped frames must be gone, not merely
 /// counted — so the shot's bytes are compared with the frame that should have been taken.
 #[test]
@@ -260,8 +246,7 @@ fn the_skipped_frames_are_discarded_and_the_next_one_is_the_shot() {
     assert_eq!((shot.width, shot.height), NEGOTIATED);
 }
 
-/// C12 saw four truncated JPEGs at the signal transitions of a target reboot. Written to a file
-/// one would be a corrupt screenshot that nothing downstream could tell from a real one.
+/// A truncated transition frame must be skipped rather than saved as a screenshot.
 #[test]
 fn a_truncated_frame_is_skipped_and_counted() {
     let frames = distinct_fixtures(2);
@@ -278,8 +263,7 @@ fn a_truncated_frame_is_skipped_and_counted() {
 #[test]
 fn a_frame_whose_header_cannot_be_read_is_skipped_and_counted() {
     let good = one_fixture();
-    // Ends in FF D9, so it passes the truncation check, and carries no start-of-frame segment at
-    // all — the header parse is what has to reject it.
+    // An EOI marker alone is insufficient: the frame also needs a valid SOF header.
     let headerless = vec![0xFF, 0xD8, 0xFF, 0xD9];
     let mut source = Scripted::new(vec![
         Ok(b"garbage".to_vec()),
@@ -293,8 +277,7 @@ fn a_frame_whose_header_cannot_be_read_is_skipped_and_counted() {
     assert_eq!((shot.width, shot.height), NEGOTIATED);
 }
 
-/// The benign form of C14, which A6 bounds at eight frames: it fixes itself, so nothing is
-/// restarted and the counters are the only trace it leaves.
+/// A short wrong-size burst should settle without restarting the stream.
 #[test]
 fn stale_size_frames_are_counted_and_the_first_frame_at_the_negotiated_size_is_the_shot() {
     let good = one_fixture();
@@ -311,7 +294,7 @@ fn stale_size_frames_are_counted_and_the_first_frame_at_the_negotiated_size_is_t
     assert_eq!((shot.width, shot.height), NEGOTIATED);
 }
 
-/// C14: the stream is stuck, not the device, and a fresh `STREAMON` re-commits the format. Once —
+/// the stream is stuck, not the device, and a fresh `STREAMON` re-commits the format. Once —
 /// a restart costs a round trip and a handful of frames, and a shot that has to do it twice has
 /// already answered the question.
 #[test]
@@ -334,7 +317,7 @@ fn a_run_of_mismatched_frames_buys_exactly_one_restart_and_then_takes_the_next_g
 }
 
 /// And when the restart does not fix it, the error says so rather than writing a screenshot at a
-/// size nobody asked for. A6 makes the frame's own header the authority, so `--any-size` is a
+/// size nobody asked for. the frame's own header the authority, so `--any-size` is a
 /// real answer and the message has to offer it.
 #[test]
 fn a_stream_that_never_returns_to_the_negotiated_size_fails_naming_both_sizes() {
@@ -354,7 +337,7 @@ fn a_stream_that_never_returns_to_the_negotiated_size_fails_naming_both_sizes() 
     assert_eq!(source.restarts, 1, "the restart must not be repeated");
 }
 
-/// `--any-size`: A6 says the header is the truth about the frame, so a user who wants that frame
+/// `--any-size`: the header is the truth about the frame, so a user who wants that frame
 /// is entitled to it — and the stream is then left alone entirely.
 #[test]
 fn any_size_takes_the_first_well_formed_frame_whatever_its_header_says() {
@@ -375,9 +358,7 @@ fn any_size_takes_the_first_well_formed_frame_whatever_its_header_says() {
     assert_eq!(source.restarts, 0, "--any-size must not restart the stream");
 }
 
-/// §6.1: a stall is not evidence the signal is gone, so a timeout is survivable and the deadline
-/// is what ends the attempt. The failure this guards is a `shot` that hangs for ever on a node
-/// that never produces a buffer.
+/// A stalled source must remain retryable, but the overall deadline must bound the command.
 #[test]
 fn a_source_that_only_times_out_fails_at_the_deadline() {
     let mut source = Scripted::always_timing_out();
@@ -395,7 +376,7 @@ fn a_source_that_only_times_out_fails_at_the_deadline() {
     assert!(source.calls > 0, "the source was never asked");
 }
 
-/// R2: `--skip` is a budget of frames to **look at and throw away** (A6's stale ones). A frame the
+/// R2: `--skip` is a budget of frames to look at and throw away (stale ones). A frame the
 /// source refused never arrived, so it cannot have been one of them — sharing a counter made three
 /// bad frames spend three of the eight skips, and the shot was then a frame the policy had been
 /// told to discard.
@@ -441,7 +422,7 @@ fn a_frame_is_examined_even_when_the_deadline_has_already_passed() {
     );
 }
 
-/// And it is exactly *one* frame past the deadline: a source that keeps producing unusable frames
+/// And it is *one* frame past the deadline: a source that keeps producing unusable frames
 /// must not be asked for ever. The clock is consulted after every judgement.
 #[test]
 fn a_frame_that_is_no_good_ends_the_attempt_at_the_deadline() {
@@ -454,7 +435,7 @@ fn a_frame_that_is_no_good_ends_the_attempt_at_the_deadline() {
     );
 }
 
-/// A disconnection is fatal here: Stage 2's rediscovery is for a session that keeps running, and
+/// A disconnection is fatal here: rediscovery is for a session that keeps running, and
 /// a screenshot has nothing to keep running for. Asking a gone node again is the thing not to do.
 #[test]
 fn a_disconnected_source_fails_at_once_and_is_not_asked_again() {
@@ -506,7 +487,7 @@ fn a_jpeg_shot_is_the_device_bytes_byte_for_byte() {
     assert!(leftovers.is_empty(), "temporary left behind: {leftovers:?}");
 }
 
-/// A `.png` shot goes through the pipeline's own decoder (§1.3, A19: RGBA, strict), so it is the
+/// A `.png` shot goes through the pipeline's own decoder, so it is the
 /// same frame the viewer would have shown, at the size the frame's own header declares.
 #[test]
 fn a_png_shot_decodes_to_the_header_size_in_eight_bit_rgba() {
@@ -573,7 +554,6 @@ fn the_default_target_is_a_timestamped_jpeg_in_the_working_directory() {
 }
 
 /// The counters are the evidence the policy did anything, so they are on the line the user reads
-/// (§3.4: report what was observed, and nothing more).
 #[test]
 fn the_summary_line_reports_every_counter() {
     let quiet = Shot {
@@ -619,7 +599,7 @@ fn the_summary_line_reports_every_counter() {
 /// The recorded desk every binary-level test enumerates instead of the developer's own.
 ///
 /// Without it these runs walk the real `/sys` and `QUERYCAP` whatever video nodes are plugged in,
-/// which on this desk is the dongle and the user's webcam (CLAUDE.md). `--sysfs-root` points
+/// which on the recorded test setup is the dongle and the user's webcam (CLAUDE.md). `--sysfs-root` points
 /// discovery at the fixture and stops it opening any node at all (`cli::sources`).
 fn fixture_root() -> PathBuf {
     nanokvm::discovery::testing::fixture("usb2-desk")
@@ -690,7 +670,7 @@ fn an_unknown_extension_is_refused_before_the_video_node_is_opened() {
     assert!(files_in(&scratch.0).is_empty());
 }
 
-/// C4: `--timeout` is validated **before** the node is opened, so a value that cannot be waited
+/// `--timeout` is validated before the node is opened, so a value that cannot be waited
 /// for is a usage error rather than a panic with the video node held. The proof is that the
 /// message is about the timeout even though the `--video` path is absent too.
 #[test]
@@ -722,7 +702,7 @@ fn an_unwaitable_timeout_is_refused_before_the_video_node_is_opened() {
     assert!(files_in(&scratch.0).is_empty());
 }
 
-/// `--any-size` is the flag a user reaches for when C14 has them, so it has to be findable.
+/// Help must expose the escape hatch for devices that cannot deliver the requested size.
 #[test]
 fn the_shot_help_documents_the_size_and_skip_policy() {
     let scratch = Scratch::new("help");

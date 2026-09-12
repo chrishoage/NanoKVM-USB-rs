@@ -1,10 +1,4 @@
-//! The chrome's pure rules, as properties (plan §12 Stage 4b).
-//!
-//! The clause-by-clause assertions live beside the code in `src/viewer/chrome/`. What is here is
-//! the property that has to hold for **every** state there is, not for the handful a test can
-//! name: the viewer's release binding is never trapped by the chrome.
-//!
-//! Nothing here opens a device, a window or a config file.
+//! Property tests for viewer-control routing, hit testing, and persistent settings.
 
 use proptest::prelude::*;
 
@@ -136,10 +130,7 @@ fn any_action() -> impl Strategy<Value = KeyAction> {
 }
 
 proptest! {
-    /// **The property 4b exists to keep true.** `KeyAction::Release` — the `Pause` binding — routes
-    /// to the target's release path from every state there is, and nothing else ever routes there
-    /// by being `Release`. A chrome that could swallow it would trap the user's keyboard behind a
-    /// menu, and §12 Stage 1 requires the way out to be reachable.
+    /// The release binding must bypass every menu state so a popover cannot trap input.
     #[test]
     fn the_release_key_is_never_routed_anywhere_but_the_release_path(i in any_inputs()) {
         prop_assert_eq!(route_key(&i, KeyAction::Release), Sink::Target);
@@ -158,15 +149,13 @@ proptest! {
         }
     }
 
-    /// **§12 Stage 4c's half of the same property.** The paste chord is the other viewer-local
-    /// binding on the one reserved key, and it reaches the event loop from every state — a chord
-    /// a popover could swallow is a chord the user cannot reach.
+    /// The paste binding must reach the event loop even while a popover is open.
     #[test]
     fn the_paste_chord_is_never_routed_anywhere_but_the_event_loop(i in any_inputs()) {
         prop_assert_eq!(route_key(&i, KeyAction::Paste), Sink::Target);
     }
 
-    /// And while a paste runs the chord **is** the release, from every state: it cancels, and it
+    /// And while a paste runs the chord is the release, from every state: it cancels, and it
     /// can never restart a paste that is half-typed.
     #[test]
     fn the_chord_during_a_paste_is_always_the_release(i in any_inputs()) {
@@ -177,9 +166,8 @@ proptest! {
     }
 
     /// While a paste runs, an ordinary host key reaches neither the target nor the chrome —
-    /// unless it is the up of a press the **host** made and the target still holds, which is owed
+    /// unless it is the up of a press the host made and the target still holds, which is owed
     /// from every state. A keystroke forwarded into the middle of a paste corrupts the text
-    /// (§12 Stage 4c).
     #[test]
     fn a_running_paste_drops_every_host_key_it_does_not_owe(
         i in any_inputs(),
@@ -193,7 +181,7 @@ proptest! {
         prop_assert_eq!(sink, Sink::Dropped, "{:?}", running);
     }
 
-    /// The other half: while a paste runs, the up of a key the **paste itself** is holding is
+    /// The other half: while a paste runs, the up of a key the paste itself is holding is
     /// dropped even though the target is holding it. The paste releases its own keys; forwarding
     /// the user's Shift-up into the middle of a capital is the corruption this prevents.
     #[test]
@@ -236,15 +224,14 @@ proptest! {
         }
     }
 
-    /// A pointer event is never dropped, **except a button press during a paste that is not on
-    /// the chrome**. The chrome may take it and the target may take it, but a button press that
+    /// A pointer event is never dropped, except a button press during a paste that is not on
+    /// the chrome. The chrome may take it and the target may take it, but a button press that
     /// reached neither would be a press with no release — the defect `viewer::state`'s
     /// consumed-edge bookkeeping exists to prevent. A press dropped mid-paste is not that defect:
-    /// it never becomes outstanding, so there is no release owed for it (§12 Stage 4c).
+    /// it never becomes outstanding, so there is no release owed for it.
     #[test]
     fn a_pointer_event_always_reaches_one_side(i in any_inputs()) {
-        let on_chrome = !i.chrome_unreachable()
-            && (i.pointer_over_chrome || i.popover_open || i.modal_open);
+        let on_chrome = !i.chrome_unreachable()&& (i.pointer_over_chrome || i.popover_open || i.modal_open);
         for kind in kinds() {
             if i.paste_running
                 && !on_chrome
@@ -256,7 +243,7 @@ proptest! {
         }
     }
 
-    /// **A click must not land on the target in the middle of a paste.** A keystroke corrupts the
+    /// A click must not land on the target in the middle of a paste. A keystroke corrupts the
     /// text; a click moves the target's focus out from under it, and the rest of the paste is
     /// then typed into whatever the click opened — on a live desktop. So no button press reaches
     /// the target from any state, however the pill, the popover and the lock are arranged.
@@ -267,12 +254,9 @@ proptest! {
     ) {
         let running = RouteInputs { paste_running: true, ..i };
         let sink = route_pointer(&running, PointerKind::Button { mask, down: true });
-        // The invariant is about the **target**, not about `Dropped`: on the chrome the press is
-        // the chrome's, which never reaches the target either (the lead's ruling on 4c item 7),
-        // and the pill must stay clickable while a paste that can take minutes runs.
+        // Keep menus clickable during paste while suppressing target button presses.
         prop_assert_ne!(sink, Sink::Target, "{:?}", running);
-        let on_chrome = !running.chrome_unreachable()
-            && (running.pointer_over_chrome || running.popover_open || running.modal_open);
+        let on_chrome = !running.chrome_unreachable()&& (running.pointer_over_chrome || running.popover_open || running.modal_open);
         prop_assert_eq!(
             sink,
             if on_chrome { Sink::Chrome } else { Sink::Dropped },
@@ -281,7 +265,7 @@ proptest! {
         );
     }
 
-    /// And the other half: a button the target is **already** holding still gets its up, paste or
+    /// And the other half: a button the target is already holding still gets its up, paste or
     /// no paste. The press was forwarded before the paste began, so the release is owed from every
     /// state — the same clause that survives a popover.
     #[test]
@@ -298,11 +282,8 @@ proptest! {
         );
     }
 
-    /// **The property review item 1 adds, and the other half of what 4b exists to keep true.**
-    /// `viewer::state`'s invariant is that a press which was forwarded always has a release that is
-    /// forwardable; the chrome can break it from outside the reducer, because a flag can flip
-    /// between the two edges. So for **any** state at all, the up edge of a key the target is
-    /// holding goes to the target — never to the chrome, never nowhere.
+    /// A menu state change between press and release must not strand target input.
+    /// Release edges for held keys must always remain forwardable.
     #[test]
     fn the_up_of_an_outstanding_key_always_reaches_the_target(
         i in any_inputs(),
@@ -312,7 +293,6 @@ proptest! {
         outstanding.set_key(key, true);
         // The host's press, not the paste's: a key a running paste is holding is its own to
         // release, and forwarding a host key-up for it would end a character half way through
-        // (§12 Stage 4c, `RouteInputs::paste_held`).
         let mut paste_held = i.paste_held;
         paste_held.set_key(key, false);
         let i = RouteInputs { outstanding, paste_held, ..i };
@@ -337,10 +317,7 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// §12 Stage 4c — the paste job, as properties. The clause-by-clause assertions are beside the code
-// in `src/viewer/chrome/paste.rs`; what is here holds for every text and every cancel point.
-// ---------------------------------------------------------------------------------------------
+// Paste invariants across generated text and cancellation points.
 
 /// Any text made of characters US QWERTY can reach, so every compile succeeds and the properties
 /// are about the *job* rather than about the mapper.
@@ -372,7 +349,7 @@ proptest! {
         while job.next_step(now).is_some() {
             job.delivered(now);
             prop_assert!(job.sent() > last, "progress went backwards or stalled");
-            prop_assert!(job.sent() <= total);
+            prop_assert!(job.sent()<= total);
             prop_assert_eq!(job.remaining(), total - job.sent());
             prop_assert_eq!(job.remaining_duration(), paste::PACE * job.remaining() as u32);
             prop_assert_eq!(job.progress().total, total);
@@ -384,7 +361,7 @@ proptest! {
         prop_assert_eq!(job.remaining_duration(), Duration::ZERO);
     }
 
-    /// **A paste always ends with nothing held.** Run any job to completion and the target holds
+    /// A paste always ends with nothing held. Run any job to completion and the target holds
     /// nothing — the same assertion the two built-in shortcuts make, for the same reason: a paste
     /// that left Shift down would leave the target unusable and nothing local could fix it.
     #[test]
@@ -397,7 +374,7 @@ proptest! {
         prop_assert!(job.held().is_empty(), "{:?} left held", job.held());
     }
 
-    /// **Cancel from any state leaves nothing held** — once the release-all the cancellation
+    /// Cancel from any state leaves nothing held — once the release-all the cancellation
     /// reports as owed has run. The outcome names the progress it had, and the job offers no
     /// further steps.
     #[test]
@@ -422,7 +399,7 @@ proptest! {
         }
         prop_assert!(!job.is_running());
         prop_assert!(job.next_step(now).is_none());
-        // §2.6's release-all, which is what the viewer runs alongside the cancel.
+        // Match the release-all that accompanies cancellation in the viewer.
         let mut owed = cancellation.still_held;
         owed.clear();
         prop_assert!(owed.is_empty());

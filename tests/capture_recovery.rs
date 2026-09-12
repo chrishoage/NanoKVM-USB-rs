@@ -1,16 +1,4 @@
-//! Capture recovery without hardware: §6.1's Stage 2 rows, S2-1, S2-2 and S2-4 (plan §6.1).
-//!
-//! §6.1's table gives two reachable conditions and a different response to each — a stall gets
-//! "attempt restart", a disconnection gets "attempt rediscovery" — and §9.3 says the synthetic
-//! source exists so those responses can be asserted deterministically. Everything here drives
-//! the real [`Pipeline`] through a scripted source and a scripted opener; the only thing faked
-//! is the device.
-//!
-//! Nothing here sleeps as a synchronisation primitive. Where a test waits, it polls a condition
-//! with a deadline: the deadline bounds a hang, and the assertion is on the condition. Where a
-//! test asserts an *absence* (no restart happened), it first waits for a positive condition that
-//! proves the loop ran — several hundred capture errors, say — so the absence is observed rather
-//! than merely not yet observed.
+//! Stall restart, disconnect recovery, and format-watchdog behavior with fake sources.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -38,7 +26,7 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// A real 1920x1080 frame off this device (§9.1: captures are fixtures).
+/// A real 1920x1080 frame off this device.
 fn frame_1080p() -> Vec<u8> {
     fixture("mjpeg-1920x1080-01.jpg")
 }
@@ -94,7 +82,7 @@ enum Act {
     Panic,
 }
 
-/// What `restart()` does on a scripted source.
+/// What `restart` does on a scripted source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnRestart {
     /// Succeed and change nothing: the stall outlives the restart.
@@ -108,7 +96,7 @@ enum OnRestart {
     /// Report the node is gone. The pipeline must take the disconnect path, not count a failed
     /// restart.
     Disconnected,
-    /// Panic on the calling thread, exactly as `V4l2Source::restart` does when the old stream's
+    /// Panic on the calling thread, as `V4l2Source::restart` does when the old stream's
     /// `STREAMOFF` fails with anything but `ENODEV` (v4l2 module docs item 4). The pipeline must
     /// treat it as a failed restart, not as a lost device.
     Panic,
@@ -127,7 +115,7 @@ struct Recorder {
     /// `next_frame` calls, so "the loop is still running" is observable.
     calls: u64,
     /// Set while an [`OpenAct::Slow`] open is blocked inside the opener, so a test can wait for
-    /// the pipeline to really be *inside* `open()` rather than about to be.
+    /// the pipeline to really be *inside* `open` rather than about to be.
     in_slow_open: bool,
 }
 
@@ -190,8 +178,7 @@ impl FrameSource for ScriptedSource {
             Act::Panic => panic!("scripted panic, as a v4l destructor would"),
             Act::Frame(i) => {
                 let jpeg_bytes = self.frames[i % self.frames.len()].clone();
-                // A6, the same rule both real sources follow: dimensions from this frame's own
-                // start-of-frame header.
+                // SOF dimensions describe the bytes being decoded; negotiated dimensions may be stale.
                 let (width, height) = jpeg::dimensions(&jpeg_bytes)
                     .map_err(|e| CaptureError::BadFrame(e.to_string()))?;
                 let seq = self.sequence;
@@ -261,7 +248,7 @@ enum OpenAct {
     /// `open`, then fail. `V4l2Source::open` is `S_FMT`, `S_PARM`, `REQBUFS`, four `mmap`s and
     /// `QBUF`s and a `STREAMON`, each a USB control transfer to a node that has just
     /// re-enumerated, where the kernel's control timeout runs to seconds. Nothing can interrupt
-    /// that, so the pipeline must not be waiting on it when `stop()` arrives.
+    /// that, so the pipeline must not be waiting on it when `stop` arrives.
     Slow(Duration),
 }
 
@@ -312,12 +299,12 @@ fn fast(reopen_backoff: Duration, max: Duration) -> PipelineConfig {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The disconnect path (§6.1 S2-4)
+// The disconnect path
 // ---------------------------------------------------------------------------------------------
 
 /// The whole disconnect story in one test: the loss is reported, the reopen is retried on a
 /// doubling backoff that respects its cap, the reopen succeeds, frames flow again — and the
-/// renderer's last image survives the entire gap untouched (§6.1 S1-2, carried into S2-4).
+/// renderer's last image survives the entire gap untouched.
 #[test]
 fn a_disconnect_reopens_on_a_doubling_backoff_and_frames_resume() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -386,8 +373,7 @@ fn a_disconnect_reopens_on_a_doubling_backoff_and_frames_resume() {
         st.last_error
     );
 
-    // §6.1 S1-2, across the gap: the renderer's last image is still there. Nothing closed the
-    // output slot and nothing drained it.
+    // A recovery gap must preserve pending output for the renderer.
     assert!(
         out.is_pending(),
         "the last decoded frame was discarded during the gap"
@@ -419,7 +405,7 @@ fn a_disconnect_reopens_on_a_doubling_backoff_and_frames_resume() {
     // opens[1..=3] are the three failures and opens[4] the success, so the gap *before* attempt
     // k is opens[k] - opens[k-1] for k >= 2.
     let opens = lock(&rec).opens.clone();
-    assert_eq!(opens.len(), 5, "unexpected number of open() calls");
+    assert_eq!(opens.len(), 5, "unexpected number of open calls");
     let g1 = opens[2] - opens[1];
     let g2 = opens[3] - opens[2];
     let g3 = opens[4] - opens[3];
@@ -445,12 +431,12 @@ fn a_disconnect_reopens_on_a_doubling_backoff_and_frames_resume() {
     h.stop();
 }
 
-/// `stop()` during a reconnect backoff must not wait the backoff out.
+/// `stop` during a reconnect backoff must not wait the backoff out.
 ///
-/// The observable consequences are both asserted: `stop()` returns promptly, and the reconnect
-/// loop makes no further `open()` call afterwards — which is what "the thread really exited"
-/// means from outside. (The `Stopped` state itself is not observable: `stop()` consumes the
-/// handle, by Stage 1's design.)
+/// The observable consequences are both asserted: `stop` returns promptly, and the reconnect
+/// loop makes no further `open` call afterwards — which is what "the thread really exited"
+/// means from outside. (The `Stopped` state itself is not observable: `stop` consumes the
+/// handle, by design.)
 #[test]
 fn stop_during_a_reconnect_backoff_returns_promptly() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -488,10 +474,10 @@ fn stop_during_a_reconnect_backoff_returns_promptly() {
     let elapsed = t.elapsed();
     assert!(
         elapsed < Duration::from_millis(500),
-        "stop() during a 3 s reconnect backoff took {elapsed:?}"
+        "stop during a 3 s reconnect backoff took {elapsed:?}"
     );
 
-    // And it stayed stopped: no further open() attempts once stop() returned.
+    // And it stayed stopped: no further open attempts once stop returned.
     let settle = Instant::now() + Duration::from_millis(200);
     while Instant::now() < settle {
         std::thread::sleep(Duration::from_millis(10));
@@ -499,7 +485,7 @@ fn stop_during_a_reconnect_backoff_returns_promptly() {
     assert_eq!(
         lock(&rec).opens.len(),
         attempts_at_stop,
-        "the reconnect loop kept trying after stop() returned"
+        "the reconnect loop kept trying after stop returned"
     );
 }
 
@@ -556,7 +542,7 @@ fn a_panicking_destructor_does_not_kill_the_thread_or_skip_the_reopen() {
 }
 
 /// A pipeline whose device is not there at all when it starts must retry rather than die: this
-/// is "start the client, then plug the dongle in", and it is the same loop S2-4 uses.
+/// is "start the client, then plug the dongle in", and it is the same loop used after disconnection.
 #[test]
 fn a_device_absent_at_startup_is_retried_rather_than_fatal() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -591,7 +577,7 @@ fn a_device_absent_at_startup_is_retried_rather_than_fatal() {
     h.stop();
 }
 
-/// Stage 1's entry point is unchanged: one source, no rediscovery, and the disconnection is
+/// entry point is unchanged: one source, no rediscovery, and the disconnection is
 /// terminal. A caller that handed over a device it opened itself has given the pipeline nothing
 /// to reopen, and inventing an attempt would be a lie about what was tried.
 #[test]
@@ -702,7 +688,7 @@ fn stats_never_report_running_while_disconnected() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The stall path (§6.1 S2-1: "attempt restart")
+// The stall path
 // ---------------------------------------------------------------------------------------------
 
 fn stall_config(restart_after: Option<Duration>) -> PipelineConfig {
@@ -716,7 +702,7 @@ fn stall_config(restart_after: Option<Duration>) -> PipelineConfig {
 }
 
 /// A stall with no error to explain it gets a restart, then another one every `restart_after`
-/// for as long as it lasts (§6.1: the stall row's response is "attempt restart").
+/// for as long as it lasts.
 #[test]
 fn a_stall_restarts_the_stream_and_keeps_restarting_while_it_lasts() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -748,7 +734,7 @@ fn a_stall_restarts_the_stream_and_keeps_restarting_while_it_lasts() {
     assert_eq!(st.state, PipelineState::Stalled, "{st:?}");
     assert_eq!(
         st.disconnects, 0,
-        "a stall must never be reported as a disconnection (§6.1): {st:?}"
+        "a stall must never be reported as a disconnection : {st:?}"
     );
     h.stop();
 }
@@ -801,10 +787,7 @@ fn restart_after_none_never_restarts() {
     wait_for("a long stall", PATIENCE, || h.stats().capture_errors >= 20);
     let st = h.stats();
     assert_eq!(st.stream_restarts, 0, "{st:?}");
-    assert!(
-        lock(&rec).restarts.is_empty(),
-        "restart() was called anyway"
-    );
+    assert!(lock(&rec).restarts.is_empty(), "restart was called anyway");
     assert_eq!(st.state, PipelineState::Stalled, "{st:?}");
     h.stop();
 }
@@ -858,11 +841,11 @@ fn a_restart_that_reports_disconnected_takes_the_disconnect_path() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Resolution change (§6.1 S2-3 groundwork, §6/A6)
+// Resolution change
 // ---------------------------------------------------------------------------------------------
 
 /// A target that changes mode mid-stream: 1920x1080, then 1280x720, then back. Every decoded
-/// frame must be correctly sized for its own header (A6), the changes must be counted, and the
+/// frame must be correctly sized for its own header, the changes must be counted, and the
 /// decoder's reused scratch buffer must not leave the smaller frame carrying anything of the
 /// larger one — asserted by comparing against a fresh decode of the same fixture.
 #[test]
@@ -880,8 +863,7 @@ fn a_resolution_switch_produces_correctly_sized_frames_at_every_step() {
         acts.push(Act::Frame(0));
     }
     let mut source = ScriptedSource::new(&rec, Arc::clone(&frames), acts, Act::Frame(0));
-    // Slower than a decode (2.4 ms at 1080p, A19) so the consumer below sees every frame rather
-    // than the pipeline dropping them: this test is about each step, not about drop behaviour.
+    // Pace capture slower than decoding so this test observes each recovery step.
     source.pace = Duration::from_millis(15);
     let h = Pipeline::start(Box::new(source), stall_config(None));
     let out = h.output();
@@ -1010,7 +992,7 @@ fn a_panic_on_the_capture_thread_is_recovered_from_when_an_opener_is_available()
             rec: Arc::clone(&rec),
         })
     };
-    // A backoff long enough to read the panic message off `stats()` before the reopen clears it.
+    // A backoff long enough to read the panic message off `stats` before the reopen clears it.
     let h = Pipeline::start_with_opener(
         opener,
         fast(Duration::from_millis(300), Duration::from_millis(300)),
@@ -1069,15 +1051,7 @@ fn the_bytes_window_resets_when_taken() {
 // The review's findings, pinned (REVIEW.md #1-#4)
 // ---------------------------------------------------------------------------------------------
 
-/// **Review finding #1.** A `restart()` that *panics* is a failed restart, never a lost device.
-///
-/// `V4l2Source::restart` drops the old stream, and the `v4l` destructors `panic!` on any teardown
-/// ioctl that fails with something other than `ENODEV` (v4l2 module docs item 4) — which is
-/// exactly the state a genuinely wedged stream is in, and the only state the stall timer exists
-/// to attack. Before the fix that panic reached the capture loop's `catch_unwind` and became
-/// `Step::Lost`: on `Pipeline::start` — the entry point `src/main.rs` uses, now with
-/// `restart_after` on by default — every no-signal period would have ended with `disconnects = 1`
-/// and the capture thread exited, from a stall Stage 1 survived indefinitely (§6.1 S1-1/S1-2).
+/// A restart panic must count as a failed restart, not a disconnected source.
 #[test]
 fn a_panicking_restart_is_a_failed_restart_not_a_lost_device() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -1103,7 +1077,7 @@ fn a_panicking_restart_is_a_failed_restart_not_a_lost_device() {
     assert_eq!(
         st.disconnects, 0,
         "a restart that panicked was reported as a lost device; a stall must not be turned \
-         into a disconnection (§6.1, A5): {st:?}"
+         into a disconnection: {st:?}"
     );
     assert_eq!(
         st.state,
@@ -1128,14 +1102,7 @@ fn a_panicking_restart_is_a_failed_restart_not_a_lost_device() {
     );
 }
 
-/// **Review finding #2.** `stop()` must return promptly even while `opener.open()` is in flight.
-///
-/// The reopen *backoff* was already interruptible; the `open()` after it was not, and `stop()`
-/// joins the capture thread. A real `V4l2Source::open` against a device that has just
-/// re-enumerated is a chain of USB control transfers with second-scale kernel timeouts, so a user
-/// closing the viewer at the wrong moment waited the whole open out — measured at 1.999 s against
-/// a 2 s open. The open now runs on a helper thread the capture thread abandons; see
-/// `PipelineHandle::stop` for the bound and the residual.
+/// Shutdown must remain bounded while a source opener is blocked.
 #[test]
 fn stop_during_a_reopen_returns_promptly() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -1165,7 +1132,7 @@ fn stop_during_a_reopen_returns_promptly() {
         opener,
         fast(Duration::from_millis(5), Duration::from_millis(20)),
     );
-    wait_for("the capture thread to be inside open()", PATIENCE, || {
+    wait_for("the capture thread to be inside open", PATIENCE, || {
         lock(&rec).in_slow_open
     });
 
@@ -1174,23 +1141,16 @@ fn stop_during_a_reopen_returns_promptly() {
     let elapsed = t.elapsed();
     assert!(
         elapsed < Duration::from_millis(500),
-        "stop() called while the pipeline was inside opener.open() took {elapsed:?}; \
+        "stop called while the pipeline was inside opener.open took {elapsed:?}; \
          shutdown is only prompt between opens, not during one"
     );
     assert!(
         elapsed < slow,
-        "stop() waited the {slow:?} open out ({elapsed:?})"
+        "stop waited the {slow:?} open out ({elapsed:?})"
     );
 }
 
-/// **Review finding #3.** A pipeline that recovered must not go on reporting the failure it
-/// recovered from.
-///
-/// `disconnected_since` was cleared inside the same lock acquisition that sets `Running`, and the
-/// error string was left beside it saying the opposite, for the rest of the process's life. The
-/// one consumer this slice ships — `examples/capture-probe.rs` — prints a line per change in
-/// `last_error` and has an "error cleared" arm that could never fire, so a q12 timeline showed a
-/// device that recovered an hour ago as still erroring.
+/// Successful recovery must clear the old error so status reflects the live stream.
 #[test]
 fn last_error_is_cleared_by_a_successful_reopen() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -1247,15 +1207,8 @@ fn last_error_is_cleared_by_a_successful_reopen() {
     assert_eq!(st.disconnected_since, None, "{st:?}");
 }
 
-/// From the review's "checked and clean" column, kept because the negative result is worth
-/// keeping: a frame captured *before* a disconnection cannot be delivered after the reopen
-/// carrying a pre-unplug timestamp.
-///
-/// The compressed slot holds at most one frame and the decode thread is always parked in
-/// `wait_take`, so anything the capture thread put there is consumed long before the backoff
-/// ends. The second device's sequence numbers are given a disjoint range, so a frame that crossed
-/// the gap would be unmistakable. (The *decoded* frame that survives in the output slot is §6.1
-/// S1-2 working as intended, and is asserted elsewhere.)
+/// The reopened stream must deliver fresh timestamps after the recovery backoff.
+/// The renderer may retain its last decoded image during the gap.
 #[test]
 fn no_pre_disconnect_frame_is_delivered_after_the_reopen() {
     let frames = Arc::new(vec![frame_1080p()]);
@@ -1308,14 +1261,8 @@ fn no_pre_disconnect_frame_is_delivered_after_the_reopen() {
     );
 }
 
-/// **Review finding #4.** A child process spawned by a test must not survive the test.
-///
-/// H-B2 spawns `scripts/usb-replug.py` and reaches its `wait()` only past eight `assert!`s;
-/// `std::process::Child` does not kill on drop, so any of those failures left a script that
-/// resets USB devices running unsupervised and unreaped — against `00-common.md`'s "kill every
-/// process you start". The fix is `support::child_guard::ChildGuard`, and this is the test that
-/// the guard actually does it: `sleep` stands in for the script, and the scope that spawned it
-/// unwinds the way H-B2's most likely failure does.
+/// An assertion before `wait` must not leave a USB reset child running.
+/// The guard must kill and reap on unwind.
 #[test]
 fn a_spawned_child_is_killed_when_the_scope_that_spawned_it_unwinds() {
     use std::process::Command;
@@ -1331,7 +1278,7 @@ fn a_spawned_child_is_killed_when_the_scope_that_spawned_it_unwinds() {
             )
             .expect("spawning the stand-in for scripts/usb-replug.py");
             publish.store(guard.pid().expect("a pid"), Ordering::SeqCst);
-            // Fail an assertion the way H-B2 does before it ever reaches `wait()`.
+            // Simulate an assertion failure before the reset child is awaited.
             assert_eq!(
                 0, 1,
                 "stands in for `the node never went away with --method reset`"
@@ -1358,7 +1305,7 @@ fn a_spawned_child_is_killed_when_the_scope_that_spawned_it_unwinds() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The format watchdog (§6/A6, C4): the device is in the wrong mode, not the client
+// The format watchdog: the device is in the wrong mode, not the client
 // ---------------------------------------------------------------------------------------------
 //
 // Measured on 2026-09-11: a live viewer run through a USB reset reopened the node correctly —
@@ -1407,7 +1354,7 @@ fn watchdog_frames() -> Arc<Vec<Vec<u8>>> {
     Arc::new(vec![frame_1080p(), frame_640x480()])
 }
 
-/// **The benign transient must not be answered.** A6: after an idle period the device emits up to
+/// The benign transient must not be answered. after an idle period the device emits up to
 /// eight frames at the previous resolution — three here — and then the right ones. That is not a
 /// stuck stream and restarting it would cost frames for nothing.
 #[test]
@@ -1437,10 +1384,7 @@ fn a_short_wrong_size_transient_never_triggers_the_format_watchdog() {
         "the watchdog fired on the benign A6 transient: {st:?}"
     );
     assert_eq!(st.format_mismatch_accepted, 0, "{st:?}");
-    assert!(
-        lock(&rec).restarts.is_empty(),
-        "restart() was called anyway"
-    );
+    assert!(lock(&rec).restarts.is_empty(), "restart was called anyway");
     assert_eq!(st.last_resolution, Some((1920, 1080)));
     assert_eq!(
         st.resolution_changes, 1,
@@ -1448,7 +1392,7 @@ fn a_short_wrong_size_transient_never_triggers_the_format_watchdog() {
     );
 }
 
-/// **The measured bug.** Frames keep arriving at the device's power-on 640x480 while `S_FMT`
+/// The measured bug. Frames keep arriving at the device's power-on 640x480 while `S_FMT`
 /// negotiated 1920x1080; the watchdog restarts the stream once, the restart re-commits the
 /// format, and that is the end of it.
 #[test]
@@ -1496,15 +1440,13 @@ fn frames_stuck_in_the_wrong_mode_are_restarted_once_and_the_stats_say_so() {
     assert_eq!(
         lock(&rec).restarts.len(),
         1,
-        "restart() was called more than once"
+        "restart was called more than once"
     );
     assert_eq!(st.last_resolution, Some((1920, 1080)));
 }
 
-/// **The bound.** A unit that does not rescale internally would legitimately deliver a different
-/// size forever (A6, C4 §6 item 3), so the watchdog gets a budget: N restarts on a doubling
-/// backoff, then the SOF dimensions are accepted as the truth, said once, and the stream is left
-/// alone with the frames still flowing.
+/// Bound recovery attempts for devices that consistently deliver another size.
+/// After the budget is exhausted, accept SOF dimensions and keep frames flowing.
 #[test]
 fn a_stream_that_never_reaches_the_negotiated_mode_is_restarted_n_times_then_accepted() {
     let frames = watchdog_frames();
@@ -1533,7 +1475,7 @@ fn a_stream_that_never_reaches_the_negotiated_mode_is_restarted_n_times_then_acc
     // The backoff really doubled. `restarts[k]` is the k-th watchdog restart, and the wait
     // before it is `grace * 2^(k-1)`.
     let restarts = lock(&rec).restarts.clone();
-    assert_eq!(restarts.len(), limit as usize, "restart() call count");
+    assert_eq!(restarts.len(), limit as usize, "restart call count");
     let g1 = restarts[1] - restarts[0];
     let g2 = restarts[2] - restarts[1];
     assert!(
@@ -1574,8 +1516,8 @@ fn a_stream_that_never_reaches_the_negotiated_mode_is_restarted_n_times_then_acc
     assert_eq!(st.reopens, 0, "{st:?}");
 }
 
-/// A watchdog restart that **panics** is a failed restart, not a lost device — the same rule the
-/// stall restart follows (C4), because `V4l2Source::restart` drops the old stream and those
+/// A watchdog restart that panics is a failed restart, not a lost device — the same rule the
+/// stall restart follows, because `V4l2Source::restart` drops the old stream and those
 /// destructors panic on any teardown ioctl that fails with something other than `ENODEV`.
 #[test]
 fn a_panicking_watchdog_restart_is_a_failed_restart_not_a_lost_device() {
@@ -1596,7 +1538,7 @@ fn a_panicking_watchdog_restart_is_a_failed_restart_not_a_lost_device() {
     let st = h.stats();
     let t = Instant::now();
     h.stop();
-    assert!(t.elapsed() < Duration::from_secs(2), "stop() hung");
+    assert!(t.elapsed() < Duration::from_secs(2), "stop hung");
 
     assert_eq!(st.format_mismatch_restarts, limit as u64, "{st:?}");
     assert_eq!(
@@ -1617,7 +1559,7 @@ fn a_panicking_watchdog_restart_is_a_failed_restart_not_a_lost_device() {
     );
 }
 
-/// **The live case, end to end.** The device is lost, the pipeline reopens it, the reopened
+/// The live case, end to end. The device is lost, the pipeline reopens it, the reopened
 /// stream comes up in the wrong mode — and the watchdog, re-armed by the reopen, restarts it.
 /// This is the run recorded on 2026-09-11, with the fix in place.
 #[test]
@@ -1693,7 +1635,7 @@ fn the_format_watchdog_re_arms_after_a_reopen() {
 // review's premise wrong.
 // ---------------------------------------------------------------------------------------------
 
-/// **A gap must not buy a restart.** The grace clock is wall clock from the first mismatched
+/// A gap must not buy a restart. The grace clock is wall clock from the first mismatched
 /// frame, so a gap in which no frame arrives at all does count towards it — and on its own that
 /// would let two mismatched frames either side of a gap shorter than `restart_after` (so the
 /// stall path does not own it, and does not clear the clock) spend a restart on the evidence of
@@ -1711,7 +1653,7 @@ fn g_a_stall_does_not_stop_the_format_watchdog_clock() {
     // The gap between the two mismatched frames is ~12 scripted timeouts (5 ms of pace plus the
     // pipeline's 20 ms error backoff each, escalating to 100 ms after ten) — comfortably over
     // the 200 ms grace and comfortably under the 2 s `restart_after`, so this is a hiccup the
-    // stall path deliberately does not answer.
+    // stall path does not answer.
     let mut acts = vec![Act::Frame(1)];
     acts.extend(std::iter::repeat_n(Act::Timeout, 12));
     acts.push(Act::Frame(1));
@@ -1742,15 +1684,15 @@ fn g_a_stall_does_not_stop_the_format_watchdog_clock() {
         st.format_mismatch_restarts, 0,
         "the watchdog spent a restart on two mismatched frames either side of a stall, so the \
          grace clock ran while no frame was arriving — the opposite of what \
-         format_mismatch_grace documents: {st:?} (restart() calls: {restarts})"
+         format_mismatch_grace documents: {st:?} (restart calls: {restarts})"
     );
 }
 
-/// **The transient is bounded in frames, so the gate that answers it has to be too.** A6: "up to
+/// The transient is bounded in frames, so the gate that answers it has to be too. "up to
 /// eight frames at the previous resolution after an idle period". A time-only grace converts that
 /// into ~135 ms at 60 fps and into 800 ms at 10 fps, where a flat 500 ms grace would buy a restart
 /// the stream did not need, at the worst possible moment — it has just come back. The frame gate
-/// (`PipelineConfig::format_mismatch_frames`, 12 > A6's 8) is what makes the transient
+/// (`PipelineConfig::format_mismatch_frames`, 12 > 8) is what makes the transient
 /// un-triggerable at any rate; this test runs it at the shipped 500 ms grace and a tenth of the
 /// frame rate the grace was justified at.
 #[test]
@@ -1785,24 +1727,24 @@ fn g_the_eight_frame_transient_is_restarted_when_the_stream_is_slow() {
     );
 }
 
-/// **The escalation, and its bound.** *Rewritten by the fixer from the reviewer's
+/// The escalation, and its bound. *Rewritten by the fixer from the reviewer's
 /// `g_an_unfixable_mismatch_never_escalates_to_a_reopen`, and this note is why.*
 ///
-/// The review argued that `restart()` — `REQBUFS`/`QBUF`/`STREAMON` on the same fd, with no
+/// The review argued that `restart` — `REQBUFS`/`QBUF`/`STREAMON` on the same fd, with no
 /// `S_FMT` and no `S_PARM` — is strictly weaker than the reopen that had already failed, and that
 /// a reopen "was never observed to recover the mode", so the watchdog should escalate straight to
 /// one. The first half is true about the *ioctls*; the second half is contradicted by the
 /// hardware. The second live run of 2026-09-11
 /// (`viewer-live-replug2.log`, 17:45:55–17:45:56) is a full reopen coming up at 640x480, the
-/// watchdog restarting the stream after 516.7 ms, and the **very next frame at 1920x1080**. One
+/// watchdog restarting the stream after 516.7 ms, and the very next frame at 1920x1080. One
 /// restart, fixed, on the exact failure this watchdog was written for. The likely mechanism is
 /// timing rather than strength — the reopen lands about half a second after re-enumeration while
 /// the device is still settling, and a `STREAMON` half a second later re-commits — which is also
 /// why repeating the reopen *later* is the right escalation rather than the first move.
 ///
-/// So `restart()` stays the first remedy and the reviewer's escalation is adopted behind it, with
+/// So `restart` stays the first remedy and the reviewer's escalation is adopted behind it, with
 /// the bound the review itself asked for. The contract this test pins is the bound: a stream that
-/// nothing fixes gets its restart budget, then **exactly one** reopen with a fresh budget, then
+/// nothing fixes gets its restart budget, then one reopen with a fresh budget, then
 /// acceptance — and no further reopen, ever, for that run of mismatched frames. A device that
 /// never reaches the negotiated mode must end in acceptance, not in a reopen loop.
 #[test]
@@ -1817,9 +1759,8 @@ fn g_an_unfixable_mismatch_escalates_to_exactly_one_reopen_then_accepts() {
         Box::new(ScriptedOpener {
             acts: vec![OpenAct::Give].into(),
             tail: OpenAct::Give,
-            // Every open gives the same thing: a unit that simply does not deliver the negotiated
-            // mode. Neither a `STREAMON` nor a fresh open changes it, which is the hardware A6
-            // warns about — one that does not rescale internally.
+            // A permanently different size must terminate recovery attempts even when a
+            // fresh open cannot restore the requested mode.
             make: Box::new(move |_| {
                 watched_source(&rec2, &frames, vec![], Act::Frame(1), OnRestart::Nothing)
             }),
@@ -1878,7 +1819,7 @@ fn g_an_unfixable_mismatch_escalates_to_exactly_one_reopen_then_accepts() {
     );
 }
 
-/// **The escalation earns its place.** The same shape as the test above, except that the device
+/// The escalation earns its place. The same shape as the test above, except that the device
 /// *can* be fixed by a fresh open — the `v4l2-ctl` outcome of 2026-09-11, where a new open of the
 /// node got 1920x1080 from frame one. The restarts do nothing, the one escalation reopen recovers
 /// the mode, and nothing is ever accepted.
@@ -1941,11 +1882,11 @@ fn g_the_escalation_reopen_recovers_a_stream_no_restart_could_fix() {
     assert_eq!(st.last_resolution, Some((1920, 1080)));
 }
 
-/// **Acceptance must not wait out one more doubled grace.** The doubling exists to space
+/// Acceptance must not wait out one more doubled grace. The doubling exists to space
 /// restarts out; once the budget is spent there is no restart left to space, so a further
 /// `grace * 2^limit` — 4 s at the shipped defaults — would be pure silence, and it would arrive
-/// as `format_mismatch_accepted` long after the watchdog had in fact given up. H-B2's failure
-/// message would then print "accepted 0 time(s)" in exactly the case where the watchdog had given
+/// as `format_mismatch_accepted` long after the watchdog had in fact given up. H-failure
+/// message would then print "accepted 0 time(s)" in the case where the watchdog had given
 /// up, and read as "still trying". So the budget is checked *before* the doubled gate and the
 /// decision comes one plain grace after the last restart.
 ///
@@ -1966,7 +1907,7 @@ fn g_acceptance_waits_one_more_doubled_grace_after_the_last_restart() {
     let last_restart = *lock(&rec)
         .restarts
         .last()
-        .expect("the budget was spent, so restart() was called");
+        .expect("the budget was spent, so restart was called");
     wait_for("the acceptance", PATIENCE, || {
         h.stats().format_mismatch_accepted >= 1
     });
@@ -1980,7 +1921,7 @@ fn g_acceptance_waits_one_more_doubled_grace_after_the_last_restart() {
     );
 }
 
-/// **The mirror of the clock finding: a stall restart must not wipe the watchdog's evidence.**
+/// The mirror of the clock finding: a stall restart must not wipe the watchdog's evidence.
 ///
 /// A gap *longer* than `restart_after` fires the stall restart, and that restart used to clear
 /// `mismatch_since` — without refilling the watchdog's budget, so a stream that is both
@@ -2025,7 +1966,7 @@ fn g_a_stall_restart_does_not_wipe_the_format_watchdogs_evidence() {
     );
 }
 
-/// **Verification, not an attack.** The slice claims a frame at the negotiated size undoes an
+/// Verification, not an attack. The slice claims a frame at the negotiated size undoes an
 /// acceptance and re-arms the watchdog with a full budget, and that a later mismatch starts the
 /// grace again from the top. It does.
 #[test]

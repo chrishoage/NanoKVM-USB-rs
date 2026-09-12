@@ -1,43 +1,8 @@
-//! Where an input event goes: the target, the chrome, or nowhere (plan §12 Stage 4b).
+//! Pure routing between target input and viewer controls.
 //!
-//! This is a pure rule, shaped like [`crate::viewer::state`], for the same reason: the sentence
-//! "the chrome never steals a key the target was going to get" is a correctness claim, and a
-//! correctness claim belongs in a function with no window, no egui context and no clock in scope
-//! so that every clause of it can be asserted without a display.
-//!
-//! # Why this does not read `egui_winit::EventResponse::consumed`
-//!
-//! Because `consumed` is wrong for a KVM, measurably and in three separate ways:
-//!
-//! 1. **Tab is consumed unconditionally.** `egui_winit::State::on_window_event` reports
-//!    `consumed: true` for the Tab key whether or not egui has focus, or even a widget
-//!    (egui-winit 0.33.3 `src/lib.rs:415-418`: *"When pressing the Tab key, egui focuses the first
-//!    focusable element, hence Tab always consumes."*). Routing on it would swallow Tab — on a
-//!    KVM, to a shell.
-//! 2. **It lags by a frame.** `consumed` for keys is `egui_ctx.wants_keyboard_input()`, which
-//!    reflects the UI built *last* frame. The routing decision for the key in hand cannot be made
-//!    from a predicate about the previous one.
-//! 3. **Pointer motion is not covered at all.** Press and release use `wants_pointer_input()` but
-//!    `CursorMoved` uses `is_using_pointer()` (lib.rs:326), so merely moving the cursor over the
-//!    pill reports `consumed: false` and the motion would still be forwarded to the target.
-//!
-//! So the gate is at the source and it is ours: [`route_key`] and [`route_pointer`] decide, and
-//! only a [`Sink::Chrome`] verdict hands the raw `WindowEvent` to `egui_winit`. `input_map` is
-//! unchanged — it still discards host repeat and still intercepts the release key — and this runs
-//! after it.
-//!
-//! # The two things that always get out
-//!
-//! [`KeyAction::Release`] — and [`KeyAction::Paste`], the other viewer-local binding on the same
-//! physical key — routes to [`Sink::Target`] from **every** state: modal open, popover
-//! open, pointer locked in relative capture, paste running. §12 Stage 1 requires the way out to
-//! be reachable and §12 Stage 4c requires the never-forwarded surface to stay exactly one key.
-//! A chrome that could trap the release binding would trap the user's keyboard.
-//!
-//! And so does **the up edge of a press the target already owns** — see [`Outstanding`]. Without
-//! that clause the chrome breaks [`crate::viewer::state`]'s invariant from outside the reducer:
-//! hold Ctrl, click the pill so a popover opens, let go of Ctrl, and the key-up has gone to egui
-//! while Ctrl stays down on the target with no event left that could lift it.
+//! Decide the destination before consulting egui, which consumes some keys even when the
+//! target needs them. Track outstanding presses so their release reaches the same owner.
+//! During paste, physical input cannot interleave with generated keystrokes.
 
 use crate::proto::HidKey;
 use crate::viewer::app::PointerMode;
@@ -54,13 +19,13 @@ pub enum Sink {
     /// Hand the raw `WindowEvent` to `egui_winit` and nothing else.
     Chrome,
     /// Deliver nowhere. A host key arriving mid-paste corrupts the pasted text and a click moves
-    /// the focus out from under it (§12 Stage 4c), and a key `input_map` already swallowed has no
+    /// the focus out from under it, and a key `input_map` already swallowed has no
     /// destination by definition.
     Dropped,
 }
 
 /// The class of pointer event being routed. The three winit gives us, named as themselves so the
-/// rule reads as the plan's sentence rather than as a winit enum.
+/// rule reads as sentence rather than as a winit enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerKind {
     /// `CursorMoved`, or `DeviceEvent::MouseMotion` in relative mode.
@@ -75,12 +40,12 @@ pub enum PointerKind {
     Wheel,
 }
 
-/// The presses the **target** owns: what the viewer has forwarded and not yet sent an up for.
+/// The presses the target owns: what the viewer has forwarded and not yet sent an up for.
 ///
 /// [`crate::viewer::state`]'s invariant is *"a press that was forwarded always has a release that
 /// is forwardable"*, and the chrome can break it from outside the reducer — a flag flipping
 /// between a press and its release is enough. So the up edge of anything in this set routes to
-/// [`Sink::Target`] from every state, exactly like the release key.
+/// [`Sink::Target`] from every state, like the release key.
 ///
 /// Bit sets rather than a `Vec`, so [`RouteInputs`] stays `Copy` and the rule allocates nothing on
 /// the event loop. A key-up for something not in the set is routed by the ordinary clauses: the
@@ -145,9 +110,9 @@ impl Outstanding {
     /// Every key the target is holding: usages in ascending order, then the modifiers.
     ///
     /// That order is the one a release must go out in for the target never to see a usage without
-    /// the modifier it was pressed under — the same rule [`super::shortcut::transitions`] applies
+    /// the modifier it was pressed under — the same rule `super::shortcut::transitions` applies
     /// within a step, read backwards, which is why the modifiers come *last*. It is what
-    /// [`super::paste::PasteJob`] builds its opening release prelude from (§12 Stage 4c).
+    /// [`super::paste::PasteJob`] builds its opening release prelude from.
     pub fn held_keys(&self) -> Vec<HidKey> {
         let mut out = Vec::new();
         for usage in 0u16..=255 {
@@ -169,7 +134,7 @@ impl Outstanding {
     ///
     /// The other half of [`super::paste::PasteJob`]'s release prelude: a paste runs for minutes,
     /// and a button the viewer forwarded a press for and never released is a drag on a live
-    /// desktop for every one of them (§12 Stage 4c).
+    /// desktop for every one of them.
     pub fn held_buttons(&self) -> Vec<u8> {
         (0..8)
             .map(|bit| 1u8 << bit)
@@ -177,7 +142,7 @@ impl Outstanding {
             .collect()
     }
 
-    /// Forget everything: what a release-all does to the target's state (§2.6).
+    /// Forget everything: what a release-all does to the target's state.
     pub fn clear(&mut self) {
         *self = Outstanding::default();
     }
@@ -196,18 +161,17 @@ pub struct RouteInputs {
     /// Absolute or relative, from [`crate::viewer::ViewerConfig`] as the chrome may have changed
     /// it.
     pub pointer: PointerMode,
-    /// **Our** popover flag, not egui's. A popover the chrome opened is a fact the event loop
+    /// Our popover flag, not egui's. A popover the chrome opened is a fact the event loop
     /// knows synchronously; `Context::wants_keyboard_input()` is last frame's opinion of it.
     pub popover_open: bool,
-    /// A modal dialog is up. Reserved: 4b ships no modal (§12 Stage 4b puts the settings modal
-    /// out of scope), but the clause is in the plan and is cheaper to carry than to retrofit.
+    /// Whether a modal blocks target input. Reserved for callers that provide a modal.
     pub modal_open: bool,
     /// The pointer is inside the pill or an open popover, by [`super::hit::HitAreas`] — our own
     /// rectangle in physical pixels, not `Context::is_pointer_over_area()`.
     pub pointer_over_chrome: bool,
-    /// A clipboard paste is being typed into the target (§12 Stage 4c).
+    /// A clipboard paste is being typed into the target.
     pub paste_running: bool,
-    /// The pointer grab is actually in force — `App::grab` is `Some`.
+    /// The pointer grab is in force — `App::grab` is `Some`.
     ///
     /// Not implied by relative mode: [`crate::viewer::app`]'s `grab_pointer` tries `Locked` and
     /// then `Confined` and logs a warning when a compositor refuses both, and on such a
@@ -217,8 +181,8 @@ pub struct RouteInputs {
     pub pointer_locked: bool,
     /// What the target is holding because this viewer told it to. See [`Outstanding`].
     pub outstanding: Outstanding,
-    /// The subset of [`RouteInputs::outstanding`] that a **running paste** put down, rather than
-    /// the user (§12 Stage 4c).
+    /// The subset of [`RouteInputs::outstanding`] that a running paste put down, rather than
+    /// the user.
     ///
     /// Clause 2 exists for keys the *host* is holding: a press forwarded from this keyboard must
     /// have its release forwarded, whatever the flags did in between. A paste's own presses are
@@ -236,10 +200,9 @@ pub struct RouteInputs {
 impl RouteInputs {
     /// Whether the pointer is locked to the window and the chrome is therefore unreachable.
     ///
-    /// Under a locked pointer winit delivers no `CursorMoved` at all (q6b, and
-    /// `app.rs`'s `CursorMoved` arm says so), so there is no way to move onto the pill and no way
+    /// Under a locked pointer winit delivers no `CursorMoved` at all (`app.rs`'s `CursorMoved` arm says so), so there is no way to move onto the pill and no way
     /// to click it. Saying that here, once, is better than every clause re-deriving it — and it
-    /// requires the grab to be **in force**, not merely asked for.
+    /// requires the grab to be in force, not merely asked for.
     ///
     /// Public because it is half of the routing rule rather than an implementation detail: the
     /// proptests in `tests/viewer_chrome.rs` state their expectations in terms of it, and a test
@@ -252,37 +215,16 @@ impl RouteInputs {
     }
 }
 
-/// Where a key event goes.
+/// Route a key action by capture, ownership, and paste state.
 ///
-/// The clauses, in the order they are applied and with the one place this deviates from the
-/// research design noted:
-///
-/// 1. [`KeyAction::Release`] → [`Sink::Target`], from every state. See the module docs.
-/// 2. The **up edge of a key the target is holding because the host pressed it** →
-///    [`Sink::Target`], from every state. The press was forwarded, so the release must be
-///    forwardable, whatever happened to the flags in between ([`Outstanding`]). A key a *running
-///    paste* is holding is excluded — see [`RouteInputs::paste_held`].
-/// 3. A paste is running → [`Sink::Dropped`]. **The research design put this clause after the
-///    relative-capture clause; it is before it here.** The two overlap in practice — a paste can
-///    only run while captured, and capture can be in relative mode — and with the design's order a
-///    host keystroke during a relative-mode paste would be forwarded to the target and corrupt the
-///    text, which is exactly what §12 Stage 4c forbids. Nothing else changes: the release key is
-///    already out at clause 1 and still cancels the paste.
-/// 4. The pointer is locked in relative capture → [`Sink::Target`]: the chrome cannot be reached,
-///    so it cannot be owed anything.
-/// 5. A popover or a modal is open → [`Sink::Chrome`]. This is the reference's
-///    `isKeyboardEnable = false`, and it is the only state in which the chrome takes keys at all.
-/// 6. Otherwise → [`Sink::Target`]. **Including Tab**, which is the whole reason this function
-///    exists.
-///
-/// [`KeyAction::Swallowed`] and [`KeyAction::Unmapped`] are [`Sink::Dropped`] in every state:
-/// `input_map` has already decided they go nowhere, and this function is total so that a caller
-/// cannot forget one.
+/// Release actions always reach the reducer. A target-owned physical release keeps
+/// its owner unless paste owns that key. Menu and paste state then determine whether
+/// ordinary input is local, forwarded, or dropped.
 pub fn route_key(i: &RouteInputs, action: KeyAction) -> Sink {
     match action {
         // 1. The way out, from everywhere.
         KeyAction::Release => Sink::Target,
-        // 1b. The paste chord, which is viewer-local exactly like the release key and is never
+        // 1b. The paste chord, which is viewer-local like the release key and is never
         // forwarded. [`resolve_paste_chord`] has already turned it into `Release` if a paste is
         // running, so reaching here means none is; the arm is unconditional anyway, because a
         // trigger the chrome could swallow is a trigger the user cannot reach.
@@ -309,19 +251,8 @@ pub fn route_key(i: &RouteInputs, action: KeyAction) -> Sink {
     }
 }
 
-/// What the paste chord means right now: start one, or cancel the one that is running.
-///
-/// §12 Stage 4c reserves **one** never-forwarded surface — the release key — and hangs the paste
-/// trigger off it as `Shift+Pause`. That leaves one question: what does `Shift+Pause` mean while a
-/// paste is already running? **Release wins.** A second trigger must not restart a paste that is
-/// half-typed, and the user pressing the chord again mid-paste is far more likely to want out of
-/// it than to want it again; §2.6's release-all is also the only thing that makes "cancel" mean
-/// anything, since it is what actually lifts the keys.
-///
-/// It is a function of its own, applied before [`route_key`], because it is a *meaning* and not a
-/// destination: turned into [`KeyAction::Release`] here, everything downstream — the routing, the
-/// reducer's release sequence, the §2.6 cancellation — is the path that already exists and is
-/// already tested, rather than a second one that would have to be kept equivalent.
+/// Resolve the paste chord as start when idle or release when already pasting.
+/// A second press must cancel the partial paste instead of restarting it.
 pub fn resolve_paste_chord(action: KeyAction, paste_running: bool) -> KeyAction {
     match action {
         KeyAction::Paste if paste_running => KeyAction::Release,
@@ -329,46 +260,19 @@ pub fn resolve_paste_chord(action: KeyAction, paste_running: bool) -> KeyAction 
     }
 }
 
-/// Where a pointer event goes.
+/// Route a pointer event in priority order:
 ///
-/// 1. The **up edge of a button the target is holding** → [`Sink::Target`], from every state. A
-///    press forwarded over the video whose drag then crossed the pill would otherwise have its
-///    release eaten by egui and leave the button down on a live desktop ([`Outstanding`]).
-/// 2. The pointer is over the pill or a popover, or a popover or modal is open → [`Sink::Chrome`]
-///    — **including while a paste runs**. A popover open captures the pointer even off the
-///    rectangle so that a click outside it dismisses it rather than landing on the target: a click
-///    on a live desktop can launch or destroy something (`CLAUDE.md`), and "the click that closed
-///    the menu" must never be one. Dismissal itself is the chrome's job, not this function's:
-///    `ChromeUi::build` closes the popover on a click outside its rectangle. The clause does not
-///    apply while the pointer is locked in relative capture, where the chrome is unreachable
-///    ([`RouteInputs::chrome_unreachable`]).
-/// 3. A paste is running and this is a button **press** → [`Sink::Dropped`], the same clause
-///    [`route_key`] applies to host keys and for the same reason: a click landing in the middle of
-///    a paste puts the target's focus somewhere else, and the rest of the text is then typed into
-///    whatever the click opened. Only the press is dropped — clause 1 still owes the up of any
-///    button the target is already holding, and a press that was dropped never becomes
-///    outstanding, so this can never strand one.
-/// 4. Otherwise → [`Sink::Target`], which includes the relative-capture lock: the chrome is
-///    unreachable there, so `pointer_over_chrome` is *forced* false by `chrome_unreachable`
-///    rather than trusted — the last hit test before the lock took effect may have said otherwise.
+/// 1. Release a button held by the target through [`Sink::Target`], even if a
+///    menu opened after its press.
+/// 2. Route menu hits and events under an open popover/modal to [`Sink::Chrome`].
+///    This keeps dismissal clicks local and menus usable during paste. Relative
+///    pointer lock bypasses this rule because the menu is unreachable.
+/// 3. Drop target button presses during paste to avoid changing the destination
+///    of the remaining text. Dropped presses never become [`Outstanding`].
+/// 4. Route other events to the target, including motion and wheel during paste.
 ///
-/// # Why clause 2 is above clause 3, which is a change from how 4c first wrote it
-///
-/// 4c dropped every button press while a paste ran, from every state. That is right for the
-/// target and wrong for the chrome: it also disabled the pill and every popover for the minutes a
-/// long paste takes, so the Keyboard popover could show a running paste's progress and its cancel
-/// hint and refuse to be clicked. The reason for the drop is "a click must not reach the *target*
-/// mid-paste", and **a click on the chrome never reaches the target at all** — [`Sink::Chrome`]
-/// hands it to egui and stops there, in every state, which is the invariant
-/// `a_chrome_click_never_reaches_the_target` pins.
-///
-/// Nothing is stranded by the reordering: a press routed to the chrome never becomes
-/// [`Outstanding`] either (only `Action::Forward` sets that), so clause 1 still owes exactly the
-/// buttons the target really holds.
-///
-/// A running paste does not otherwise change pointer routing: motion and the wheel still reach the
-/// target, because a paste types and does not point, and taking the pointer away from the user for
-/// the minutes it runs would be a surprise with no cause.
+/// `ChromeUi::build` handles popover dismissal. A stale hit test cannot capture
+/// relative-lock events because [`RouteInputs::chrome_unreachable`] overrides it.
 pub fn route_pointer(i: &RouteInputs, kind: PointerKind) -> Sink {
     if let PointerKind::Button { mask, down: false } = kind {
         if i.outstanding.holds_button(mask) {
@@ -456,7 +360,7 @@ mod tests {
         };
         let i = RouteInputs::default();
         assert_eq!(route_key(&i, tab), Sink::Target);
-        // And while captured, which is the state a user is actually in when they press it.
+        // And while captured, which is the state a user is in when they press it.
         let i = RouteInputs {
             capture: CaptureState::Captured,
             ..RouteInputs::default()
@@ -464,7 +368,7 @@ mod tests {
         assert_eq!(route_key(&i, tab), Sink::Target);
     }
 
-    /// Clause 1, exhaustively: the release key gets out of **every** state, including modal-open
+    /// Clause 1, exhaustively: the release key gets out of every state, including modal-open
     /// and relative capture.
     #[test]
     fn the_release_key_gets_out_from_every_state() {
@@ -521,10 +425,8 @@ mod tests {
         }
     }
 
-    /// **Review item 6.** The lock is a *request*: `App::grab_pointer` tries `Locked`, then
-    /// `Confined`, and warns when a compositor refuses both — leaving `grab == None` and the
-    /// pointer free to walk onto the pill. Assuming it succeeded made the pill dead and turned the
-    /// click that hit it into a real button press on a live desktop.
+    /// A requested pointer lock may be refused. Route from confirmed lock state
+    /// so menus remain reachable when capture is only confined.
     #[test]
     fn a_refused_grab_leaves_the_chrome_reachable() {
         let refused = RouteInputs {
@@ -552,7 +454,7 @@ mod tests {
             ..refused
         };
         assert_eq!(route_key(&refused, key()), Sink::Chrome);
-        // And the same state with the grab actually in force is the unreachable one.
+        // And the same state with the grab in force is the unreachable one.
         let locked = RouteInputs {
             pointer_locked: true,
             ..refused
@@ -560,9 +462,7 @@ mod tests {
         assert_eq!(route_key(&locked, key()), Sink::Target);
     }
 
-    /// **Review item 1, keys.** A press forwarded to the target keeps its release: the up edge of
-    /// an outstanding key routes to the target however the flags moved in between — a popover
-    /// opened under it, the pointer wandered onto the pill, a paste started.
+    /// A forwarded keypress must retain its release through menu state changes.
     #[test]
     fn the_up_of_a_key_the_target_holds_reaches_the_target_from_every_state() {
         for held in [TAB, HidKey::Modifier(modifier::LEFT_CTRL)] {
@@ -616,8 +516,7 @@ mod tests {
         );
     }
 
-    /// **Review item 1, buttons.** LEFT pressed over the video, dragged across the pill so
-    /// `pointer_over_chrome` flips, released. The up is the target's.
+    /// Dragging a pressed target button across the menu must not consume its release.
     #[test]
     fn the_up_of_a_button_the_target_holds_reaches_the_target_from_every_state() {
         let mut outstanding = Outstanding::default();
@@ -646,7 +545,7 @@ mod tests {
         }
     }
 
-    /// **A click never lands in the middle of a paste.** A host key is dropped because it corrupts
+    /// A click never lands in the middle of a paste. A host key is dropped because it corrupts
     /// the text; a button press is dropped because it moves the target's focus out from under the
     /// paste, and the rest of the text is then typed into whatever the click opened. Motion and
     /// the wheel are untouched: a paste types, it does not point.
@@ -665,8 +564,7 @@ mod tests {
                 paste_running: true,
                 ..i
             };
-            // Off the chrome it is dropped; on it — the pill, or any popover open — it is the
-            // chrome's, which never reaches the target either (the lead's ruling on 4c item 7).
+            // Paste suppresses target presses but keeps local menus clickable.
             let on_chrome = !pasting.chrome_unreachable()
                 && (pasting.pointer_over_chrome || pasting.popover_open || pasting.modal_open);
             let expected = if on_chrome {
@@ -703,11 +601,7 @@ mod tests {
         }
     }
 
-    /// **The pill stays clickable while a paste runs** (the lead's ruling on 4c item 7).
-    ///
-    /// 4c dropped every press from every state, which also disabled the Keyboard popover that
-    /// shows the running paste's progress and its cancel hint. The reason for the drop is the
-    /// *target*, and a chrome click never reaches it: `Sink::Chrome` ends at egui.
+    /// Paste must leave its progress and cancellation menu usable.
     #[test]
     fn the_pill_stays_clickable_while_a_paste_runs() {
         let press = PointerKind::Button {
@@ -756,7 +650,7 @@ mod tests {
         assert_eq!(route_pointer(&locked, press), Sink::Dropped);
     }
 
-    /// The prelude's other half: what a release-all owes is every key **and** every button, so
+    /// The prelude's other half: what a release-all owes is every key and every button, so
     /// `held_buttons` reports them in a fixed order and nothing else.
     #[test]
     fn held_buttons_are_every_button_the_target_holds() {
@@ -791,7 +685,7 @@ mod tests {
         o.set_button(button::LEFT, false);
         assert!(o.is_empty(), "{o:?}");
 
-        // A release-all is what clears the lot (§2.6).
+        // A release-all is what clears the lot.
         o.set_key(HidKey::Usage(0xFF), true);
         assert!(o.holds_key(HidKey::Usage(0xFF)), "the top of the bit set");
         o.clear();
@@ -818,7 +712,7 @@ mod tests {
         assert_eq!(route_key(&i, KeyAction::Release), Sink::Target);
     }
 
-    /// The paste chord is viewer-local: it reaches the event loop from every state, exactly like
+    /// The paste chord is viewer-local: it reaches the event loop from every state, like
     /// the release key, and is never handed to the chrome or dropped. A trigger a menu could
     /// swallow is a trigger the user cannot reach.
     #[test]
@@ -842,7 +736,7 @@ mod tests {
         }
     }
 
-    /// **Release wins.** The chord during a running paste is the release — it cancels rather than
+    /// Release wins. The chord during a running paste is the release — it cancels rather than
     /// restarting — and with no paste running it is the paste.
     #[test]
     fn the_chord_starts_a_paste_and_cancels_a_running_one() {
@@ -855,7 +749,7 @@ mod tests {
             KeyAction::Release,
             "a second chord mid-paste must cancel, never restart"
         );
-        // …and that resolved action routes to the release path, so the cancel is §2.6's.
+        // A repeated paste chord uses the normal release path.
         let running = RouteInputs {
             capture: CaptureState::Captured,
             paste_running: true,
@@ -905,7 +799,7 @@ mod tests {
         assert!(o.held_keys().is_empty());
     }
 
-    /// Clause 2 is about the **host's** presses. A key the running paste is holding is not one,
+    /// Clause 2 is about the host's presses. A key the running paste is holding is not one,
     /// and a host key-up for it is dropped — forwarded, it would end a capital half way through
     /// and put the rest of the character in the wrong case.
     #[test]
@@ -961,7 +855,7 @@ mod tests {
     /// is the chrome's even when it lands outside the rectangle. A dismissing click must never
     /// reach a live desktop.
     ///
-    /// Routing it here is half the story; **the popover actually closing** is `ChromeUi::build`'s
+    /// Routing it here is half the story; the popover closing is `ChromeUi::build`'s
     /// job and is asserted where it happens, in `tests/viewer_chrome_ui.rs`'s
     /// `clicking_outside_an_open_popover_closes_it`.
     #[test]

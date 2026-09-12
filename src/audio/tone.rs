@@ -1,24 +1,7 @@
-//! Is a tone actually there? A Goertzel detector, for asserting on a consequence (A17).
+//! Goertzel tone detection for audio verification.
 //!
-//! CLAUDE.md's most expensive lesson: **an acknowledgement is not evidence of effect.** A PCM
-//! stream that opened, a period that was read, a counter that went up — none of those is evidence
-//! that the dongle is carrying the target's sound. §12 Stage 4a's exit criterion is therefore a
-//! *spectral peak*: with the target playing a 1 kHz sine, the samples this client captured must
-//! contain 1 kHz and not merely bytes.
-//!
-//! This file is that check, and it is here rather than in the hardware test for two reasons.
-//! Nothing in it touches a device, so it can be — and is — tested against synthetic signals
-//! offline, which is the only way to know the *detector* works before trusting what it says about
-//! the hardware. And a hardware test that had to carry its own DSP would be a hardware test
-//! nobody could debug.
-//!
-//! # Why Goertzel and not an FFT
-//!
-//! The question is "how much energy is at 1 kHz", not "what is the spectrum". Goertzel answers
-//! exactly that question for one frequency in O(n) with no allocation, no window table and no
-//! dependency — and the crate links no FFT. For the *ratio* that turns the answer into a verdict
-//! it is run again at a handful of unrelated frequencies, which is a fixed small multiple of the
-//! same cost.
+//! Compare energy at the expected frequency with nearby reference frequencies. Silent
+//! controls distinguish a working audio path from stale samples or background noise.
 
 use super::CHANNELS;
 
@@ -105,14 +88,14 @@ impl ToneReport {
 
 /// The reference frequencies [`find_tone`] compares against when the caller names none.
 ///
-/// Deliberately not harmonics or subharmonics of anything: a square-ish tone from a cheap DAC has
+/// not harmonics or subharmonics of anything: a square-ish tone from a cheap DAC has
 /// energy at 2f and 3f, and a floor measured there would flatter the result. These are unrelated
 /// frequencies in the same band, all comfortably inside the dongle's 48 kHz.
 pub const DEFAULT_REFERENCES: [f32; 6] = [137.0, 311.0, 613.0, 1907.0, 3121.0, 5003.0];
 
 /// Look for `freq_hz` in `samples`, against a floor measured at `references`.
 ///
-/// The floor is the **median** rather than the mean, so one reference frequency that happens to
+/// The floor is the median rather than the mean, so one reference frequency that happens to
 /// land on real content in the target's audio cannot lift the whole floor and hide the tone.
 pub fn find_tone(
     samples: &[f32],
@@ -136,7 +119,7 @@ pub fn find_tone(
     } else {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
     };
-    // A perfectly clean synthetic signal has a floor of exactly zero, and a ratio of `inf` is
+    // A perfectly clean synthetic signal has a floor of zero, and a ratio of `inf` is
     // useless to print. Floor it at something far below any real noise floor instead.
     let reference = reference.max(1e-12);
     ToneReport {
@@ -153,7 +136,7 @@ pub fn find_tone(
 /// A sine at moderate level against the noise floor of a USB capture chip is orders of magnitude,
 /// not a factor of two; 100 is a threshold that a real tone clears with room to spare and that
 /// noise, hum or an unrelated desktop sound does not. It is a starting point for the hardware run
-/// to confirm or move, and the run should record the ratio it actually saw rather than only that
+/// to confirm or move, and the run should record the ratio it saw rather than only that
 /// it passed.
 pub const TONE_RATIO: f32 = 100.0;
 
@@ -163,7 +146,7 @@ mod tests {
     use crate::audio::SAMPLE_RATE;
 
     /// `seconds` of a sine at `freq`, as interleaved stereo i16 — the shape the capture side
-    /// actually produces.
+    /// produces.
     fn sine(freq: f32, seconds: f32, amplitude: f32) -> Vec<i16> {
         let frames = (SAMPLE_RATE as f32 * seconds) as usize;
         let mut out = Vec::with_capacity(frames * CHANNELS);

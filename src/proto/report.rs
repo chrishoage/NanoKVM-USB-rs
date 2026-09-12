@@ -1,7 +1,9 @@
-//! HID report builders. The payload shapes here are the ones that move the pointer on hardware
-//! (A17); the bare HID report shapes from upstream's builder do not.
+//! Keyboard and mouse HID payload encoders.
+//!
+//! Mouse reports include the CH9329 mode byte. Absolute coordinates use a 4096 divisor
+//! and are clamped to 4095; larger values can wrap in the device's 13-bit field.
 
-/// Modifier bits of the keyboard report's first byte (Appendix).
+/// Modifier bits of the keyboard report's first byte.
 pub mod modifier {
     pub const LEFT_CTRL: u8 = 1 << 0;
     pub const LEFT_SHIFT: u8 = 1 << 1;
@@ -13,7 +15,7 @@ pub mod modifier {
     pub const RIGHT_META: u8 = 1 << 7;
 }
 
-/// Mouse button bits (Appendix).
+/// Mouse button bits.
 pub mod button {
     pub const LEFT: u8 = 1 << 0;
     pub const RIGHT: u8 = 1 << 1;
@@ -23,20 +25,16 @@ pub mod button {
 }
 
 /// Absolute coordinates: 12 usable bits in a 13-bit field. Full scale 4095, divisor 4096, and the
-/// device wraps to the origin at 8192, so the encoder clamps and never relies on the device (§3.4).
+/// device wraps to the origin at 8192, so the encoder clamps and never relies on the device.
 pub const ABS_MAX: u16 = 4095;
 pub const ABS_DIVISOR: u32 = 4096;
 
-/// Map a pixel on the target's screen to the absolute coordinate that lands on it.
+/// Map a target pixel to its absolute HID coordinate.
 ///
-/// The device law is `pixel = floor(v * extent / 4096)` (§3.4, measured). The exact right inverse
-/// for every extent up to 4096 is `ceil(px * 4096 / extent)`: the smallest coordinate whose floor
-/// reaches `px`. §3.4 proposes mapping "through the pixel centre", `((2*px + 1) * 2048) / extent`;
-/// that is exact for every extent measured on this desk but lands one pixel short for 1536 of the
-/// 3840 columns and 96 of the 2160 rows at 4K, so it is not used (Stage 1 finding; see
-/// `tests/proto_report.rs`). Both formulas agree that the naive `px * 4096 / extent` sends 4093 for
-/// pixel 1919 and leaves the last column unreachable. Pixels outside `extent` clamp to the last
-/// pixel; extents above 4096 cannot address every pixel and are clamped to full scale.
+/// The measured device law is `pixel = floor(v * extent / 4096)`. Its right inverse
+/// for extents up to 4096 is `ceil(px * 4096 / extent)`. Flooring the inverse can miss
+/// the final row or column. Out-of-range pixels clamp to the last pixel; larger
+/// extents cannot address every pixel and coordinates clamp to 4095.
 pub fn abs_coord(px: u32, extent: u32) -> u16 {
     if extent == 0 {
         return 0;
@@ -67,7 +65,7 @@ impl KeyboardReport {
 }
 
 /// Relative mouse report: `[0x01, buttons, dx, dy, wheel]`, 5 bytes. The leading mode byte is
-/// mandatory: without it the device ACKs and reads every field one byte to the left (A17).
+/// mandatory: without it the device ACKs and reads every field one byte to the left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MouseRelReport {
     pub buttons: u8,
@@ -79,7 +77,7 @@ pub struct MouseRelReport {
 impl MouseRelReport {
     pub const LEN: usize = 5;
     pub const MODE: u8 = 0x01;
-    /// Reports saturate at this magnitude; larger deltas are split across reports (§2.3).
+    /// Reports saturate at this magnitude; larger deltas are split across reports.
     pub const DELTA_MAX: i32 = 127;
 
     pub fn payload(&self) -> [u8; 5] {
@@ -94,7 +92,7 @@ impl MouseRelReport {
 }
 
 /// Absolute mouse report: `[0x02, buttons, xLo, xHi, yLo, yHi, wheel]`, 7 bytes, little-endian
-/// coordinates in `0..=4095`. Construction clamps; the device would wrap past 8191 (§3.4).
+/// coordinates in `0..=4095`. Construction clamps; the device would wrap past 8191.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MouseAbsReport {
     pub buttons: u8,

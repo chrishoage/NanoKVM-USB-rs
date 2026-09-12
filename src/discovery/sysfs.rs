@@ -1,37 +1,13 @@
-//! The sysfs seam (§8, §7.2).
+//! Read-only sysfs access behind an injectable interface.
 //!
-//! §7.2 fixes the packaging rule that decides this module's shape: **no `libudev`**. Everything
-//! §8 needs — vendor and product ids, the device tree, and the kernel's port `peer` assertion —
-//! is readable out of plain files and symlinks, so the only dependency here is `std::fs`.
-//!
-//! [`Sysfs`] exists so the pairing rules in [`super`] can be run against a *recorded* sysfs tree.
-//! That is not a testing convenience bolted on afterwards: §8's evidence item 2 (the SuperSpeed
-//! `peer` link) and item 3 (containment under the dongle's internal hub) are **two different
-//! physical shapes of the same dongle**, and no desk has both at once. Stage 0 measured the
-//! first, Stage 1 measured the second (STAGE1_FINDINGS, "Environment"). Recording each into a
-//! directory tree that this trait can read unchanged is the only way both rules stay tested.
-//! `scripts/snapshot-sysfs.py` records those trees. What is committed is the recording
-//! serialised to a single line-oriented file, `fixtures/sysfs/usb2-desk.sysfs`;
-//! `fixtures/sysfs/synthesize.py` expands it into `fixtures/sysfs/usb2-desk/` and derives the
-//! other three trees from it, and [`super::testing::fixture`] runs that script on demand when a
-//! tree is missing.
-//!
-//! ## Paths are sysfs-absolute, not host-absolute
-//!
-//! Every path crossing this trait is rooted at the sysfs mount point rather than at `/`:
-//! `/class/video4linux/video4`, `/devices/pci0000:00/.../3-2.2.2`, `/bus/usb/devices/3-2`.
-//! [`RealSysfs`] prepends its `root` on the way in and strips it on the way out, so the same
-//! path values name the same nodes whether `root` is `/sys` or a fixture directory. Callers
-//! never see the fixture's location, and a recorded tree stays relocatable.
+//! Recorded trees let tests cover USB 2.0, SuperSpeed, and ambiguous topologies without
+//! depending on the host's devices.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Read-only access to the four sysfs operations §8's rules need.
-///
-/// Implementations return `None` rather than an error for a missing attribute or a dangling
-/// link: sysfs races with hotplug, and a device that vanished mid-walk is a normal outcome that
-/// must degrade to "not a candidate", never to a failed discovery.
+/// Read-only sysfs operations. Missing attributes and dangling links return `None`
+/// because hotplug can remove a device during the walk.
 pub trait Sysfs {
     /// One attribute file, with trailing whitespace trimmed. `None` if it does not exist or
     /// cannot be read.
@@ -87,7 +63,7 @@ impl RealSysfs {
     }
 
     /// host path -> sysfs-absolute, or `None` when the path escaped the tree. A `peer` or
-    /// `device` link that leaves the recorded subset is exactly the "device vanished" case, and
+    /// `device` link that leaves the recorded subset is the "device vanished" case, and
     /// dropping it is what makes a partial snapshot safe to read.
     fn sysfs_path(&self, host: &Path) -> Option<PathBuf> {
         host.strip_prefix(&self.root)

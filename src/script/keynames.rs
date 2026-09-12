@@ -1,14 +1,7 @@
-//! The key-name vocabulary: the words a user may type in a chord, and the physical key each one
-//! names.
+//! Case-insensitive chord key names and HID usages.
 //!
-//! This table is *not* a layout and carries no usages. It maps a name to a winit [`KeyCode`], and
-//! [`crate::proto::keymap::hid_key`] then decides what the report carries — the same authority the
-//! viewer forwards through, so no usage is retyped here (§10.2).
-//!
-//! **Modifiers are a separate table on purpose.** A modifier is a bit of the report's first byte,
-//! never a usage in a key slot (Appendix), so [`key_by_name`] does not know the modifier names at
-//! all: a script cannot put `ctrl` into a usage slot even by accident, because the only function
-//! that resolves it returns a bit.
+//! Printable characters are resolved through the layout before this table so their case
+//! and required modifiers survive parsing.
 
 use winit::keyboard::KeyCode;
 
@@ -165,7 +158,7 @@ pub fn modifier_by_name(name: &str) -> Option<u8> {
 }
 
 /// Every canonical key name, in table order, for help text and for tests. Aliases and the literal
-/// punctuation spellings are deliberately absent: this is the list to *show* a user.
+/// punctuation spellings are absent: this is the list to *show* a user.
 pub fn canonical_names() -> impl Iterator<Item = (&'static str, KeyCode)> {
     KEYS.iter().map(|&(name, key, _)| (name, key))
 }
@@ -204,7 +197,7 @@ mod tests {
     }
 
     /// If a modifier were also a key name it could land in a usage slot, which the report has no
-    /// encoding for (Appendix).
+    /// encoding for.
     #[test]
     fn no_name_is_both_a_key_and_a_modifier() {
         for &(name, _) in MODIFIERS {

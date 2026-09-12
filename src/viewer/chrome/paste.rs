@@ -1,119 +1,8 @@
-//! Clipboard paste: the mapper and the job (plan §12 Stage 4c, §2.6, §2.8, §2.9, §10.2).
+//! Clipboard normalization, validation, and paced key submission.
 //!
-//! Pure. No clipboard, no window, no producer, no clock read — [`PasteJob`] is advanced with an
-//! [`Instant`] the caller supplies — so every rule below can be asserted without a display or a
-//! device. The I/O halves are [`super::clipboard`] (the source) and `viewer::app` (the sink).
-//!
-//! # One mapper, one rule (§10.2 rev 5)
-//!
-//! *"Clipboard paste is text injection with the clipboard as its source. The reference client's
-//! paste is a separate ASCII-to-US-usage table that skips non-ASCII silently, drops `\r`, and has
-//! no cap; ours goes through `script::compile` under the same layout and the same
-//! unreachable-character policy as `nanokvm type`, so there is one mapper and one rule."*
-//!
-//! So [`compile`] calls [`crate::script::compile_type`] — the shipped one, the one
-//! `tests/cli_keys.rs` drives against hardware — and differences its reports into key transitions
-//! with [`super::shortcut::transitions`], which is the same function the two built-in shortcuts
-//! use. Nothing here has a usage table of its own.
-//!
-//! Two normalisations happen first, and they are the only liberties taken with the text:
-//!
-//! - **`\r\n` and a bare `\r` become `\n`**, which the layout maps to Enter. §12 Stage 4c asks for
-//!   this by name. A clipboard copied from a Windows editor, or from a `<textarea>`, carries CRLF,
-//!   and the alternative to normalising is refusing every such clipboard as unreachable.
-//! - **Nothing else.** A tab is a tab: [`crate::script::Layout::key_for_char`] has a key for it
-//!   (`'\n'` and `'\t'` are the two control characters with one), so it is typed as Tab rather
-//!   than expanded to spaces. What a shell's readline does with a Tab is the target's business.
-//!
-//! # Reject before sending anything (§10.2, §2.8 item 3)
-//!
-//! A character the declared layout cannot reach fails the **whole** paste, with every offender
-//! named and located, before one key is submitted. That is §10.2's rule and it is the reference's
-//! behaviour inverted: the reference skips a character it cannot type and pastes the rest, which
-//! on a console means a command that is *almost* what the user copied. The compile happens before
-//! any step is handed to the producer, so "nothing was sent" is structural rather than a promise.
-//!
-//! # CapsLock: refuse, and why refuse rather than compensate
-//!
-//! D2 gave `nanokvm type` three policies — `refuse` (the default), `ignore`, `compensate` — and
-//! the viewer's paste takes **refuse**, with no way to override it from the chrome. Three reasons,
-//! in the order they weigh:
-//!
-//! 1. **A paste has no length cap and therefore no bounded duration.** `type` is one short
-//!    argument delivered in a second or two, so the lock state it read a moment ago is still true
-//!    when the last character lands. A paste is whatever is on the clipboard: at
-//!    [`crate::script::REPORT_DELAY_MS`] a two-thousand-character paste runs for minutes, and
-//!    `compensate` is a decision made once at the start and then applied to every letter. If
-//!    anything toggles CapsLock during those minutes — the target's own software, a second
-//!    keyboard, the user — the compensation inverts from a fix into the bug, silently, for the
-//!    remainder. Refusing has no such failure mode: the state is read, and either the paste does
-//!    not start or it starts from a state that was actually off.
-//! 2. **`compensate` types something other than what was copied.** It sends the *opposite* shift
-//!    bit and relies on the target to invert it back. That is an approximation of the kind §10.2
-//!    rules out everywhere else in this client, accepted for `type` only because a human typed the
-//!    flag for that one invocation and can look at the result. Nobody types a flag for a menu item.
-//! 3. **It is `type`'s own default.** One rule, and the wording of the refusal is D2's wording, so
-//!    a user who has met the CLI's refusal meets the same sentence and the same remedy here.
-//!
-//! **The wrong case can never be typed silently**, and that is structural rather than a claim:
-//! [`compile`] compiles the text twice, once under [`CapsLock::Off`] and once under
-//! [`CapsLock::Compensate`], and refuses whenever the target reports CapsLock on *and the two
-//! differ* — which is the compiler's own definition of "this text contains a character CapsLock
-//! changes", never a list of letters restated here. A clipboard of pure punctuation therefore
-//! pastes with CapsLock on, correctly, because the lock bit cannot change what it types.
-//!
-//! It also refuses when the lock state is **unknown**. The viewer asks the writer for a fresh
-//! `GET_INFO` before every paste ([`crate::input::Producer::refresh_device_info`]) precisely so
-//! this is not decided from the reading the link happened to be commissioned with; a device that
-//! did not answer leaves the question open, and an open question about the target's keyboard is
-//! not something to type through.
-//!
-//! # Admission: a job, advanced by the event loop (§2.9, §2.8)
-//!
-//! [`PasteJob`] is a state machine and not a loop. D1 established that a *script* is a blocking,
-//! paced sequence of acknowledged transactions on its own link — and that path is not available
-//! here for the reason `super::shortcut`'s docs give: the viewer's writer thread owns the serial
-//! link, and a second writer on a chip with no inter-byte timeout (§5.1) is the "a truncated
-//! serial write corrupts the next command" hazard with two guns. Nor may the event loop block
-//! (§5.4). So the paste is submitted through the viewer's own [`crate::input::Producer`], one key
-//! transition per [`PasteJob::next_step`], at [`crate::script::REPORT_DELAY_MS`] — the rate
-//! `nanokvm type` runs at, from the one constant both read.
-//!
-//! Feeding it one step at a time is also what keeps the bounded queue bounded (§2.8): one barrier
-//! is submitted per 40 ms against a writer that acknowledges a keyboard report in about 4 ms
-//! (A11), so the queue depth a paste produces is one. A refusal is still possible — an overflow
-//! raised by something else, a link that died — and a refusal is a **job failure** surfaced in the
-//! chrome, never a dropped keystroke: §2.8 item 3, "never a partially delivered sequence reported
-//! as success".
-//!
-//! # The prelude, and why it is not a §2.6 release-all
-//!
-//! §12 Stage 4c asks for an explicit release at the start "so nothing the user still held (e.g.
-//! the Shift of the trigger chord) corrupts the text". It cannot be
-//! [`crate::input::Producer::request_release_all`]: that is a §2.6 *cancellation*, which
-//! disengages the producer and ends the capture session — the paste would release the keyboard and
-//! then have nowhere to type. What it is instead is an explicit **up edge for everything the
-//! target is holding because this viewer forwarded the press**, which is exactly
-//! [`super::route::Outstanding`]: every key, and then every mouse button. The last of those ups
-//! leaves the target's keyboard and mouse reports zeroed, which is the state a release-all would
-//! have left them in, and the session is still engaged.
-//!
-//! The buttons are in it for the same reason as the keys, only worse: a paste runs for minutes and
-//! a button left down is a drag on a live desktop for all of them. Nothing new is *pressed* — a
-//! release for a button this viewer already forwarded a press for is the completion of that press,
-//! never a click.
-//!
-//! It is a prefix of the job's own steps, so it is counted in the progress and paced like the
-//! rest; and it is a no-op on the wire when nothing is held, because the writer's held-state
-//! tracker emits no report for a transition that changes nothing (§2.5).
-//!
-//! # And it ends with nothing held
-//!
-//! [`crate::script::Script::tap`] is always a press followed by `RELEASE_ALL`, and
-//! [`super::shortcut::transitions`] differences that into an explicit up for every modifier and
-//! every usage the press put down. [`tests::a_completed_paste_ends_with_nothing_held`] replays a
-//! whole job through [`PasteJob::held`] and asserts it is empty — the same assertion
-//! `shortcut::tests::every_builtin_ends_with_nothing_held` makes, for the same reason.
+//! Normalize line endings and compile all text before sending a key. A fresh lock-state
+//! reading is required when CapsLock would change the text. Unsupported characters refuse
+//! the whole paste. Cancellation releases held input and reports partial progress.
 
 use std::time::{Duration, Instant};
 
@@ -132,19 +21,14 @@ pub const PACE: Duration = Duration::from_millis(REPORT_DELAY_MS);
 /// number would be a sentence the code no longer means.
 pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The sentence every refusal ends with (§2.8 item 3: a refusal is never a partial paste).
+/// The sentence every refusal ends with.
 ///
 /// Lower case because most variants reach it after a semicolon; the two that reach it after a full
-/// stop capitalise it themselves, which is D2's own wording in the CLI. What
+/// stop capitalise it themselves, which is own wording in the CLI. What
 /// [`tests::every_refusal_ends_with_the_assurance`] asserts is the sentence, not its first letter.
 const NOTHING_WAS_SENT: &str = "no keyboard report was sent.";
 
-/// The chord that starts a paste, spelled from the viewer's release binding.
-///
-/// Derived rather than written down, so it cannot disagree with the key
-/// [`crate::viewer::input_map::map_key`] actually looks at: §12 Stage 4c puts the trigger on the
-/// **already-reserved** release key so the never-forwarded surface stays one key, and a menu
-/// advertising a different one would send the user to a key that does nothing.
+/// Paste chord derived from the viewer's locally reserved release key.
 pub fn chord(release_key: &str) -> String {
     format!("Shift+{release_key}")
 }
@@ -153,11 +37,11 @@ pub fn chord(release_key: &str) -> String {
 ///
 /// Every variant is a sentence the chrome shows. They are enumerated rather than stringly typed
 /// because the tests assert on the *reason*, and because [`Refusal::Unreachable`] carries the
-/// offender list the chrome renders as its own lines (§10.2).
+/// offender list the chrome renders as its own lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// Keys can only reach the target while the session is captured; `Producer::submit` refuses
-    /// otherwise (§2.6).
+    /// otherwise.
     NotCaptured,
     /// The compositor has no data-control protocol, or the read failed. Carries
     /// [`super::clipboard`]'s own sentence.
@@ -165,14 +49,14 @@ pub enum Refusal {
     /// The clipboard held text, and it was empty. Nothing to type is not a failure worth a stack
     /// trace, but it is worth saying: a paste that did nothing and said nothing looks broken.
     Empty,
-    /// §10.2: at least one character has no key on the declared layout. **Nothing was sent.**
+    /// Unsupported characters prevent any paste keystrokes from being sent.
     Unreachable {
         layout: Layout,
         /// Each offending character once, with the 1-based position of its first occurrence, in
         /// the order they first occur — [`CompileError::Unreachable`]'s own list.
         chars: Vec<(char, usize)>,
     },
-    /// The target reports CapsLock on and the text contains characters it would invert (D2).
+    /// The target reports CapsLock on and the text contains characters it would invert.
     CapsLockOn,
     /// The device has not answered `GET_INFO`, so the lock state is unknown.
     LockStateUnknown,
@@ -195,8 +79,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::NotCaptured => write!(
                 f,
-                "input is not captured, so nothing can be typed. Click in the window, or press \
-                 Enter, to capture; {NOTHING_WAS_SENT}"
+                "input is not captured; click the video or press Enter first. {NOTHING_WAS_SENT}"
             ),
             // The reason is another module's sentence and may or may not be punctuated, so the
             // trailing stop is taken off before the one assurance is put on.
@@ -218,25 +101,20 @@ impl std::fmt::Display for Refusal {
                 };
                 write!(
                     f,
-                    "{n} {subject} not reachable on layout {layout}. Text injection needs a key \
-                     for every character (§10.2); {NOTHING_WAS_SENT}"
+                    "{n} {subject} not supported by target layout {layout}; {NOTHING_WAS_SENT}"
                 )
             }
-            // D2's words, and D2's remedies. The CLI's refusal says the same thing, so a user who
-            // has met one has met both.
+            // Keep the CapsLock remedy consistent with the CLI.
             Refusal::CapsLockOn => f.write_str(
                 "the target reports CapsLock ON; letters would be typed inverted. Turn it off on \
                  the target, or with \"nanokvm key capslock\". No keyboard report was sent.",
             ),
             Refusal::LockStateUnknown => f.write_str(
-                "the device has not reported the target's lock bits, so whether letters would \
-                 arrive inverted is unknown. No keyboard report was sent.",
+                "the target's CapsLock state is unknown. No keyboard report was sent.",
             ),
             Refusal::DeviceTimeout => write!(
                 f,
-                "the device did not answer GET_INFO within {} s, so the target's lock bits are \
-                 unknown and whether letters would arrive inverted cannot be decided. No keyboard \
-                 report was sent.",
+                "the target's lock state could not be read within {} s. No keyboard report was sent.",
                 PREPARE_TIMEOUT.as_secs()
             ),
             Refusal::Compile { reason } => write!(f, "{reason}; {NOTHING_WAS_SENT}"),
@@ -260,7 +138,7 @@ impl Refusal {
             .collect()
     }
 
-    /// What this refusal is **logged** as, which is deliberately not what the chrome shows.
+    /// What this refusal is logged as, which is not what the chrome shows.
     ///
     /// [`Refusal::offenders`] names characters out of the user's clipboard, and a log is durable,
     /// shared and often pasted into a bug report — so the log gets the count and a pointer to the
@@ -333,7 +211,7 @@ pub type CapsLockState = Option<bool>;
 /// Turn clipboard text into the key transitions that type it, or refuse.
 ///
 /// Every refusal happens here, before a single step exists, which is what makes "nothing was sent"
-/// structural (§2.8 item 3).
+/// structural.
 pub fn compile(
     text: &str,
     layout: Layout,
@@ -378,11 +256,10 @@ pub fn compile(
 pub enum PasteOutcome {
     /// Every step was submitted.
     Done { total: usize },
-    /// The release key cancelled it (§2.6). Carries how far it got, because "it was cancelled" and
+    /// The release key cancelled it. Carries how far it got, because "it was cancelled" and
     /// "it was cancelled after 37 of 214 keys" are different facts to the person at the console.
     Cancelled { sent: usize, total: usize },
-    /// A step was refused, or the session ended under it (§2.8 item 3: never a partially delivered
-    /// sequence reported as success).
+    /// Delivery failed or the captured session ended before completion.
     Failed {
         reason: String,
         sent: usize,
@@ -406,13 +283,8 @@ impl std::fmt::Display for PasteOutcome {
     }
 }
 
-/// How a §2.6 release-all ends the paste it interrupts.
-///
-/// A release-all is raised for seven reasons and they are not the same event: the user asking for
-/// their keyboard back is a cancellation, and a queue that overflowed or a link that died is a
-/// **failure** — §2.8 item 3's "never a partially delivered sequence reported as success" applies
-/// to the words as much as to the keys. The viewer cannot tell them apart after the fact, because
-/// the release runs synchronously inside the reducer's action; so the reason is carried in, here.
+/// Classify a release reason as cancellation or failure while preserving partial
+/// progress. User release differs from overflow or link loss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ending {
     /// The user, or a clean shutdown. [`PasteOutcome::Cancelled`].
@@ -426,7 +298,7 @@ pub enum Ending {
 /// The split is "did a person ask for this?". `UserRequested` is the release key — which is also
 /// the cancel — `FocusLost` is the user's own window switch, and `Shutdown` is the user closing
 /// the window; those three are cancellations and say how far the paste got. Everything else is the
-/// session failing underneath it (§2.8, §2.6.1, §2.7), and a paste that stopped because the queue
+/// session failing underneath it, and a paste that stopped because the queue
 /// overflowed or the cable went must say so, not report itself as cancelled.
 pub fn ending_for(reason: ReleaseReason) -> Ending {
     match reason {
@@ -434,18 +306,15 @@ pub fn ending_for(reason: ReleaseReason) -> Ending {
             Ending::Cancelled
         }
         ReleaseReason::Overflow => Ending::Failed(
-            "the input queue overflowed under the paste (§2.8); re-capture deliberately and paste \
-             again"
+            "input queue overflow; capture again before retrying the paste"
                 .to_string(),
         ),
         ReleaseReason::LinkDown => Ending::Failed(
-            "the link to the device failed under the paste (§2.6.1); what had been sent may not \
-             have reached the target"
+            "serial connection lost during paste; some submitted input may not have reached the target"
                 .to_string(),
         ),
         ReleaseReason::Reconnected => Ending::Failed(
-            "the link was replaced under the paste (§2.7), so the target's HID state was \
-             resynchronised; re-capture deliberately and paste again"
+            "serial connection restored; capture again before retrying the incomplete paste"
                 .to_string(),
         ),
         ReleaseReason::CaptureReleased => {
@@ -454,14 +323,10 @@ pub fn ending_for(reason: ReleaseReason) -> Ending {
     }
 }
 
-/// What a cancellation produced, and what the caller still owes the target.
-///
-/// `#[must_use]` because the second field is an obligation: a caller that takes the outcome and
-/// drops this has cancelled a paste with keys still down on someone else's console. The viewer
-/// discharges it with §2.6's release-all, which the release key already triggers through the
-/// reducer; this type is what makes the obligation visible to a reader and to a test.
+/// Cancellation result and held input the caller must release. `must_use` keeps
+/// that cleanup obligation visible to callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "the keys in `still_held` are down on the target until something releases them (§2.6)"]
+#[must_use = "the keys in `still_held` are down on the target until something releases them"]
 pub struct Cancellation {
     pub outcome: PasteOutcome,
     /// What the paste had pressed and not yet released when it was cancelled.
@@ -474,7 +339,7 @@ pub struct PasteProgress {
     pub sent: usize,
     pub total: usize,
     /// Steps left times the pace. An estimate, and named as one in the line: a step whose report
-    /// is identical to the last changes nothing and costs no transaction (§2.5), so the real time
+    /// is identical to the last changes nothing and costs no transaction, so the real time
     /// is a little under this.
     pub remaining: Duration,
 }
@@ -518,7 +383,7 @@ impl PasteJob {
     ///
     /// `outstanding` is what the target holds because this viewer forwarded the press — typically
     /// the Shift of the `Shift+Pause` chord that started the paste. The prelude is the up edge of
-    /// each of them (module docs): every key, then every **button**, because "the same state a
+    /// each of them (module docs): every key, then every button, because "the same state a
     /// release-all would have left" includes the mouse buttons and a paste that left one down
     /// would leave a live desktop dragging for the minutes it runs for.
     pub fn new(outstanding: Outstanding, body: Vec<Event>, pace: Duration) -> PasteJob {
@@ -570,8 +435,7 @@ impl PasteJob {
         self.total() - self.sent
     }
 
-    /// The whole paste at the paced rate — §12 Stage 4c: "state the expected duration in the
-    /// progress line".
+    /// Estimated duration at the configured transition rate.
     pub fn expected_duration(&self) -> Duration {
         self.pace * u32::try_from(self.total()).unwrap_or(u32::MAX)
     }
@@ -661,7 +525,7 @@ impl PasteJob {
         }
     }
 
-    /// The producer refused a step, or the session ended under the job (§2.8 item 3).
+    /// The producer refused a step, or the session ended under the job.
     pub fn fail(&mut self, reason: String) {
         if self.outcome.is_some() {
             return;
@@ -673,11 +537,8 @@ impl PasteJob {
         });
     }
 
-    /// A §2.6 release-all ended it, as [`ending_for`] reads the reason.
-    ///
-    /// Returns what is still held, which the caller must release — the release-all that ended the
-    /// job is what discharges it. Ending an already-finished job is a no-op that reports the
-    /// outcome it already had.
+    /// End the paste and return held input the caller must release. Repeated calls
+    /// retain the completed outcome without starting another cleanup sequence.
     pub fn end(&mut self, ending: Ending) -> Cancellation {
         if self.outcome.is_none() {
             self.outcome = Some(match ending {
@@ -698,7 +559,7 @@ impl PasteJob {
         }
     }
 
-    /// The release key cancelled it (§2.6): [`PasteJob::end`] with [`Ending::Cancelled`].
+    /// The release key cancelled it: [`PasteJob::end`] with [`Ending::Cancelled`].
     pub fn cancel(&mut self) -> Cancellation {
         self.end(Ending::Cancelled)
     }
@@ -777,7 +638,7 @@ mod tests {
         assert_eq!(events("one\r\ntwo"), events("one\ntwo"));
     }
 
-    // ---- the unreachable-character policy (§10.2) -----------------------------------------
+    // ---- the unreachable-character policy -----------------------------------------
 
     #[test]
     fn an_unreachable_character_refuses_the_whole_paste_and_names_it() {
@@ -831,9 +692,9 @@ mod tests {
         assert_eq!(compile("", Layout::Us, Some(false)), Err(Refusal::Empty));
     }
 
-    // ---- CapsLock (D2) ---------------------------------------------------------------------
+    // ---- CapsLock ---------------------------------------------------------------------
 
-    /// The load-bearing one: with the target's CapsLock on, letters are **never** typed. Not
+    /// The required one: with the target's CapsLock on, letters are never typed. Not
     /// inverted, not compensated — refused, with the lock state named.
     #[test]
     fn caps_lock_on_refuses_text_with_letters_and_names_the_state() {
@@ -863,7 +724,7 @@ mod tests {
         assert!(compile("1234 !@#$ ...", Layout::Us, Some(true)).is_ok());
     }
 
-    /// An unknown lock state is refused exactly like a known-on one, for the same reason: the
+    /// An unknown lock state is refused like a known-on one, for the same reason: the
     /// alternative is typing letters that may arrive inverted without saying so.
     #[test]
     fn an_unknown_lock_state_refuses_letters_but_not_punctuation() {
@@ -947,7 +808,7 @@ mod tests {
         assert_eq!(job("a").prelude(), 0);
     }
 
-    /// **The prelude releases held buttons too, or it is not a release-all.** A paste runs for
+    /// The prelude releases held buttons too, or it is not a release-all. A paste runs for
     /// minutes; a button the viewer forwarded a press for and never released is a drag on a live
     /// desktop for every one of them. Only releases are ever emitted — a press would be a click
     /// this client never sends by itself.
@@ -1024,7 +885,7 @@ mod tests {
     }
 
     /// Cancel at every point there is. The outcome names how far it got, and what is still held is
-    /// exactly the replay of the delivered prefix — which the caller's release-all then clears.
+    /// the replay of the delivered prefix — which the caller's release-all then clears.
     #[test]
     fn cancelling_from_any_state_reports_its_progress_and_leaves_nothing_held_after_the_release() {
         let body = events("Hi!\n");
@@ -1052,7 +913,7 @@ mod tests {
                 j.next_step(now).is_none(),
                 "a cancelled job offers no more steps"
             );
-            // What the caller owes, and the §2.6 release-all discharging it.
+            // Cancellation reports the held input that release-all must clear.
             let mut owed = cancellation.still_held;
             assert_eq!(owed, replay_outstanding(&body[..cut]));
             owed.clear();
@@ -1189,8 +1050,8 @@ mod tests {
         all
     }
 
-    /// **Every refusal ends with the assurance**, because the sentence a user is owed when a paste
-    /// does nothing is that nothing was *half* done (§2.8 item 3). It was missing from three of
+    /// Every refusal ends with the assurance, because the sentence a user is owed when a paste
+    /// does nothing is that nothing was *half* done. It was missing from three of
     /// them, and the one the 3 s device timeout used to raise was one of the three.
     #[test]
     fn every_refusal_ends_with_the_assurance() {
@@ -1203,7 +1064,7 @@ mod tests {
         }
     }
 
-    /// **A refusal never carries the clipboard into the log.** The offending characters are the
+    /// A refusal never carries the clipboard into the log. The offending characters are the
     /// user's own text; the popover lists them and the log gets a count and somewhere to look.
     #[test]
     fn a_logged_refusal_carries_no_character_out_of_the_clipboard() {
@@ -1236,26 +1097,26 @@ mod tests {
     #[test]
     fn the_device_half_of_the_timeout_is_not_a_clipboard_refusal() {
         let device = Refusal::DeviceTimeout.to_string();
-        assert!(device.contains("GET_INFO"), "{device}");
+        assert!(device.contains("could not be read"), "{device}");
         assert!(
             device.contains(&PREPARE_TIMEOUT.as_secs().to_string()),
             "it names the deadline it waited: {device}"
         );
-        assert!(device.contains("lock bits"), "{device}");
+        assert!(device.contains("lock state"), "{device}");
         assert_ne!(Refusal::DeviceTimeout, Refusal::LockStateUnknown);
     }
 
-    // ---- how a release-all ends a running paste (§2.6, §2.8 item 3) -------------------------
+    // ---- how a release-all ends a running paste -------------------------
 
-    /// **A session that failed under a paste is a failed paste, named.** The release-all runs
+    /// A session that failed under a paste is a failed paste, named. The release-all runs
     /// inside the reducer's action, so the reason has to be read here or not at all; reporting an
     /// overflow as "cancelled" tells the user they stopped it themselves.
     #[test]
     fn a_release_all_for_a_failure_ends_the_job_as_failed() {
         for (reason, needle) in [
             (ReleaseReason::Overflow, "overflow"),
-            (ReleaseReason::LinkDown, "link to the device failed"),
-            (ReleaseReason::Reconnected, "link was replaced"),
+            (ReleaseReason::LinkDown, "serial connection lost"),
+            (ReleaseReason::Reconnected, "serial connection restored"),
             (ReleaseReason::CaptureReleased, "capture ended"),
         ] {
             let mut j = job("hello");

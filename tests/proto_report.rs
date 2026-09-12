@@ -1,25 +1,14 @@
-//! Absolute-coordinate mapping against the measured device law (§3.4).
-//!
-//! Ninety measurements, no outliers, one law:
-//!
-//! ```text
-//! effective = min(v & 0x1FFF, 4095)
-//! pixel     = floor(effective * extent / 4096)
-//! ```
-//!
-//! So the encoder's job is to be a right inverse of `pixel(v)`: for every pixel `px` the value it
-//! sends must land back on `px`. That is the property tested here.
+//! Absolute-coordinate mapping against the measured 4096-divisor device law.
 
 use nanokvm::proto::report::{abs_coord, MouseAbsReport, ABS_DIVISOR, ABS_MAX};
 
-/// The measured device law (§3.4): what pixel a coordinate lands on.
+/// The measured device law: what pixel a coordinate lands on.
 fn device_pixel(v: u16, extent: u32) -> u32 {
     let effective = u32::from(v & 0x1FFF).min(u32::from(ABS_MAX));
     effective * extent / ABS_DIVISOR
 }
 
-/// Every extent this client can be pointed at, from the §3.4 measurement and the modes the device
-/// enumerates (§6): 640x480, 720x576, 1280x720, 1920x1080, 2560x1440, 3840x2160.
+/// Extents from recorded capture modes.
 const EXTENTS: [u32; 12] = [
     640, 480, 720, 576, 1280, 720, 1920, 1080, 2560, 1440, 3840, 2160,
 ];
@@ -29,9 +18,7 @@ const EXACT_EXTENTS: [u32; 13] = [
     640, 480, 720, 576, 1280, 720, 1920, 1080, 2560, 1440, 3840, 2160, 4096,
 ];
 
-/// §3.4: for every pixel the coordinate sent must land back on that pixel under the device law.
-/// The plan's pixel-centre formula failed this at 3840 and 2160 (a Stage 1 finding); the encoder
-/// now uses the exact inverse `ceil(px * 4096 / extent)`, so the property holds for all extents.
+/// Every supported pixel maps back to itself under the measured device law.
 #[test]
 fn every_pixel_round_trips_through_the_device_law() {
     for extent in EXACT_EXTENTS {
@@ -83,7 +70,7 @@ fn the_mapping_is_monotonic_and_in_range() {
     }
 }
 
-/// §3.4: "2048 lands dead centre, and the slope matches 1920/4096 to six decimals."
+/// Half scale maps to the center using divisor 4096.
 #[test]
 fn the_centre_pixel_lands_on_the_centre() {
     let v = abs_coord(960, 1920);
@@ -100,8 +87,7 @@ fn the_centre_pixel_lands_on_the_centre() {
     assert_eq!(device_pixel(2048, 1080), 540);
 }
 
-/// Out-of-range pixels clamp in our own encoder. §3.4: never rely on the device, because an
-/// overshoot past 8191 silently jumps the pointer to the top-left corner of a live console.
+/// Clamp in the encoder because larger values can wrap at the device.
 #[test]
 fn a_pixel_past_the_edge_clamps_to_the_last_pixel() {
     // 4094, not 4095: ceil(1919 * 4096 / 1920) = 4094 lands on the last column, 1919, and is the
@@ -130,8 +116,7 @@ fn a_zero_extent_is_the_origin() {
     assert_eq!(abs_coord(u32::MAX, 0), 0);
 }
 
-/// §9.2 item 2 and the Appendix: the payload is exactly 7 bytes with the mode byte first, and the
-/// coordinates it carries are clamped whatever the caller put in the struct.
+/// Absolute reports must retain the mode byte and clamp coordinates.
 #[test]
 fn the_absolute_report_clamps_whatever_it_is_given() {
     for x in [0u16, 1, 2048, 4095, 4096, 8191, 8192, 32767, u16::MAX] {

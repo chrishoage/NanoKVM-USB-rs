@@ -1,14 +1,8 @@
-//! Hardware capture test. Needs the dongle (§9.3: feature-gated, `#[ignore]`d, never gating CI).
+//! Capture tests for the real NanoKVM-USB video device (345f:2133).
 //!
-//! ```text
-//! cargo test --features hardware --test capture_hardware -- --ignored --nocapture
-//! ```
-//!
-//! `/dev/video4` is the NanoKVM-USB node on this desk. `/dev/video0`–`3` belong to unrelated
-//! hardware and are never opened here.
-//!
-//! §12 "Verify by consequence, not by acknowledgement": every assertion below is on an observed
-//! frame — its header, its timestamp, its size — never on an ioctl returning success.
+//! The recorded path is `/dev/video4`; verify identity before running. Never open the
+//! user's unrelated bus-5 devices. Run with the hardware feature, ignored tests enabled,
+//! and one test thread. These tests stream video without sending target input.
 
 #![cfg(feature = "hardware")]
 
@@ -23,9 +17,9 @@ static DEVICE: Mutex<()> = Mutex::new(());
 use nanokvm::capture::v4l2::now_monotonic;
 use nanokvm::capture::{jpeg, FrameSource, V4l2Source};
 
-/// The dongle's video node on this desk (CLAUDE.md).
+/// The dongle's video node on the recorded test setup (CLAUDE.md).
 const NODE: &str = "/dev/video4";
-/// The primary path (§6): the target outputs 1080p, so 4K would cost 3.9x for an upscale.
+/// The primary path: the target outputs 1080p, so 4K would cost 3.9x for an upscale.
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const FPS: u32 = 60;
@@ -50,14 +44,14 @@ fn capture_120_frames_at_1080p60() {
             .unwrap_or_else(|e| panic!("frame {i}: {e}"));
         let now = now_monotonic();
 
-        // A6: the frame's own start-of-frame header is the authority. Re-parse it here rather
+        // the frame's own start-of-frame header is the authority. Re-parse it here rather
         // than trusting the source's own parse.
         let (w, h) = jpeg::dimensions(&frame.jpeg).unwrap_or_else(|e| panic!("frame {i}: {e}"));
         assert_eq!((w, h), (WIDTH, HEIGHT), "frame {i} header dimensions");
         assert_eq!((frame.width, frame.height), (w, h), "frame {i}");
         assert_eq!(frame.jpeg.len() as u64, u64::from(src.bytes_stats().last));
 
-        // §5.5: monotonic, and the label is capture-to-dequeue age, not latency.
+        // Driver timestamps use the monotonic clock; this measures dequeue age only.
         assert!(
             frame.captured_at >= last_captured,
             "frame {i}: captured_at went backwards, {:?} after {:?}",
@@ -90,7 +84,7 @@ fn capture_120_frames_at_1080p60() {
         u32::from(src.last_flags())
     );
     println!("  rate from buffer timestamps: {fps:.2} fps over {span:.3?}");
-    println!("  capture-to-dequeue age (NOT latency, §5.5): min {age_min:.2} ms  p50 {age_p50:.2} ms  max {age_max:.2} ms");
+    println!("  capture-to-dequeue age (NOT latency, ): min {age_min:.2} ms  p50 {age_p50:.2} ms  max {age_max:.2} ms");
     println!(
         "  bytesused: min {} max {} mean {:.0} last {} (n={})",
         bytes.min,
@@ -118,7 +112,7 @@ fn capture_120_frames_at_1080p60() {
     assert!(bytes.min > 0);
 }
 
-/// A stall must be detectable rather than a hang (§6.1 S1-2). With a timeout shorter than the
+/// A stall must be detectable rather than a hang. With a timeout shorter than the
 /// frame period, `next_frame` must return `Timeout` and the source must keep working
 /// afterwards — the v4l crate's own timeout facility corrupts the buffer ring here, which is
 /// why this module polls the fd itself (see `capture::v4l2` module docs).
@@ -158,19 +152,8 @@ fn a_short_timeout_returns_and_the_stream_recovers() {
     println!("  30 frames delivered after {timeouts} timeouts; the ring survived");
 }
 
-/// The stream rebuild (`capture::v4l2` module docs item 2).
-///
-/// In `v4l` 0.14 `next()` assigns `arena_index` only *after* `VIDIOC_DQBUF` succeeds, so any
-/// error out of it — `EIO`, which V4L2 documents for temporary problems like signal loss —
-/// leaves `arena_index` naming a driver-owned buffer and every later `next()` gets `EINVAL`
-/// forever. B2 covered only the timeout case, because polling the fd ourselves keeps a stall
-/// away from that path; a failing `DQBUF` is not so avoidable, so the source rebuilds the stream
-/// instead.
-///
-/// Inducing a genuine `EIO` needs an unplug, and the captured video is the target's only
-/// feedback channel (CLAUDE.md), so this drives the same code path through
-/// `force_rebuild_for_test`: drop the stream, then assert by consequence (§12) that frames flow
-/// again and that the rebuild was counted.
+/// A failed `DQBUF` can leave v4l’s arena index pointing at a driver-owned buffer.
+/// Rebuilding the stream must recover from that state instead of repeating `EINVAL`.
 #[test]
 #[ignore = "needs the NanoKVM-USB dongle on /dev/video4"]
 fn a_dropped_stream_is_rebuilt_and_frames_flow_again() {

@@ -1,15 +1,14 @@
-//! The seam between the input writer (§2.6) and a transport (`serial`, or a fake in tests).
+//! Transport interface used by the input writer and keyboard commands.
 //!
-//! A `Link` moves whole frames. It is the writer's atomic unit: a call to `transact` either hands
-//! one complete, well-formed frame to the transport or hands nothing. It never writes part of a
-//! frame, because the CH9329 has no inter-byte timeout and a torn frame corrupts the following
-//! command (§5.1, A15).
+//! A transaction completes one frame before returning. Cancellation happens between
+//! transactions so a partial frame cannot corrupt the next command. Acknowledgement
+//! confirms receipt by the bridge, not the target's response to the input.
 
 use std::time::Duration;
 
 /// A reply frame from the device with its header, length and checksum already stripped and
 /// validated. `cmd` is the reply's own command byte: `request | 0x80` on success, `request | 0xC0`
-/// on error (Appendix).
+/// on error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub cmd: u8,
@@ -58,22 +57,22 @@ impl LinkError {
 
 /// A frame-level transport to the CH9329.
 pub trait Link: Send {
-    /// Write exactly one complete frame for `cmd` with `payload`, then wait up to `timeout` for the
+    /// Write one complete frame for `cmd` with `payload`, then wait up to `timeout` for the
     /// reply whose command byte answers `cmd` (see [`Reply::answers`]). Frames that answer some
-    /// other command — notably the unsolicited `0x81` lock-state push (A12) — must be diverted,
+    /// other command — notably the unsolicited `0x81` lock-state push — must be diverted,
     /// never returned here and never treated as this call's reply.
     ///
     /// Contract:
     /// - the write is all-or-nothing at the frame boundary; a partial write is reported as
     ///   [`LinkError::Io`] and the link must be treated as down afterwards;
-    /// - a device error frame is returned as `Err(LinkError::Device { .. })`, never dropped (§3.1);
-    /// - an acknowledgement proves the frame was parsed, not that it had any effect (§3.4).
+    /// - a device error frame is returned as `Err(LinkError::Device {.. })`, never dropped;
+    /// - an acknowledgement proves the frame was parsed, not that it had any effect.
     fn transact(&mut self, cmd: u8, payload: &[u8], timeout: Duration) -> Result<Reply, LinkError>;
 
     /// Write bytes that complete any frame the chip's parser is waiting on, without forming a
-    /// valid command (§5.1; §11 "Still open: Resynchronisation after a torn write").
+    /// valid command.
     ///
-    /// The chip's receive parser has **no inter-byte timeout**: after a torn write it waits
+    /// The chip's receive parser has no inter-byte timeout: after a torn write it waits
     /// indefinitely — measured to ten seconds — and then eats the *next* command as the remainder
     /// of the truncated one. Reopening the port does not clear that, because the parser state
     /// lives in the chip and the chip was not power-cycled; a write timeout on a live port and a
@@ -88,7 +87,7 @@ pub trait Link: Send {
         Ok(())
     }
 
-    /// Whether the transport has already failed — asked **without writing anything** (§2.6, §2.7).
+    /// Whether the transport has already failed — asked without writing anything.
     ///
     /// This exists because loss is not always write-driven. A transport that has a receiving half
     /// of its own learns about a hang-up from that half within a poll: `serialport` turns the
@@ -101,7 +100,7 @@ pub trait Link: Send {
     /// back under a different name.
     ///
     /// So the writer asks, on a short interval, instead of writing. A query rather than a keepalive
-    /// is the whole point: the CH9329 acknowledges anything (§3.4, A17), so traffic would prove
+    /// is the whole point: the CH9329 acknowledges anything, so traffic would prove
     /// nothing about the link that a poll of its own read side does not already know, and would put
     /// bytes on a live console's keyboard to find out.
     ///
@@ -113,12 +112,8 @@ pub trait Link: Send {
     }
 }
 
-/// Produces a fresh transport after the previous one failed (§2.7). The writer owns one of these
-/// for its whole life and asks it for a new [`Link`] whenever the current one is down.
-///
-/// Deciding *when* to reopen is not a transport concern and does not live here: §2.7's sequence —
-/// discard the queue, release-all, re-query device info — needs the input writer's queue and its
-/// epoch bookkeeping, so the writer drives it and a source does nothing but hand over a link.
+/// Source of replacement transports. The writer owns retry timing, cancellation,
+/// and commissioning; the source only opens a link.
 pub trait LinkSource: Send {
     /// Open a new transport, or say why not. An `Err` is expected and ordinary: the device is
     /// simply not back yet.

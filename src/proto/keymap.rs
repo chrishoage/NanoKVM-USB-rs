@@ -1,44 +1,25 @@
-//! Physical key (winit [`KeyCode`]) to HID usage.
+//! Physical winit [`KeyCode`] values mapped to HID keyboard usages.
 //!
-//! A mechanical port of `reference/browser/src/libs/keyboard/keymap.ts`. Upstream keys its table
-//! on W3C UI Events `code` values and winit's `KeyCode` variant names follow the same table
-//! (Appendix), so the port is a rename with three name-level corrections, listed below.
+//! The mapping follows the upstream browser client's physical-key table. Target
+//! layout determines characters; this module does not translate text. winit uses
+//! `SuperLeft`/`SuperRight` for Meta/Win aliases, `WakeUp` for Wake, and
+//! `AudioVolume*` for the legacy Volume aliases.
 //!
-//! The table is *not* a layout. `KeyCode` is the physical key; what character it produces is the
-//! target's business, and this client forwards keys rather than text (§10.2).
+//! # Unmapped keys
 //!
-//! # Where winit's names differ from upstream's keys
-//!
-//! - **`SuperLeft` / `SuperRight`.** winit renames W3C `MetaLeft` / `MetaRight`. Upstream lists
-//!   `MetaLeft` and `WinLeft` as separate keys with the same usage `0xE3` (likewise `MetaRight` /
-//!   `WinRight` and `0xE7`); winit has one variant each, so the alias simply disappears. Both are
-//!   modifiers here, matching upstream's `ModifierMap`, which takes precedence over its
-//!   `KeycodeMap` at every call site.
-//! - **`WakeUp`.** Upstream's key is spelled `Wake`, which is not a W3C `code` and therefore never
-//!   matches a browser event; the intended usage `0xF9` is mapped here under winit's (correct)
-//!   `WakeUp`.
-//! - **`AudioVolume*`.** Upstream lists both `AudioVolumeMute`/`Up`/`Down` and the legacy
-//!   `VolumeMute`/`Up`/`Down` aliases at the same usages. winit has only the `AudioVolume*` names.
-//!
-//! # Intentionally unmapped `KeyCode` variants
-//!
-//! Every variant below returns `None`, and each has a reason. A key that maps to nothing is never
-//! sent, so the target simply never sees it.
-//!
-//! | Variant | Why |
+//! | Keys | Reason |
 //! | --- | --- |
-//! | `Fn`, `FnLock` | Hardware-local. winit documents `Fn` as a key that "does not generate a separate code"; neither has a HID keyboard/keypad usage, and neither is in upstream's table. Forwarding is meaningless — the target has its own `Fn`. |
-//! | `NumpadStar`, `NumpadHash` | Phone/remote keypad keys, not numeric-keypad keys (winit's own docs say to use `NumpadMultiply` for the keypad `*`). No HID keyboard usage, absent from upstream. |
-//! | `Meta`, `Hyper`, `Turbo` | Legacy bare modifiers with no left/right identity. The HID keyboard page has usages only for the eight sided modifiers (`0xE0`–`0xE7`), which the sided variants already cover. Absent from upstream. |
-//! | `Abort`, `Resume`, `Suspend` | System-control keys, not keyboard-page usages. Absent from upstream. |
-//! | `Open` | Sun-keyboard key with no entry in upstream's table. HID `0x74` is "Execute", a different key that winit does not expose; guessing an equivalence would be an invention, not a port. |
-//! | `Hiragana`, `Katakana` | Dedicated Japanese word-processor keys. Upstream maps the *`Lang3`/`Lang4`* codes (`0x92`/`0x93`) that ordinary Japanese keyboards emit, and has no entry for these; those two variants are mapped. |
-//! | `F25` … `F35` | The HID keyboard/keypad page stops at F24 (`0x73`). Upstream stops there too. |
+//! | `Fn`, `FnLock` | Hardware-local keys absent from the upstream mapping. |
+//! | `NumpadStar`, `NumpadHash` | Phone keypad keys; the numeric keypad uses `NumpadMultiply`. |
+//! | `Meta`, `Hyper`, `Turbo` | No left/right identity for the report's modifier bits. |
+//! | `Abort`, `Resume`, `Suspend` | System controls outside this keyboard mapping. |
+//! | `Open` | No upstream mapping; treating it as HID Execute would guess an equivalence. |
+//! | `Hiragana`, `Katakana` | The upstream mapping uses `Lang3`/`Lang4` instead. |
+//! | `F25`–`F35` | HID keyboard function-key usages end at F24. |
 //!
-//! `KeyCode` is `#[non_exhaustive]`, so a variant added by a future winit also falls through to
-//! `None`. The exhaustiveness test in this module carries a hand-maintained list of all 194
-//! variants in winit 0.30.13 and asserts its own length, so a winit upgrade that adds keys trips a
-//! test rather than silently dropping them.
+//! Unknown variants return `None`. The test's manually maintained key list must
+//! be reviewed when upgrading winit; its length assertion cannot detect new
+//! upstream variants by itself.
 
 use crate::proto::report::modifier;
 use crate::proto::HidKey;
@@ -48,12 +29,12 @@ use winit::keyboard::KeyCode;
 /// sided modifiers, a keyboard/keypad usage for everything else, `None` for a key this client does
 /// not forward (see the module documentation for the list and the reasons).
 ///
-/// Ported from `browser/src/libs/keyboard/keymap.ts` (Appendix).
+/// Ported from `browser/src/libs/keyboard/keymap.ts`.
 pub fn hid_key(code: KeyCode) -> Option<HidKey> {
     use KeyCode as K;
 
     // Modifiers first: upstream's `ModifierMap` shadows its `KeycodeMap` for these eight keys, and
-    // the report carries them as bits of byte 0, never as usages in the key slots (Appendix).
+    // the report carries them as bits of byte 0, never as usages in the key slots.
     let usage: u8 = match code {
         K::ControlLeft => return Some(HidKey::Modifier(modifier::LEFT_CTRL)),
         K::ShiftLeft => return Some(HidKey::Modifier(modifier::LEFT_SHIFT)),
@@ -304,7 +285,7 @@ mod tests {
     /// Every `KeyCode` variant in winit 0.30.13, hand-maintained.
     ///
     /// `KeyCode` is `#[non_exhaustive]`, so the compiler cannot check this list for us. Bump
-    /// [`VARIANT_COUNT`] deliberately when upgrading winit, after adding the new variants here and
+    /// [`VARIANT_COUNT`] when upgrading winit, after adding the new variants here and
     /// deciding whether each maps or joins the documented unmapped set.
     const ALL: &[KeyCode] = {
         use KeyCode as K;
@@ -555,7 +536,7 @@ mod tests {
         assert_eq!(sorted.len(), ALL.len(), "duplicate entry in ALL");
     }
 
-    /// The point of the test: a key that is neither mapped nor deliberately dropped is a key that
+    /// The point of the test: a key that is neither mapped nor dropped is a key that
     /// silently does nothing on the target.
     #[test]
     fn every_key_code_is_either_mapped_or_documented_as_unmapped() {
@@ -582,10 +563,8 @@ mod tests {
         }
     }
 
-    /// Spot check against `browser/src/libs/keyboard/keymap.ts`. `reference/` is gitignored and
-    /// absent in CI, so the expected values are transcribed here rather than read at runtime.
-    /// These are HID usages from the datasheet's own page, not device captures, so §9.1's "read
-    /// the fixture" rule does not apply — `fixtures/packets/ch9329.toml` carries only frames.
+    /// HID-usage spot checks against the upstream keymap. The optional `reference/`
+    /// checkout is not needed at test time.
     #[test]
     fn spot_check_against_upstream() {
         let cases: &[(KeyCode, HidKey)] = &[
@@ -605,7 +584,7 @@ mod tests {
             (KeyCode::BracketRight, HidKey::Usage(0x30)),
             (KeyCode::Backslash, HidKey::Usage(0x31)),
             (KeyCode::Slash, HidKey::Usage(0x38)),
-            // The lock key the §9 hardware check watches for.
+            // CapsLock provides observable target feedback in hardware tests.
             (KeyCode::CapsLock, HidKey::Usage(0x39)),
             // Function keys, both blocks.
             (KeyCode::F1, HidKey::Usage(0x3a)),
@@ -650,8 +629,8 @@ mod tests {
         }
     }
 
-    /// The modifier bits are the report's byte 0, so each must be exactly one bit and all eight
-    /// together must be 0xFF (Appendix).
+    /// The modifier bits are the report's byte 0, so each must be one bit and all eight
+    /// together must be 0xFF.
     #[test]
     fn the_eight_modifiers_are_eight_distinct_bits() {
         let sided = [
@@ -678,7 +657,7 @@ mod tests {
         assert_eq!(union, 0xFF);
     }
 
-    /// A usage of zero is "no key" in the report, so it must never be produced (Appendix).
+    /// A usage of zero is "no key" in the report, so it must never be produced.
     #[test]
     fn no_key_maps_to_usage_zero() {
         for &code in ALL {

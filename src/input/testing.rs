@@ -1,43 +1,7 @@
-//! An in-memory fake [`Link`] for testing the input path without a device (§9.3).
+//! Fake transports and controllable link sources for input tests.
 //!
-//! It records every `(cmd, payload)` handed to it, in order, so that assertions can be made on
-//! **the frame sequence** rather than on internal counters. Recording happens on entry to
-//! `transact`, before the configured behaviour is applied, so a frame that the transport then
-//! failed to write still appears — the record is "what the writer handed to the link", which is
-//! exactly the boundary §2.6.1 draws.
-//!
-//! Behaviour is controllable per call through a script, with a default for calls the script does
-//! not cover:
-//!
-//! - [`Behaviour::Ack`] — a success reply, `cmd | 0x80`.
-//! - [`Behaviour::Stall`] — park inside `transact` until the test releases it. This is how a
-//!   stalled writer (§2.8) and the cancellation race (§2.6) are tested. On release the call
-//!   applies whatever *default* is configured then, so a test can stall-then-fail; scripted
-//!   entries are reserved for the calls that follow.
-//! - [`Behaviour::Fail`] — `LinkError::Down`, a transport failure.
-//! - [`Behaviour::Timeout`] — `LinkError::Timeout`, returned immediately; no test ever sleeps.
-//! - [`Behaviour::DeviceError`] — `LinkError::Device`, a `cmd | 0xC0` reply with a code.
-//!
-//! `GET_INFO` is answered like the real device, because §2.7's reconnect sequence ends with one
-//! and treats its reply as the proof a link is real: a fake that acknowledged it with an empty
-//! payload would fail every reconnect for the wrong reason. [`FakeControl::set_get_info_payload`]
-//! is how a test makes that proof fail on purpose.
-//!
-//! [`Link::resync`] is recorded rather than ignored, so that the §2.7 sequence can be asserted as
-//! an *ordered* whole — preamble, then the release frames, then `GET_INFO` — through
-//! [`FakeControl::calls`]. A call made to a link that has already hung up
-//! ([`FakeControl::hang_up`]) is recorded too, as [`FakeCall::Refused`] and in
-//! [`FakeControl::refused`]: no byte leaves, but the attempt is evidence, and "the writer
-//! discovered the loss without writing" is a claim that has to be able to fail.
-//!
-//! [`FakeSource`] is the same idea one level up: a scripted supply of links, which can also be
-//! made to **park inside `open`** ([`FakeSourceControl::hold_opens`]). That is not a curiosity —
-//! it is the only way to reproduce a real port that takes seconds to open, which is the window a
-//! shutdown must not be stuck behind and the window in which a trigger can land with no sequence
-//! left to run (§2.7).
-//!
-//! Every wait here is a `Condvar` rendezvous with a generous failsafe deadline. A test that
-//! reaches a deadline fails; nothing uses a sleep for synchronisation.
+//! Tests can pause transactions at frame boundaries and observe exact report order without
+//! using serial hardware or relying on scheduler timing.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -54,12 +18,11 @@ const FAILSAFE: Duration = Duration::from_secs(10);
 pub struct RecordedFrame {
     /// The command byte (`proto::cmd::*`).
     pub cmd: u8,
-    /// The raw payload, exactly as `report.payload()` produced it.
+    /// The raw payload, as `report.payload()` produced it.
     pub payload: Vec<u8>,
 }
 
-/// One thing the writer asked of the link, in order: a frame, the §5.1 resynchronisation
-/// preamble, or a call the hung-up transport refused. The unit the §2.7 sequence is asserted in.
+/// Ordered link operations: report, resynchronization, or refused call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakeCall {
     /// [`Link::resync`] — the writer asked the transport to finish any torn frame.
@@ -103,8 +66,7 @@ struct FakeState {
     entered: u64,
     /// Stalls the test has released, ever.
     released: u64,
-    /// What `GET_INFO` answers with. The device's own reply payload by default (Appendix), so the
-    /// §2.7 proof succeeds unless a test says otherwise.
+    /// Payload returned by GET_INFO; defaults to a valid recorded reply.
     get_info_payload: Vec<u8>,
     /// Make [`Link::resync`] fail, as a port that died between `open` and the preamble would.
     fail_resync: bool,
@@ -114,9 +76,7 @@ struct FakeState {
     /// Calls refused because [`FakeState::hung_up`] was set, ever. Also recorded in `calls` as
     /// [`FakeCall::Refused`]; the counter is what an assertion reads.
     refused: u64,
-    /// Park [`Link::resync`] the way [`Behaviour::Stall`] parks a transact, so a test can hold the
-    /// writer *inside* the §2.7 sequence at step 3a — before the step-3b drain, which is the only
-    /// window in which the queue can be made non-empty for that drain to find.
+    /// Pause resynchronization before the reconnect drain so tests can seed stale entries.
     stall_resync: bool,
     /// `resync` calls, ever.
     resyncs: u64,
@@ -183,19 +143,19 @@ impl FakeControl {
         lock(&self.shared.state).frames.len()
     }
 
-    /// Every frame **and** every [`Link::resync`], in the order the writer issued them.
+    /// Every frame and every [`Link::resync`], in the order the writer issued them.
     pub fn calls(&self) -> Vec<FakeCall> {
         lock(&self.shared.state).calls.clone()
     }
 
-    /// How many times the writer asked for the §5.1 preamble.
+    /// Number of resynchronization requests.
     pub fn resyncs(&self) -> u64 {
         lock(&self.shared.state).resyncs
     }
 
     /// How many calls this link refused because it had hung up.
     ///
-    /// **This is the assertion the idle-loss path rests on.** "The writer discovered the loss
+    /// This is the assertion the idle-loss path rests on. "The writer discovered the loss
     /// without writing" is only a claim a test can falsify if a call to a dead link leaves a
     /// trace: `frame_count()` and `calls().len()` alone cannot tell a writer that stayed silent
     /// from one whose frames the fake ate. Zero here is the silence; anything else is the writer
@@ -204,9 +164,7 @@ impl FakeControl {
         lock(&self.shared.state).refused
     }
 
-    /// The payload `GET_INFO` answers with. A payload shorter than
-    /// [`crate::proto::frame::DeviceInfo::MIN_PAYLOAD`] makes the §2.7 proof fail the way a
-    /// half-present device does.
+    /// Device-info reply payload; a short payload makes commissioning fail.
     pub fn set_get_info_payload(&self, payload: &[u8]) {
         lock(&self.shared.state).get_info_payload = payload.to_vec();
     }
@@ -216,29 +174,13 @@ impl FakeControl {
         lock(&self.shared.state).fail_resync = fail;
     }
 
-    /// The far end goes away **without the writer touching it** — the H-A4 shape.
-    ///
-    /// This is the one failure the in-memory fake could not express before: [`Behaviour::Fail`]
-    /// needs a call to fail, so loss was only ever discoverable by writing. A real link has a read
-    /// side that notices on its own, and [`Link::is_down`] is how that verdict reaches the writer;
-    /// this knob is that verdict. Afterwards every call fails too — no byte leaves, because a
-    /// hung-up transport puts no bytes anywhere — but the *attempt* is recorded, as
-    /// [`FakeCall::Refused`] and in [`FakeControl::refused`]. That is what lets a test assert that
-    /// the writer discovered the loss **without writing**: an unrecorded refusal would make that
-    /// assertion hold whether or not the writer wrote.
+    /// Disconnect without requiring a write, modeling reader-detected idle loss.
     pub fn hang_up(&self) {
         lock(&self.shared.state).hung_up = true;
         self.shared.cv.notify_all();
     }
 
-    /// Park the next [`Link::resync`] until [`FakeControl::release_stalls`], counted by
-    /// [`FakeControl::wait_for_stalled`] like any other stall.
-    ///
-    /// This is the only rendezvous **inside** the §2.7 sequence and before its step-3b drain, so it
-    /// is what lets a test put something in the queue for that drain to discard. Nothing a producer
-    /// can do reaches that window — `submit` refuses while `link_down` is set, and it stays set
-    /// until step 3e — so the drain would otherwise have no test that can fail (see
-    /// [`force_enqueue_key`]).
+    /// Pause the next resync until released, exposing the pre-drain commissioning boundary.
     pub fn stall_resync(&self, stall: bool) {
         lock(&self.shared.state).stall_resync = stall;
     }
@@ -337,8 +279,7 @@ impl Link for FakeLink {
                 behaviour = Behaviour::Ack;
             }
         }
-        // Answered like the device: `GET_INFO` carries a payload, everything else acknowledges
-        // with nothing (Appendix). §2.7 step 3 parses that payload, so an empty one is a rejection.
+        // Device-info requests need a payload; other successful reports acknowledge without one.
         let data = if cmd == crate::proto::cmd::GET_INFO {
             st.get_info_payload.clone()
         } else {
@@ -405,7 +346,7 @@ impl Link for FakeLink {
 
 /// The expected frame for a keyboard report. Built through [`KeyboardReport::payload`] rather
 /// than from retyped bytes: `proto` owns the encoding and `fixtures/packets/ch9329.toml` is the
-/// authority for *that*, while these tests are about order and content (§9.1, §9.2 item 1).
+/// authority for *that*, while these tests are about order and content.
 pub fn kb_frame(modifiers: u8, keys: [u8; 6]) -> RecordedFrame {
     RecordedFrame {
         cmd: crate::proto::cmd::SEND_KB_GENERAL_DATA,
@@ -444,13 +385,13 @@ pub fn rel_frame(buttons: u8, dx: i8, dy: i8, wheel: i8) -> RecordedFrame {
 }
 
 /// The two frames a release-all produces in `Rel` mode: zeroed keyboard, then the
-/// `MOUSE_RELEASE_ALL` report (§2.6).
+/// `MOUSE_RELEASE_ALL` report.
 pub fn release_frames_rel() -> Vec<RecordedFrame> {
     vec![kb_frame(0, [0; 6]), rel_frame(0, 0, 0, 0)]
 }
 
 /// The three frames a release-all produces in `Abs` mode: zeroed keyboard, an absolute report at
-/// the last position with all buttons up, then [`MOUSE_RELEASE_ALL`] (§2.6).
+/// the last position with all buttons up, then [`crate::proto::report::MOUSE_RELEASE_ALL`].
 pub fn release_frames_abs(x: u16, y: u16) -> Vec<RecordedFrame> {
     vec![
         kb_frame(0, [0; 6]),
@@ -459,13 +400,8 @@ pub fn release_frames_abs(x: u16, y: u16) -> Vec<RecordedFrame> {
     ]
 }
 
-/// Park the writer inside a transact so a test can fill the queue deterministically.
-///
-/// Submits one relative motion event — recorded as frame 0 of every test that uses this — scripts
-/// the link to stall on it, and returns once the writer is parked inside that call with the queue
-/// empty. Everything submitted afterwards accumulates in the queue under the §2.2 coalescing
-/// rules until [`FakeControl::release_stalls`] is called, which is what makes the coalescing and
-/// ordering assertions deterministic without a single sleep.
+/// Pause the writer inside a relative-motion transaction, leaving the queue empty
+/// so tests can fill it deterministically.
 pub fn stall_writer(producer: &crate::input::Producer, control: &FakeControl) {
     control.script([Behaviour::Stall]);
     producer
@@ -479,7 +415,7 @@ pub fn gate_frame() -> RecordedFrame {
     rel_frame(0, 1, 0, 0)
 }
 
-/// Block until the writer has completed at least `count` cancellation sequences (§2.6) and return
+/// Block until the writer has completed at least `count` cancellation sequences and return
 /// the most recent record.
 ///
 /// The rendezvous a test needs when the *writer* is what triggers the cancellation — a transport
@@ -513,21 +449,8 @@ pub fn wait_for_cancellations(
     }
 }
 
-/// Push a key-down barrier straight into the queue at `epoch`, bypassing every gate
-/// [`crate::input::Producer::submit`] applies.
-///
-/// **Why this exists.** §2.7 step 1 — "discard the whole pending queue, never replay" — defends
-/// against a queue that is not empty when a link is commissioned. No sequence of public calls can
-/// build that state: `submit` refuses while `link_down` is set, and the writer clears `link_down`
-/// only at step 3e, after the drain. The drain is still required, because "never replay" must not
-/// rest on an argument about interleavings that a later change can invalidate — so the test for it
-/// constructs the state the drain defends against directly, rather than pretending a producer could
-/// reach it. Paired with [`FakeControl::stall_resync`], which holds the writer at step 3a.
-///
-/// `epoch` is the entry's, and the caller chooses it: `Stats::requested_epoch` read while the
-/// writer is parked at step 3a is the epoch the reconnect latched, which is the interesting one —
-/// an entry carrying it survives the writer's `entry.epoch < acked_epoch` staleness check and is
-/// therefore written unless the drain removes it.
+/// Inject a key-down directly at `epoch` to test defensive reconnect draining.
+/// Public submission cannot create this state while the link is down.
 pub fn force_enqueue_key(
     producer: &crate::input::Producer,
     key: crate::proto::report::HidKey,
@@ -577,7 +500,7 @@ struct SourceShared {
     cv: Condvar,
 }
 
-/// A [`LinkSource`] whose answers a test writes in advance (§2.7).
+/// A [`LinkSource`] whose answers a test writes in advance.
 ///
 /// Move it into [`crate::input::spawn_with_source`]; steer it through the
 /// [`FakeSourceControl`] returned alongside.
@@ -760,7 +683,7 @@ impl Drop for FakeSource {
 
 // ---------------------------------------------------------------- reconnect rendezvous
 
-/// Block until the writer has commissioned at least `n` **replacement** links (§2.7), i.e. until
+/// Block until the writer has commissioned at least `n` replacement links, i.e. until
 /// `Stats::reconnects >= n`. The initial link is not one of them.
 pub fn wait_for_reconnects(producer: &crate::input::Producer, n: u64) {
     use std::sync::atomic::Ordering;
@@ -786,9 +709,8 @@ pub fn wait_for_reconnects(producer: &crate::input::Producer, n: u64) {
     }
 }
 
-/// The frames one §2.7 sequence puts on a freshly opened link, in order: the preamble, the
-/// release-all pair in `Rel` mode (a new link has no known pointer position), then the `GET_INFO`
-/// that proves the link is real.
+/// Expected commissioning operations: preamble, keyboard and relative-mouse
+/// releases, then device information.
 pub fn commission_calls() -> Vec<FakeCall> {
     let mut calls = vec![FakeCall::Resync];
     calls.extend(release_frames_rel().into_iter().map(FakeCall::Frame));

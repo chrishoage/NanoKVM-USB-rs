@@ -1,39 +1,20 @@
-//! Framing: encode, streaming parse with resynchronisation. Pure; no I/O, no clock (§4).
+//! CH9329 frame encoding and incremental reply parsing.
 //!
-//! The wire format is (Appendix):
-//!
-//! ```text
-//! HEAD1(0x57) HEAD2(0xAB) ADDR CMD LEN DATA[LEN] SUM
-//! SUM = (HEAD1 + HEAD2 + ADDR + CMD + LEN + sum(DATA)) & 0xFF
-//! ```
-//!
-//! Encoding is the easy half. Decoding is the module's reason to exist, because this device does
-//! not always send well-formed frames:
-//!
-//! - it answers an undefined command with a **five-byte frame carrying no checksum byte at all**
-//!   (§3.2, fixture `[[disagreement]] unknown_command_reply_has_no_checksum_byte`). A parser that
-//!   indexes `frame[5 + len]` panics on real traffic;
-//! - it emits **error frames** `CMD | 0xC0` whose payload is not zero-terminated, which upstream's
-//!   off-by-one receive checksum discards entirely (§3.1). Ours surfaces them;
-//! - it pushes **unsolicited `0x81` frames** between a request and its reply (Appendix), so the
-//!   parser must simply produce frames in order and let the caller match by command byte.
-//!
-//! Because of the first item, the parser resynchronises **byte-wise**: after a checksum mismatch it
-//! resumes scanning at the byte *after* the failed frame's first header byte, never after the whole
-//! failed frame. See [`Parser`] for why that is the difference between recovering the next reply
-//! and eating it.
+//! The parser validates lengths and checksums before exposing payloads. On corruption it
+//! resumes scanning one byte after the header, preserving a valid frame that overlaps a
+//! truncated candidate. Unfinished frames can be expired by the transport's silence timer.
 
 use std::fmt;
 
 use crate::link::Reply;
 
-/// Frame header, both bytes (Appendix).
+/// Frame header, both bytes.
 pub const HEAD: [u8; 2] = [0x57, 0xAB];
 
-/// The only device address this client uses; the fixtures are all `ADDR = 0x00` (Appendix).
+/// The only device address this client uses; the fixtures are all `ADDR = 0x00`.
 pub const ADDR: u8 = 0x00;
 
-/// Largest payload a frame can carry, because `LEN` is one byte (Appendix).
+/// Largest payload a frame can carry, because `LEN` is one byte.
 pub const MAX_PAYLOAD: usize = 255;
 
 /// Bytes of overhead around a payload: `HEAD1 HEAD2 ADDR CMD LEN … SUM`.
@@ -44,12 +25,11 @@ pub const MAX_FRAME: usize = OVERHEAD + MAX_PAYLOAD;
 
 /// Cap on the parser's reassembly buffer. A complete frame is at most [`MAX_FRAME`] bytes, so this
 /// is slack rather than a working limit; it exists so that a stream which never contains a header
-/// cannot grow the buffer without bound (§3.2).
+/// cannot grow the buffer without bound.
 pub const MAX_BUFFER: usize = 4096;
 
-/// Encoding refused. The frame is never truncated to fit — a short write on this device consumes
-/// the *following* command as payload, because its receive parser has no inter-byte timeout
-/// (fixture `[[disagreement]] device_receive_parser_has_no_inter_byte_timeout`, §5.1).
+/// Encoding errors. Oversized frames are refused rather than truncated: incomplete
+/// frames can consume later commands on this bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
     /// The payload does not fit in the one-byte `LEN` field.
@@ -61,15 +41,15 @@ pub enum EncodeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// Fewer payload bytes than the reply's layout requires. Device-supplied lengths are never
-    /// trusted; this is returned instead of indexing past the end (§3.2).
+    /// trusted; this is returned instead of indexing past the end.
     #[error("payload is {got} bytes, need at least {need}")]
     ShortPayload { need: usize, got: usize },
 }
 
-/// The datasheet **transmit** checksum, which is also the correct receive checksum (Appendix).
+/// The datasheet transmit checksum, which is also the correct receive checksum.
 ///
 /// `SUM = (HEAD1 + HEAD2 + ADDR + CMD + LEN + sum(DATA)) & 0xFF`. Upstream's `decode()` sums one
-/// byte fewer, so it accepts a corrupt final payload byte and rejects every error frame (§3.1);
+/// byte fewer, so it accepts a corrupt final payload byte and rejects every error frame;
 /// this covers the whole frame.
 ///
 /// A `payload` longer than [`MAX_PAYLOAD`] cannot be framed at all — [`encode`] rejects it — so
@@ -93,7 +73,7 @@ fn checksum_over(bytes: &[u8]) -> u8 {
     (sum & 0xFF) as u8
 }
 
-/// Encode one complete frame for `cmd` with `payload`, addressed to [`ADDR`] (Appendix).
+/// Encode one complete frame for `cmd` with `payload`, addressed to [`ADDR`].
 ///
 /// Errors rather than truncates: see [`EncodeError`].
 pub fn encode(cmd: u8, payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
@@ -104,8 +84,8 @@ pub fn encode(cmd: u8, payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
 
 /// [`encode`] into a caller-owned buffer, appending to whatever is already there.
 ///
-/// On error `buf` is left exactly as it was found, so a rejected payload cannot leave a partial
-/// frame queued for the transport (§5.1).
+/// On error `buf` is left as it was found, so a rejected payload cannot leave a partial
+/// frame queued for the transport.
 pub fn encode_into(buf: &mut Vec<u8>, cmd: u8, payload: &[u8]) -> Result<(), EncodeError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(EncodeError::PayloadTooLong { len: payload.len() });
@@ -120,7 +100,7 @@ pub fn encode_into(buf: &mut Vec<u8>, cmd: u8, payload: &[u8]) -> Result<(), Enc
     Ok(())
 }
 
-/// One well-formed frame: header stripped, `LEN` consumed, checksum verified (Appendix).
+/// One well-formed frame: header stripped, `LEN` consumed, checksum verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub addr: u8,
@@ -148,7 +128,7 @@ impl Frame {
         Ok(buf)
     }
 
-    /// View this frame as a [`Reply`] for the `serial` reader to match by command byte (Appendix).
+    /// View this frame as a [`Reply`] for the `serial` reader to match by command byte.
     /// `addr` is dropped: a reply's identity is its command byte, never its arrival order.
     pub fn into_reply(self) -> Reply {
         Reply {
@@ -166,7 +146,7 @@ impl From<Frame> for Reply {
 
 /// What the [`Parser`] found in the byte stream. Everything the parser discards is reported;
 /// nothing is dropped silently, because silent drops are how upstream lost every error frame
-/// (§3.1).
+/// .
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A complete frame whose checksum verified.
@@ -176,8 +156,7 @@ pub enum Event {
     /// one byte into `raw`, so `raw` may include bytes belonging to the next frame — see
     /// [`Parser`].
     BadChecksum { raw: Vec<u8> },
-    /// [`Parser::expire_partial`] was called with an incomplete frame in the buffer: the caller's
-    /// read timeout fired and the missing bytes are not coming. This is the §3.2 five-byte reply.
+    /// Incomplete bytes expired by the caller's silence timer.
     Truncated { raw: Vec<u8> },
     /// Bytes discarded while hunting for a header, coalesced. Bytes already reported inside an
     /// [`Event::BadChecksum`] are not counted again.
@@ -185,17 +164,17 @@ pub enum Event {
 }
 
 /// Streaming frame parser: bytes in, [`Event`]s out. Pure — it owns no clock, no I/O and no
-/// timeout, so the caller drives expiry with [`Parser::expire_partial`] (§3.2, §4).
+/// timeout, so the caller drives expiry with [`Parser::expire_partial`].
 ///
 /// # Resynchronisation
 ///
-/// The device answers an undefined command with `57 AB 00 FE 00` — five bytes, `LEN 0`, **no
-/// checksum byte**, confirmed over a ten-second wait (§3.2). Feed that reply followed immediately
+/// The device answers an undefined command with `57 AB 00 FE 00` — five bytes, `LEN 0`, no
+/// checksum byte, confirmed over a ten-second wait. Feed that reply followed immediately
 /// by a real one and a naive parser reads the next frame's `0x57` as the missing checksum byte,
 /// rejects the candidate, and resumes *after* it — losing the next reply entirely.
 ///
 /// So on a checksum mismatch this parser emits [`Event::BadChecksum`] and resumes scanning at the
-/// byte **after the failed candidate's first header byte**, not after the whole candidate. The
+/// byte after the failed candidate's first header byte, not after the whole candidate. The
 /// stolen `0x57` is handed back to the scan and the following reply parses normally. The bytes in
 /// between are not re-reported as [`Event::Garbage`]; they already appeared in `raw`.
 ///
@@ -203,7 +182,7 @@ pub enum Event {
 ///
 /// Events come out in stream order. The parser never matches requests to replies — the device
 /// pushes unsolicited `0x81` frames between a request and its answer, so matching is the caller's
-/// job and is done by command byte (Appendix).
+/// job and is done by command byte.
 ///
 /// # Bounds
 ///
@@ -249,15 +228,10 @@ impl Parser {
         self.events.drain(..)
     }
 
-    /// The caller's read timeout fired while a frame was still incomplete: give up on it.
+    /// Expire an incomplete frame after the transport's silence timeout.
     ///
-    /// Returns [`Event::Truncated`] carrying the abandoned bytes and empties the buffer, or `None`
-    /// if nothing was pending. This is the only way the §3.2 five-byte no-checksum reply is
-    /// retired when nothing follows it: the parser has no clock, and would otherwise wait forever
-    /// for a sixth byte the fixture proves never arrives.
-    ///
-    /// The returned event is *not* queued. Events already queued by [`Parser::push`] are older and
-    /// remain available from [`Parser::next_event`].
+    /// Returns [`Event::Truncated`] and clears buffered bytes, or `None` if empty. The event
+    /// is returned directly; older queued events remain available through [`Parser::next_event`].
     pub fn expire_partial(&mut self) -> Option<Event> {
         if self.buf.is_empty() {
             return None;
@@ -273,7 +247,7 @@ impl Parser {
         self.buf.len()
     }
 
-    /// Drop everything: buffered bytes, queued events and pending garbage. For reconnect (§2.7),
+    /// Drop everything: buffered bytes, queued events and pending garbage. For reconnect,
     /// where nothing from the old connection may be carried across.
     pub fn reset(&mut self) {
         self.buf.clear();
@@ -311,7 +285,7 @@ impl Parser {
                 let raw = self.buf[..total].to_vec();
                 self.flush_garbage();
                 self.events.push_back(Event::BadChecksum { raw });
-                // Byte-wise resync (§3.2): hand every byte after the first header byte back to the
+                // Byte-wise resync: hand every byte after the first header byte back to the
                 // scan, and do not charge them to `Garbage` a second time.
                 self.consume(1);
                 self.suppressed = total - 1;
@@ -381,13 +355,13 @@ impl Parser {
     }
 }
 
-/// The `GET_INFO` (`0x01`) reply payload, `[versionChar, connectedFlag, lockBits, …]` (Appendix).
+/// The `GET_INFO` (`0x01`) reply payload, `[versionChar, connectedFlag, lockBits, …]`.
 ///
 /// The lock bits originate in the *target's* HID output report, so a change in them is proof the
-/// target processed a keystroke — the one end-to-end check that needs no video (Appendix).
+/// target processed a keystroke — the one end-to-end check that needs no video.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeviceInfo {
-    /// `1.0 + (data[0] - 0x30) / 10`. This unit reports `0x38` → 1.8 (Appendix).
+    /// `1.0 + (data[0] - 0x30) / 10`. This unit reports `0x38` → 1.8.
     pub version: f32,
     /// The target has enumerated the emulated HID.
     pub target_connected: bool,
@@ -400,14 +374,10 @@ impl DeviceInfo {
     /// Payload bytes required before any field can be read.
     pub const MIN_PAYLOAD: usize = 3;
 
-    /// Parse a `GET_INFO` reply payload (Appendix).
+    /// Parse a `GET_INFO` reply payload.
     ///
-    /// A payload shorter than [`DeviceInfo::MIN_PAYLOAD`] is [`ParseError::ShortPayload`], never a
-    /// panic: `LEN` is the device's claim, and this device is already known to send frames its own
-    /// documented format forbids (§3.2). Trailing bytes are ignored — the observed reply carries
-    /// five zero bytes after the lock bits and none of them is documented.
-    ///
-    /// A version character below `'0'` saturates to 1.0 rather than wrapping.
+    /// Short payloads return [`ParseError::ShortPayload`]. Trailing undocumented bytes are
+    /// ignored. Version characters below `0` saturate to version 1.0.
     pub fn parse(payload: &[u8]) -> Result<DeviceInfo, ParseError> {
         let fields = (payload.first(), payload.get(1), payload.get(2));
         let (&version_char, &connected, &locks) = match fields {
@@ -429,13 +399,7 @@ impl DeviceInfo {
     }
 }
 
-/// The reply as one line, in one wording for every command that prints it.
-///
-/// `key`, `type` and the viewer's startup line used to print `caps=true` while `devices --probe`
-/// printed `caps=on` for the same bit, which reads as two different facts about the target. The
-/// lock bits are *states of the target's keyboard* (Appendix) and `on`/`off` is what a user checks
-/// them against, so that is the spelling, and it lives here — next to the type — rather than in
-/// each caller.
+/// Format device information with consistent `on`/`off` lock states.
 impl fmt::Display for DeviceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -455,12 +419,9 @@ impl fmt::Display for DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// Just the three lock bits, `num=… caps=… scroll=…`.
+    /// Format only the target lock bits: `num=… caps=… scroll=…`.
     ///
-    /// For the one caller that has a `0x81` frame but not a *query* answer: the device pushes an
-    /// unsolicited lock-state frame after a lock-key change (A12), and reporting its version and
-    /// target flag as if they had just been asked for would be claiming more than was observed
-    /// (§3.4). The spelling is the same one [`DeviceInfo`]'s `Display` uses.
+    /// Unsolicited lock notifications do not establish fresh firmware or connection status.
     pub fn locks(&self) -> String {
         format!(
             "num={} caps={} scroll={}",
@@ -483,13 +444,12 @@ fn on_off(bit: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The observed `GET_INFO` reply (Appendix, fixture `get_info_reply`). Retyped here only
-    /// because these are unit tests of the parser's mechanics; the byte-level authority tests live
-    /// in `tests/proto_fixtures.rs` and read the fixture file (§9.1).
+    /// Parser test payload. Independent packet conformance checks read the TOML fixtures
+    /// in `tests/proto_fixtures.rs`.
     const GET_INFO_REPLY: [u8; 14] = [
         0x57, 0xAB, 0x00, 0x81, 0x08, 0x38, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC4,
     ];
-    /// The §3.2 malformed reply: five bytes, no checksum.
+    /// Recorded five-byte reply without a checksum.
     const NO_CHECKSUM_REPLY: [u8; 5] = [0x57, 0xAB, 0x00, 0xFE, 0x00];
 
     fn events(bytes: &[u8]) -> Vec<Event> {
@@ -565,10 +525,8 @@ mod tests {
         );
     }
 
-    /// §3.2. The device's reply to an undefined command has no checksum byte. Followed immediately
-    /// by a real reply, the missing byte is supplied by the next frame's `0x57`, the candidate
-    /// fails its checksum, and byte-wise resync is what gets the real reply back. Resuming after
-    /// the whole failed candidate would consume `57` and leave `AB 00 81 08 …`, losing the reply.
+    /// A missing checksum consumes the next header byte as a candidate checksum.
+    /// Byte-wise resynchronization must recover the following valid reply.
     #[test]
     fn no_checksum_reply_followed_by_a_real_reply_recovers_the_real_reply() {
         let mut bytes = NO_CHECKSUM_REPLY.to_vec();
@@ -681,9 +639,7 @@ mod tests {
         assert!(!info.num_lock && !info.caps_lock && !info.scroll_lock);
     }
 
-    /// One wording for every command that prints this (H2): `key`, `type`, `devices --probe` and
-    /// the viewer's startup line all print these bits, and they used to disagree — `caps=true`
-    /// here, `caps=on` there, for one bit of one reply.
+    /// Use consistent target-connection wording across device probes and keyboard commands.
     #[test]
     fn the_info_line_reports_lock_bits_as_states() {
         let info = DeviceInfo {

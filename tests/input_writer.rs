@@ -1,9 +1,4 @@
-//! Writer robustness (§3.1, §5.1, §2.6.1) and the §2.8 instrumentation sanity checks.
-//!
-//! A device error frame is a rejected report on a healthy link (§3.1) and must not stop the
-//! writer or lose the next report. A timeout means the frame was written and nothing answered —
-//! the device may still have acted on it (§2.6.1) — so it is counted, flagged, and the writer
-//! carries on.
+//! Writer behavior under device errors, timeouts, and transport failure.
 
 use std::time::Duration;
 
@@ -24,7 +19,7 @@ fn config() -> Config {
     }
 }
 
-/// A device error reply does not stop the writer and does not lose the next report (§3.1).
+/// A device error reply does not stop the writer and does not lose the next report.
 #[test]
 fn a_device_error_does_not_stop_the_writer() {
     let (link, ctl) = fake_link();
@@ -67,7 +62,7 @@ fn a_device_error_does_not_stop_the_writer() {
     let _ = writer.shutdown();
 }
 
-/// A timeout is counted, flags the path degraded, and the writer continues (§5.1, §2.6.1).
+/// A timeout is counted, flags the path degraded, and the writer continues.
 #[test]
 fn a_timeout_is_counted_and_the_writer_continues() {
     let (link, ctl) = fake_link();
@@ -99,8 +94,7 @@ fn a_timeout_is_counted_and_the_writer_continues() {
     let _ = writer.shutdown();
 }
 
-/// §2.8: queue depth, time-in-queue and the coalescing counters are populated. Sanity only — the
-/// point is that overload is observable rather than mysterious.
+/// Overload must populate queue-depth, age, and coalescing counters.
 #[test]
 fn the_instrumentation_is_populated() {
     let (link, ctl) = fake_link();
@@ -173,7 +167,7 @@ fn stats_are_readable_from_a_clone_on_another_thread() {
     let _ = writer.shutdown();
 }
 
-/// The API contract the viewer is written against: `Producer: Clone + Send + Sync` (§2.9).
+/// The API contract the viewer is written against: `Producer: Clone + Send + Sync`.
 #[test]
 fn producer_is_clone_send_and_sync() {
     fn assert_bounds<T: Clone + Send + Sync>() {}

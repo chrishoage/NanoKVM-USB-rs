@@ -1,7 +1,7 @@
-//! CH9329 wire protocol. Pure: no I/O anywhere in this module (§4).
+//! CH9329 framing, HID reports, key mapping, and device replies.
 //!
-//! Authority for byte-level correctness is `fixtures/packets/ch9329.toml` (§9.1). Tests read that
-//! file; they never retype its bytes.
+//! Encoding and parsing are independent of serial I/O. Protocol examples are stored in
+//! `fixtures/packets/ch9329.toml`; see `docs/protocol.md` for framing and hardware quirks.
 
 pub mod frame;
 pub mod keymap;
@@ -12,7 +12,7 @@ pub use frame::*;
 pub use report::*;
 pub use usb_string::*;
 
-/// Command bytes (Appendix).
+/// Command bytes.
 pub mod cmd {
     pub const GET_INFO: u8 = 0x01;
     pub const SEND_KB_GENERAL_DATA: u8 = 0x02;
@@ -29,5 +29,5 @@ pub mod cmd {
     pub const RESET: u8 = 0x0f;
 }
 
-/// Serial defaults confirmed on hardware (Appendix).
+/// Serial defaults confirmed on hardware.
 pub const BAUD: u32 = 57600;

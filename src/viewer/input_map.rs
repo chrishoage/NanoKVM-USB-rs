@@ -1,15 +1,7 @@
-//! Translating winit events into [`crate::input::Event`]s (plan §2.5, §3.4, §10.2).
+//! Host input mapping, pointer projection, and viewer escape bindings.
 //!
-//! Everything here is a pure function or a small accumulator. Nothing in this module touches the
-//! window, the producer or the clock, so all of it is unit tested without a display.
-//!
-//! Two rules from the plan are enforced here rather than downstream:
-//!
-//! - **Host key repeat is discarded** (§2.5). The target's own operating system generates
-//!   repetition from the held HID state; forwarding host repeats doubles it.
-//! - **Physical keys, never text** (§10.2). Only [`winit::keyboard::PhysicalKey::Code`] is
-//!   translated, through [`crate::proto::keymap::hid_key`]. Text injection needs a declared target
-//!   layout and is not part of Stage 1.
+//! Absolute positions use the current letterbox rectangle. Relative motion retains the
+//! target's acceleration semantics. The release key and paste chord are consumed locally.
 
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -23,7 +15,7 @@ use crate::viewer::render::Rect;
 /// Logical pixels of `PixelDelta` scrolling per wheel detent.
 ///
 /// The HID wheel field counts detents, not pixels, so a pixel-precise device (a touchpad) has to
-/// be quantised somewhere. 20 px is roughly one notch of a mouse wheel on this desktop and is a
+/// be quantised somewhere. 20 px is roughly one notch of a mouse wheel on the recorded test setuptop and is a
 /// round number chosen by feel, not by measurement — there is no hardware fact behind it.
 pub const PIXELS_PER_DETENT: f64 = 20.0;
 
@@ -32,48 +24,26 @@ pub const PIXELS_PER_DETENT: f64 = 20.0;
 pub enum KeyAction {
     /// Forward this to the target.
     Forward { key: HidKey, down: bool },
-    /// The release key was pressed: leave capture. Never forwarded (§12 Stage 1).
+    /// The release key was pressed: leave capture. Never forwarded.
     Release,
-    /// The release key was pressed **with Shift held**: paste the clipboard into the target
-    /// (§12 Stage 4c). Never forwarded either — it is the same physical key.
+    /// The release key was pressed with Shift held: paste the clipboard into the target
+    /// . Never forwarded either — it is the same physical key.
     Paste,
-    /// Deliberately swallowed: a host auto-repeat (§2.5), or the release key's own key-up.
+    /// Consumed host repeat or local release-key edge.
     Swallowed,
     /// A physical key this client does not map. Counted and logged; the target never sees it.
     Unmapped,
 }
 
-/// Translate one `WindowEvent::KeyboardInput` key event.
-///
-/// Takes the three fields of `winit::event::KeyEvent` that matter rather than the event itself:
-/// `KeyEvent` carries a platform-private field that cannot be constructed outside winit, so a
-/// function taking the whole event could not be unit tested.
-///
-/// `Pause` is intercepted as the release binding and is never forwarded in either direction, so a
-/// target cannot see half of it. Everything else goes through the keymap; a key with no HID usage
-/// is [`KeyAction::Unmapped`] rather than an error, because a key that maps to nothing is simply
-/// never sent.
-///
-/// # The paste chord (§12 Stage 4c)
-///
-/// `Shift+Pause` is [`KeyAction::Paste`] and bare `Pause` is still [`KeyAction::Release`], so the
-/// never-forwarded surface stays **one key** — which is the whole reason §12 Stage 4c puts the
-/// trigger on a chord of the key already reserved rather than on a second one. Only Shift is
-/// examined: Ctrl+Pause, Alt+Pause and Super+Pause are the release, because a user reaching for
-/// the way out with a modifier still down must get the way out.
-///
-/// `modifiers` is the host's modifier state as winit last reported it in `ModifiersChanged`, which
-/// is the same state the target is being sent — the Shift of the chord was forwarded as an
-/// ordinary key-down before the Pause arrived, which is exactly why the paste job begins by
-/// releasing what the target holds (`chrome::paste`).
+/// Map a host key event from its public fields. Consume release and paste bindings
+/// locally, ignore host repeats, and map other physical keys to supported HID usages.
 pub fn map_key(
     physical_key: PhysicalKey,
     state: ElementState,
     repeat: bool,
     modifiers: ModifiersState,
 ) -> KeyAction {
-    // §2.5: discard host repeat before anything else, including the release key — a held release
-    // key must not re-trigger release once per repeat.
+    // Ignore host repeats so holding the release key cannot retrigger cancellation.
     if repeat {
         return KeyAction::Swallowed;
     }
@@ -105,9 +75,9 @@ pub fn enter_key() -> Option<HidKey> {
     hid_key(KeyCode::Enter)
 }
 
-/// Map a winit mouse button to its CH9329 button bit (Appendix).
+/// Map a winit mouse button to its CH9329 button bit.
 ///
-/// `Other(_)` is ignored: the report has exactly five bits and inventing a mapping for a sixth
+/// `Other(_)` is ignored: the report has five bits and inventing a mapping for a sixth
 /// button would send a press the user did not make on someone else's console.
 pub fn map_button(b: MouseButton) -> Option<u8> {
     Some(match b {
@@ -120,11 +90,11 @@ pub fn map_button(b: MouseButton) -> Option<u8> {
     })
 }
 
-/// Turn a cursor position into an absolute coordinate pair for the target (§3.4).
+/// Turn a cursor position into an absolute coordinate pair for the target.
 ///
 /// `pos` is in physical pixels with the window's top-left as the origin, `rect` is the video
 /// rectangle inside that window, and `frame` is the decoded frame's own dimensions — which come
-/// from its JPEG header and can change under us (§6, A6).
+/// from its JPEG header and can change under us.
 ///
 /// Positions outside the rectangle are clamped to its edge rather than dropped: the pointer has
 /// to be able to reach the last row and column of the target's screen, and a cursor a pixel past
@@ -154,7 +124,7 @@ pub fn map_cursor(pos: (f64, f64), rect: Rect, frame: (u32, u32)) -> Option<(u16
 /// from the window size the event loop *currently* holds, because that is the number a resize
 /// changes and the one the event loop learns first. A rectangle carried across from the render
 /// thread is up to a frame wait plus a present behind, and a cursor mapped through a stale
-/// rectangle reaches the wrong pixel on a live console (§3.4).
+/// rectangle reaches the wrong pixel on a live console.
 pub fn map_cursor_in_window(
     pos: (f64, f64),
     window: (u32, u32),
@@ -163,12 +133,7 @@ pub fn map_cursor_in_window(
     map_cursor(pos, crate::viewer::render::letterbox(window, frame)?, frame)
 }
 
-/// Accumulates fractional relative motion so slow movement is not rounded away (§2.2: relative
-/// motion is an accumulating delta and must be summed, never replaced).
-///
-/// winit delivers `DeviceEvent::MouseMotion` deltas as `f64`. The report carries whole units, so
-/// the fraction is kept here and folded into the next event rather than discarded — otherwise a
-/// pointer moved slowly enough never moves at all.
+/// Accumulate fractional relative motion so slow movement is not rounded to zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RelAccumulator {
     remainder_x: f64,
@@ -188,7 +153,7 @@ impl RelAccumulator {
             return None;
         }
         // Saturating casts: a delta beyond i32 is not a real mouse movement, and the writer
-        // splits anything past the report range across reports anyway (§2.3).
+        // splits anything past the report range across reports anyway.
         Some(Event::PointerRel {
             dx: dx as i32,
             dy: dy as i32,
@@ -198,7 +163,7 @@ impl RelAccumulator {
 
 /// Accumulates wheel scrolling into whole detents.
 ///
-/// **Sign.** winit documents positive `MouseScrollDelta` values as meaning "the content being
+/// Sign. winit documents positive `MouseScrollDelta` values as meaning "the content being
 /// scrolled should move right and down", i.e. the wheel turned away from the user. The HID wheel
 /// field uses the same convention: `+1` is away from the user. So the sign is passed through
 /// unchanged, and this comment is the verification — there is no negation anywhere below.
@@ -260,7 +225,7 @@ mod tests {
 
     #[test]
     fn host_repeat_is_discarded() {
-        // §2.5: the target's OS repeats from held state; forwarding host repeats doubles it.
+        // The target repeats held keys; forwarding host repeats would duplicate repeat behavior.
         assert_eq!(
             key(KeyCode::KeyA, ElementState::Pressed, true),
             KeyAction::Swallowed
@@ -341,8 +306,7 @@ mod tests {
         );
     }
 
-    /// §12 Stage 4c: the paste chord is `Shift+Pause`, and **bare Pause is still the release**.
-    /// Both are on one physical key, so the never-forwarded surface does not grow.
+    /// Shift+Pause pastes while bare Pause releases; both remain local bindings.
     #[test]
     fn shift_pause_is_the_paste_chord_and_bare_pause_is_still_the_release() {
         assert_eq!(
@@ -388,7 +352,7 @@ mod tests {
 
     /// The up of the paste chord is swallowed like the up of the release, in every modifier state
     /// — including one where Shift was let go between the press and the up, which is what a user
-    /// who types the chord quickly actually produces.
+    /// who types the chord quickly produces.
     #[test]
     fn the_paste_chords_key_up_is_never_forwarded() {
         for modifiers in [ModifiersState::SHIFT, ModifiersState::empty()] {
@@ -401,7 +365,7 @@ mod tests {
     }
 
     /// A held paste chord does not re-trigger, for the same reason a held release key does not
-    /// (§2.5): the host repeats, the target's own OS does not need it, and a paste per repeat
+    /// : the host repeats, the target's own OS does not need it, and a paste per repeat
     /// would be a queue of pastes.
     #[test]
     fn a_held_paste_chord_does_not_retrigger() {

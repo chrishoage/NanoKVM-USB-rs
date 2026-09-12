@@ -1,13 +1,7 @@
-//! The no-hardware [`FrameSource`] (§4, §9.3).
+//! Deterministic frame sources for capture tests.
 //!
-//! §9.3: "a synthetic `FrameSource` covers decode and render and makes latency and
-//! drop-behaviour assertions deterministic". This one replays real captured frames, so the
-//! decode path under test is the same one the device exercises.
-//!
-//! It deliberately **mimics an mmap ring**: each frame is written into one internal buffer that
-//! is reused and overwritten, and the caller is handed a copy. That is the only way to make
-//! §9.2 item 8 — "no pending frame references a requeued mmap buffer" — testable without
-//! hardware. A source that handed out a fresh `Vec` each time would pass that test vacuously.
+//! Synthetic sources exercise timeout, corruption, resolution, and disconnect handling
+//! without opening a video device.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,7 +15,7 @@ struct ScriptedFailure {
     error: CaptureError,
 }
 
-/// Replays a list of JPEGs as a [`FrameSource`] (§9.3).
+/// Replays a list of JPEGs as a [`FrameSource`].
 pub struct SyntheticSource {
     /// The source material. Never handed out directly.
     frames: Vec<Vec<u8>>,
@@ -40,7 +34,7 @@ impl SyntheticSource {
     /// A source replaying `frames` in order, looping, one every `interval`.
     ///
     /// `interval` of [`Duration::ZERO`] means "as fast as [`FrameSource::next_frame`] is
-    /// called", which is what the drop-before-decode test needs (§5.2).
+    /// called", which is what the drop-before-decode test needs.
     ///
     /// # Errors
     ///
@@ -66,7 +60,7 @@ impl SyntheticSource {
     }
 
     /// A source replaying every `.jpg` in `dir`, sorted by name. Used with
-    /// `fixtures/frames/absrange`, which holds real 1920x1080 frames off this device (§9.1).
+    /// `fixtures/frames/absrange`, which holds real 1920x1080 frames off this device.
     ///
     /// # Errors
     ///
@@ -89,19 +83,11 @@ impl SyntheticSource {
         Ok(s)
     }
 
-    /// Script a failure: after `n` frames have been delivered, the next call returns `error`
-    /// once, and the call after that resumes normal delivery.
+    /// Schedule a one-shot error after `n` delivered frames.
     ///
-    /// A failed call does not count as a delivery, so calling this three times with the same `n`
-    /// produces three consecutive failures — which is how §6.1 S1-2's "frames stop and later
-    /// resume" is exercised without hardware.
-    ///
-    /// **A scripted failure is paced like a frame**: the call sleeps out its interval before
-    /// failing, exactly as a real dequeue timeout consumes wall clock. Without that, three
-    /// scripted 50 ms timeouts elapse in microseconds and the pipeline never actually stalls,
-    /// so a test claiming to exercise a stall exercises nothing.
-    ///
-    /// Entries are consumed in the order they are scheduled.
+    /// Failures do not count as deliveries, so repeated entries at the same index fail
+    /// consecutively. Each failure waits a frame interval to model real timeout duration.
+    /// Entries are consumed in insertion order.
     pub fn fail_after(&mut self, n: usize, error: CaptureError) {
         self.failures.push(ScriptedFailure { after: n, error });
     }
@@ -152,9 +138,9 @@ impl SyntheticSource {
 impl FrameSource for SyntheticSource {
     /// Hand out the next frame, or the next scripted failure.
     ///
-    /// The frame is written into the internal ring buffer and a **copy** is returned, so the
+    /// The frame is written into the internal ring buffer and a copy is returned, so the
     /// returned frame stays valid and unchanged no matter how many times the ring is
-    /// subsequently overwritten (§5.2, §9.2 item 8).
+    /// subsequently overwritten.
     fn next_frame(&mut self) -> Result<CompressedFrame, CaptureError> {
         // Pace first, then fail: a scripted failure has to cost the wall clock a real dequeue
         // failure costs, or it cannot produce a stall. See `fail_after`.
@@ -164,13 +150,13 @@ impl FrameSource for SyntheticSource {
             return Err(self.failures.remove(pos).error);
         }
 
-        // Overwrite the ring, exactly as the driver overwrites a requeued mmap buffer.
+        // Overwrite the ring, as the driver overwrites a requeued mmap buffer.
         let src = &self.frames[self.cursor % self.frames.len()];
         self.ring.clear();
         self.ring.extend_from_slice(src);
         self.cursor = self.cursor.wrapping_add(1);
 
-        // A6: dimensions from this frame's own header, the same rule the real source follows.
+        // Use the same SOF dimension rule as the hardware source.
         let (width, height) = jpeg::dimensions(&self.ring)
             .map_err(|e| CaptureError::BadFrame(format!("synthetic frame {}: {e}", self.cursor)))?;
         // And the same sanity ceiling the real source applies, so a corrupt-SOF frame can be
@@ -191,9 +177,9 @@ impl FrameSource for SyntheticSource {
             jpeg: jpeg_bytes,
             width,
             height,
-            // An **absolute** `CLOCK_MONOTONIC` stamp, because that is what `CompressedFrame`
+            // An absolute `CLOCK_MONOTONIC` stamp, because that is what `CompressedFrame`
             // documents and what the renderer subtracts from `now_monotonic()` to get a
-            // capture-to-submit age (§5.5). A relative duration since some epoch of this
+            // capture-to-submit age. A relative duration since some epoch of this
             // source's own would make every such age wrong by the process uptime. One interval
             // back from now stands in for the transfer time a real buffer's start-of-exposure
             // stamp is already behind by.
@@ -240,7 +226,7 @@ mod tests {
         assert_eq!(s.delivered(), 5);
     }
 
-    /// §9.2 item 8, directly: the failure this guards is silent corruption, not a crash.
+    /// Reusing a source buffer must not mutate an already-delivered frame.
     #[test]
     fn a_delivered_frame_survives_the_ring_being_overwritten() {
         let frames = two_distinct_fixtures();
@@ -342,8 +328,8 @@ mod tests {
         }
     }
 
-    /// `CompressedFrame::captured_at` is documented as an **absolute** `CLOCK_MONOTONIC` stamp,
-    /// directly subtractable from [`now_monotonic`] (§5.5) — that subtraction is what
+    /// `CompressedFrame::captured_at` is documented as an absolute `CLOCK_MONOTONIC` stamp,
+    /// directly subtractable from [`now_monotonic`] — that subtraction is what
     /// `viewer::render` reports as capture-to-submit age. A relative duration since this
     /// source's own construction would make every such age wrong by the process uptime, so the
     /// clock is asserted rather than assumed.
@@ -390,7 +376,7 @@ mod tests {
     }
 
     /// The sanity ceiling, at the source rather than at the decoder: a frame whose SOF has been
-    /// corrupted into claiming a size the device cannot produce is an unusable frame (§6, A6),
+    /// corrupted into claiming a size the device cannot produce is an unusable frame,
     /// counted as such, and never handed on.
     #[test]
     fn a_header_over_the_ceiling_is_a_bad_frame() {

@@ -1,14 +1,4 @@
-//! The bounded period ring and the drift policy, as properties (plan §4.1 rev 5, §9.2).
-//!
-//! `src/audio/ring.rs` has the worked examples — a full ring drops the oldest, an empty one hands
-//! over silence, a drift streak fires once and resets. These are the invariants those examples
-//! are instances of, checked against arbitrary interleavings of pushes and pops, because the
-//! thing that actually happens in a session is an arbitrary interleaving of pushes and pops.
-//!
-//! The ring is the one part of the audio path where a bug is silent: a lost period is a click
-//! nobody reports and a leaked one is a slowly growing delay. So the accounting identity below —
-//! **everything pushed is either still in the ring, played, or counted as dropped** — is the
-//! property that matters most here, and it is the one a plausible refactor breaks first.
+//! Property tests for bounded audio buffering and independent drift corrections.
 
 use proptest::prelude::*;
 
@@ -43,11 +33,11 @@ proptest! {
                 Op::Push => { ring.push(vec![1; config.period_samples()]); }
                 Op::Pop => { ring.pop(); }
             }
-            prop_assert!(ring.len() <= config.periods);
+            prop_assert!(ring.len()<= config.periods);
         }
     }
 
-    /// The accounting identity: every period that went in is accounted for exactly once — still
+    /// The accounting identity: every period that went in is accounted for once — still
     /// held, played out, or counted as dropped by one of the two drop paths. A period that
     /// vanished from the counters is a click the user hears and nothing reports.
     #[test]
@@ -66,11 +56,10 @@ proptest! {
         prop_assert_eq!(
             c.pushed,
             c.popped + c.overruns + c.drift_drops + ring.len() as u64,
-            "counts {:?} with {} still held", c, ring.len()
-        );
+            "counts {:?} with {} still held", c, ring.len());
     }
 
-    /// Every period that leaves the ring is exactly one period long, silence included. The
+    /// Every period that leaves the ring is one period long, silence included. The
     /// playback side writes whatever it is handed straight to a device that was configured for
     /// one period at a time, so a short buffer would desynchronise the stream for the rest of the
     /// session.
@@ -123,9 +112,8 @@ proptest! {
         }
     }
 
-    /// An overrun and a drift drop are different events and are never conflated: a push reports
-    /// at most one of them, and each has its own counter. §12 Stage 4a requires them separate
-    /// because one is a failure and the other is the correction that prevents it.
+    /// Keep corrective drift drops separate from capacity overruns in both outcomes
+    /// and counters.
     #[test]
     fn a_push_is_counted_once_and_in_one_column(config in configs(), ops in ops()) {
         let mut ring = PeriodRing::new(config);
@@ -197,14 +185,8 @@ proptest! {
 }
 
 proptest! {
-    /// **An outage is not drift.** Whichever side stops, the ring pins against that wall and every
-    /// operation from then on is an xrun — and neither drift counter may move, because §12 Stage
-    /// 4a's drift rate is read straight off those two numbers. A policy that corrected here would
-    /// report a stalled playback sink, or a dongle that was unplugged, as a clock difference of
-    /// several hundred ppm.
-    ///
-    /// Both directions, over an arbitrary prefix of healthy traffic first, so the outage begins
-    /// from a ring in any state — including one that was already near a mark.
+    /// A stopped producer or consumer causes xruns, not clock drift. Test both
+    /// directions long enough to cross the correction window.
     #[test]
     fn an_outage_never_shows_up_as_drift(
         config in configs(),
@@ -235,7 +217,7 @@ proptest! {
             "counts {:?} after a {}-operation outage", after, outage
         );
         // And once it has lasted longer than the ring is deep, the outage is reported as what it
-        // is, on the wall it actually reached. (A shorter one may still be inside the buffer,
+        // is, on the wall it reached. (A shorter one may still be inside the buffer,
         // which is what the buffer is for.)
         if outage > config.periods {
             if drained {

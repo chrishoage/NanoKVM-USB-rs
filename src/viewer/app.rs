@@ -1,18 +1,8 @@
-//! The winit application: the window, the event loop, and everything wired to it (plan §2.6,
-//! §4.1, §5.4, §5.5, §6.1, §12 Stage 1).
+//! Viewer event loop and subsystem coordination.
 //!
-//! # Thread ownership
-//!
-//! This is the event loop thread. It owns the window, the input [`Producer`], the capture state
-//! machine and the shortcut inhibitor handle. It creates the wgpu objects once, in `resumed`,
-//! and then **never touches wgpu again** (§5.4): the `nanokvm-render` thread owns them, and the
-//! two communicate through [`RenderShared`].
-//!
-//! Nothing here blocks. [`Producer::submit`] is non-blocking (§2.9), [`Producer::engage`] is
-//! retried rather than waited on (§2.6), and the render thread's `present()` — which blocks for
-//! about 99 % of every frame — is on the other side of a slot. That separation is the whole point
-//! of §5.4, and the `--stats-interval` line is its acceptance measurement: event-loop handling
-//! latency in microseconds printed next to a present time of a whole frame period.
+//! Input routing is decided before handing events to egui. Capture and release edges,
+//! paste cancellation, and target key-up events must retain their meaning over the menu.
+//! The event loop submits work without waiting for serial, decode, or presentation.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,47 +37,26 @@ const APP_ID: &str = "nanokvm-usb";
 /// How often the title and the release-outcome check run while released or captured.
 const TICK: Duration = Duration::from_millis(250);
 /// How often they run while `Engaging`, where a retry of [`Producer::engage`] is pending and the
-/// writer's acknowledgement is expected within a few milliseconds (§5.1: 4–17 ms per report).
+/// writer's acknowledgement is expected within a few milliseconds.
 const ENGAGING_TICK: Duration = Duration::from_millis(10);
-/// The shortest gap between two chrome builds (§12 Stage 4b).
-///
-/// egui asks for an immediate repaint — `repaint_delay == Duration::ZERO` — while anything is
-/// animating, and taking it literally makes `about_to_wait` re-enter with a zero-length wait and
-/// rebuild as fast as the CPU allows: **measured at over 4096 builds in a 3-second interval on
-/// this desk**, which is a busy loop on the thread §5.4 exists to keep free. A chrome frame more
-/// often than the display refreshes is thrown away by the render thread anyway, so the deadline is
-/// floored here. 16 ms is ~60 Hz: fast enough that a tooltip fade looks continuous, and a cap
-/// rather than a cadence — with nothing animating, the 250 ms tick is what drives a rebuild.
+/// Minimum interval between UI builds. An immediate egui repaint request can
+/// otherwise create a busy loop; rendering faster than the display wastes event-loop time.
 const CHROME_MIN_REPAINT: Duration = Duration::from_millis(16);
 
-/// How long a paste waits for the clipboard **and** for a fresh `GET_INFO` before giving up
-/// (§12 Stage 4c).
-///
-/// Both are answers from something else: the clipboard is written by whichever application owns
-/// the selection, and the lock bits come from the device over a link whose `GET_INFO` round trip
-/// measured 3.98 ms (A11) and whose commissioning deadline is 500 ms. Three seconds is an order of
-/// magnitude past either and is short enough that a menu item which did nothing says why while the
-/// user is still looking at it. A paste that times out has sent nothing: the compile has not
-/// happened yet.
-///
-/// The number itself lives in `chrome::paste`, which is where the refusals that name it are
-/// written, and `chrome::clipboard`'s reader thread gives up on the same one.
+/// Deadline for clipboard fetch and fresh device information before paste preparation fails.
 const PASTE_PREPARE_TIMEOUT: Duration = chrome::paste::PREPARE_TIMEOUT;
 
 /// Event-handling latency samples kept for the stats line.
 const LATENCY_SAMPLES: usize = 4096;
-/// How long teardown waits for the render thread before detaching it. Two `FRAME_WAIT` periods
-/// plus room for one `present()`: enough for a renderer that is merely busy, and far short of the
-/// unbounded wait a surface nobody is compositing produces (§5.4, measured at `present p50 999 ms`
-/// on a locked session).
+/// Maximum render join time before detaching an unresponsive compositor call.
 const RENDER_JOIN: Duration = Duration::from_millis(500);
 
 /// How the pointer is delivered to the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PointerMode {
-    /// Absolute positioning through [`crate::proto::abs_coord`] (§3.4). The default: relative
+    /// Absolute positioning through [`crate::proto::abs_coord`]. The default: relative
     /// motion cannot reach a specific coordinate, because the target applies pointer acceleration
-    /// and magnitudes do not survive (§3.4, measured).
+    /// and magnitudes do not survive.
     #[default]
     Absolute,
     /// Relative motion, with the pointer locked to the window. For targets whose pointer does not
@@ -95,12 +64,7 @@ pub enum PointerMode {
     Relative,
 }
 
-/// What the viewer needs from the command line, plus what the chrome needs to start (§12 Stage
-/// 4b).
-///
-/// `Clone` rather than `Copy` since the chrome arrived: it carries the enumerated mode list, and
-/// the alternative — a fixed-size array of modes — would be exactly the fixed list §12 Stage 4b
-/// says not to have.
+/// Viewer startup settings, device modes, and development controls.
 #[derive(Debug, Clone)]
 pub struct ViewerConfig {
     /// The pointer mode at startup. The chrome's Mouse popover can change it while running, which
@@ -108,39 +72,28 @@ pub struct ViewerConfig {
     pub pointer: PointerMode,
     /// How often to log the statistics line; `None` disables it.
     pub stats_interval: Option<Duration>,
-    /// Quit cleanly after this long. A development flag (§9.3: hardware runs must be bounded).
+    /// Quit cleanly after this long. A development flag.
     pub exit_after: Option<Duration>,
-    /// The persisted chrome settings, already loaded (a malformed file is `main`'s error to
-    /// report, before a window exists — §12 Stage 4b: "not a silent reset").
+    /// Validated persistent settings, loaded before the window is created.
     pub chrome: chrome::Config,
     /// Where to write them back when the user changes one. `None` means nothing is remembered:
     /// a process with no `HOME` and no `XDG_CONFIG_HOME` has nowhere to put a file.
     pub chrome_store: Option<chrome::Store>,
-    /// The capture modes **the device enumerated**, for the Video popover. Empty when the
+    /// The capture modes the device enumerated, for the Video popover. Empty when the
     /// enumeration could not be made; the popover says so rather than offering a guess.
     pub video_modes: Vec<(u32, u32)>,
-    /// A popover to open at startup. **A development flag** (`--chrome-popover`, hidden), so the
-    /// §12 Stage 4b measurement with a popover open can be taken on a desk where the pointer
-    /// cannot be driven. `None` in every ordinary run.
+    /// Optional panel opened at startup for development measurements.
     pub chrome_popover: Option<chrome::Popover>,
     /// The frame rate the modes are offered at — what `--fps` asked for, carried through so a
     /// resolution change renegotiates at the rate the user chose rather than the driver's own
-    /// default (§6, A7).
+    /// default.
     pub fps: u32,
-    /// Engage capture as soon as the window is up, without a click or an Enter. **A development
-    /// flag** (`--capture-on-start`, hidden): §12 Stage 4c's exit criterion is a paste onto the
-    /// target, and nothing on this desk may drive the pointer or the keyboard for a hardware run
-    /// (`CLAUDE.md`). It feeds the reducer exactly the Enter edge a user's own keypress would,
-    /// which is consumed and never forwarded (`viewer::state::capturing_edge`).
+    /// Engage input at startup through the ordinary consumed Enter edge. Development only.
     pub capture_on_start: bool,
-    /// Start a clipboard paste the moment capture engages. **A development flag**
+    /// Start a clipboard paste the moment capture engages. A development flag
     /// (`--paste-on-capture`, hidden), for the same reason as above.
     pub paste_on_capture: bool,
-    /// Feed the release key this long after a paste starts. **A development flag**
-    /// (`--paste-cancel-after-ms`, hidden): §12 Stage 4c's exit criterion includes cancelling a
-    /// running paste, and nobody can press Pause for an unattended run. It takes the *same* path
-    /// the key takes — `Trigger::ReleaseKey` — rather than a private cancel, so what it exercises
-    /// is the shipping cancel and not a test-only one.
+    /// Inject the normal release action after this paste duration. Development only.
     pub paste_cancel_after: Option<Duration>,
 }
 
@@ -151,21 +104,13 @@ pub struct ViewerConfig {
 /// to the quarter-second.
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
-    /// The compositor changed the inhibitor's state (§1.5, q6c).
+    /// The compositor changed the inhibitor's state.
     Inhibit(InhibitEvent),
 }
 
-/// Run the viewer. Blocks until the window closes, the `--exit-after` deadline passes, or
-/// `SIGINT` arrives.
+/// Run the viewer until close, development deadline, or interruption.
 ///
-/// `interrupted` is polled on the tick rather than acted on from the signal handler, because the
-/// only async-signal-safe thing a handler may do is set a flag. The exit path is the same one
-/// `CloseRequested` takes, so a release-all is always requested first (§2.6).
-///
-/// The teardown below runs whether or not the loop returned an error. A loop that failed still
-/// leaves a render thread to stop and a pointer grab to give back, and the caller still has to
-/// reach `WriterHandle::shutdown` — its release-all is the last thing that can unstick a key held
-/// on the target (§2.6.1), so nothing here may return early past it.
+/// The event loop polls `interrupted`; signal handlers do not perform cleanup directly.
 pub fn run(
     pipeline: &PipelineHandle,
     producer: Producer,
@@ -197,19 +142,13 @@ pub fn run(
     }
 }
 
-/// Where a clipboard paste is, from this thread's point of view (§12 Stage 4c).
-///
-/// `Preparing` exists because two answers are needed before a paste can be compiled and **neither
-/// may be waited for on this thread** (§5.4): the clipboard, which another application writes into
-/// a pipe, and a fresh `GET_INFO`, which the writer thread transacts between frames. Both are
-/// asked for at once and joined here; whichever is slower sets the pace, and a deadline covers the
-/// case where one never arrives. Nothing has been sent in this state — the compile has not even
-/// happened — so abandoning it leaves nothing held.
+/// Paste lifecycle. Preparation waits asynchronously for clipboard text and fresh
+/// lock state; delivery starts only after both permit compilation.
 enum PasteState {
     Idle,
     Preparing {
         fetch: chrome::clipboard::Fetch,
-        /// The clipboard text once it has arrived. **Never logged** (`chrome::clipboard`).
+        /// The clipboard text once it has arrived. Never logged (`chrome::clipboard`).
         text: Option<String>,
         /// `Stats::device_info_generation` as it was when the refresh was asked for. The reading
         /// is fresh once this has moved.
@@ -231,11 +170,8 @@ impl PasteState {
 struct App<'a> {
     pipeline: &'a PipelineHandle,
     producer: Producer,
-    /// The audio path, or `None` for `--no-audio`.
-    ///
-    /// Read only for the title. §4.1 rev 5: audio is a side channel, so nothing on the event loop
-    /// may wait on it, act on its failures, or let its absence change anything — which is why
-    /// this is an `Option` the title formats and not a subsystem the loop drives.
+    /// Optional audio handle for status and controls. The event loop never waits for
+    /// audio recovery or propagates its failures into video or input.
     audio: Option<&'a AudioHandle>,
     config: ViewerConfig,
     proxy: EventLoopProxy<UserEvent>,
@@ -253,11 +189,11 @@ struct App<'a> {
     grab: Option<CursorGrabMode>,
     /// The window's size in physical pixels, straight from `Resized`. The event loop knows this
     /// immediately, which is why the letterbox rectangle is computed here rather than read from
-    /// the render thread (§3.4; [`RenderShared::frame_size`]).
+    /// the render thread.
     window_size: (u32, u32),
     /// Whether the pointer is known to be over the surface. `set_cursor_grab` returning `Ok` only
     /// means the request was sent — `zwp_locked_pointer_v1` takes effect once the pointer is
-    /// inside (q6b) — so the cursor is hidden on that confirmation, never on the `Ok`.
+    /// inside — so the cursor is hidden on that confirmation, never on the `Ok`.
     pointer_inside: bool,
     cursor_hidden: bool,
     /// Teardown has already run. It is called from `exiting` and again from `run`; the second call
@@ -267,8 +203,8 @@ struct App<'a> {
     rel: RelAccumulator,
     wheel: WheelAccumulator,
 
-    // ---- the chrome (§12 Stage 4b) --------------------------------------------------------
-    /// The egui context. Cloned into the UI build; never sent to the render thread.
+    // ---- the chrome --------------------------------------------------------
+    // The egui context. Cloned into the UI build; never sent to the render thread.
     egui_ctx: egui::Context,
     /// `None` until `resumed` has a window to bind it to.
     egui_state: Option<egui_winit::State>,
@@ -298,24 +234,21 @@ struct App<'a> {
     /// The mode the pipeline last reported negotiating, for the Video popover's marker. Refreshed
     /// on the tick from [`PipelineStats::negotiated_dimensions`].
     negotiated: Option<(u32, u32)>,
-    /// What the target is holding because this loop forwarded the press (§12 Stage 4b, review
-    /// item 1). Maintained here rather than read from the writer's own held state because the
-    /// routing decision is made on this thread, synchronously, with the event in hand; the writer
-    /// is behind a queue. Fed from exactly the two places that can change what the target holds:
-    /// [`Action::Forward`] and [`Action::ReleaseAll`].
+    /// Input presses forwarded by this event loop. Routing needs synchronous ownership
+    /// information; the writer's held state may lag behind the queue.
     outstanding: chrome::Outstanding,
     /// The host's modifier state, from `ModifiersChanged`. Read by `input_map::map_key` for the
-    /// one chord this client has: `Shift+`the release key starts a paste (§12 Stage 4c).
+    /// one chord this client has: `Shift+`the release key starts a paste.
     modifiers: ModifiersState,
     /// Whether a data-control clipboard could be read at all, probed once at startup. The Paste
-    /// item is disabled with this as its tooltip when it could not (§12 Stage 4c).
+    /// item is disabled with this as its tooltip when it could not.
     paste_available: chrome::clipboard::Availability,
-    /// The paste in flight, if any (§12 Stage 4c).
+    /// The paste in flight, if any.
     paste: PasteState,
     /// How the last paste ended, for the chrome's last-outcome line.
     paste_last: Option<PasteOutcome>,
     /// Why the last attempt was refused before anything was sent, with its offender list.
-    /// Cleared when a paste actually starts, so the chrome never shows a stale refusal beside a
+    /// Cleared when a paste starts, so the chrome never shows a stale refusal beside a
     /// running paste.
     paste_refusal: Option<Refusal>,
     /// When the `--paste-cancel-after-ms` development flag should feed the release key.
@@ -325,10 +258,7 @@ struct App<'a> {
     capture_on_start_done: bool,
     /// `--paste-on-capture` has already been acted on, for the same reason.
     paste_on_capture_done: bool,
-    /// How long each chrome build took **on this thread** — the UI build plus `tessellate`, which
-    /// is the whole of what §5.4 says must not be allowed to inflate input handling. Reported in
-    /// the input stats line beside the handling latency, because that pair is the measurement that
-    /// makes the event-loop-vs-render-thread split falsifiable.
+    /// UI build and tessellation durations, reported separately from input-handler time.
     chrome_build_us: VecDeque<u64>,
 
     started: Instant,
@@ -337,11 +267,9 @@ struct App<'a> {
     last_captured: u64,
     latency_us: VecDeque<u64>,
     unmapped_keys: u64,
-    /// The §2.6.1 release-outcome notice, including the bookkeeping that reports each release
-    /// once rather than every tick.
+    /// Latest release notice and deduplication state.
     release_notice: ReleaseNotice,
-    /// `Stats::reconnects` as of the last tick, so a completed §2.7 reconnect is logged once,
-    /// with the device info the new link reported.
+    /// Last observed reconnect count, used to log each completed recovery once.
     last_reconnects: u64,
     title: String,
     fatal: Option<anyhow::Error>,
@@ -436,16 +364,10 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Stop the render thread and give the compositor and the pointer back. Idempotent.
+    /// Stop rendering and release compositor input capture. Idempotent.
     ///
-    /// **The join is bounded.** The render thread spends almost all of its life inside `present()`
-    /// (§5.4), and `present()` waits on a compositor frame callback that never comes when the
-    /// surface is not being composited — 999 ms at p50 on a locked session, and unbounded in
-    /// principle. Joining unconditionally would hang the whole shutdown there, and everything that
-    /// matters happens *after* it: the release-all has been requested but `main`'s
-    /// `writer.shutdown()` is what waits for it and reports whether it was submitted (§2.6.1). So a
-    /// renderer that has not come back within [`RENDER_JOIN`] is reported and detached; the process
-    /// is exiting anyway.
+    /// The join is bounded because presentation may block while the surface is hidden.
+    /// GPU destruction is deferred to process exit to avoid a closed Wayland connection.
     fn teardown(&mut self) {
         if self.torn_down {
             // `run` calls this again after `run_app` has returned, by which point neither the
@@ -464,15 +386,13 @@ impl<'a> App<'a> {
                     log::error!("nanokvm-render thread panicked");
                 }
             } else {
-                // Detaching is safe only because the render thread never destroys its GPU
-                // objects: it leaves them to the process exit, so nothing it does after this
-                // point can touch the Wayland connection winit is about to close (hardware
-                // defect D8 — `render::release_gpu` carries the mechanism and the core dump).
+                // The render thread retains GPU objects until exit, avoiding destructors on winit
+                // proxies after the display closes.
                 log::warn!(
                     "the render thread has not finished within {RENDER_JOIN:?} — it is most \
                      likely blocked in present() on a surface the compositor is not scheduling. \
                      Detaching it so shutdown can continue; the release-all has already been \
-                     requested. It holds no GPU objects it will try to destroy afterwards (D8)."
+                     requested. It holds no GPU objects it will try to destroy afterwards."
                 );
                 drop(h);
             }
@@ -490,10 +410,7 @@ impl<'a> App<'a> {
             );
             self.title.clear();
             if next.capture() == CaptureState::Engaging {
-                // Entering `Engaging` shortens the tick immediately. Leaving `next_tick` where the
-                // 250 ms cadence put it would give re-capture a dead zone of up to a whole tick in
-                // which the retry never runs and every event that arrives is dropped (§2.6: no
-                // input flows until the acknowledgement lands).
+                // Shorten the tick on engagement so recapture does not wait through the idle interval.
                 self.next_tick = Instant::now() + ENGAGING_TICK;
             }
         }
@@ -501,10 +418,7 @@ impl<'a> App<'a> {
         for action in actions {
             self.perform(el, action);
         }
-        // `--paste-on-capture`, the development flag §12 Stage 4c's exit criterion runs under: the
-        // paste starts the moment input is really flowing, which is `Captured` and not the click
-        // that asked for it (§2.6: nothing is sent until the writer's acknowledgement lands). The
-        // latch is what keeps a release-and-recapture from starting a second one.
+        // Start the development paste only once, after capture is fully engaged.
         if self.config.paste_on_capture
             && !self.paste_on_capture_done
             && self.session.capture() == CaptureState::Captured
@@ -532,7 +446,7 @@ impl<'a> App<'a> {
             Action::ReleasePointer => self.ungrab(),
             Action::TryEngage => {
                 // Never blocks: `NotYetAcked` keeps the state machine in `Engaging` and the next
-                // event or tick retries (§2.6).
+                // event or tick retries.
                 let trigger = match self.producer.engage() {
                     Ok(()) => Trigger::EngageSucceeded,
                     Err(e) => {
@@ -544,10 +458,8 @@ impl<'a> App<'a> {
             }
             Action::ReleaseAll(reason) => {
                 log::info!("release-all requested: {reason:?}");
-                // §2.6 invalidates prior work, and a paste is prior work. Cancelled **before** the
-                // request goes out, so the outcome the chrome shows is the progress as it was when
-                // the release was decided; the release itself is what discharges the keys the job
-                // reports still held.
+                // Record paste cancellation before release-all so its progress reflects the release
+                // decision and its held keys are cleared by that same release.
                 self.cancel_paste(reason);
                 self.producer.request_release_all(reason);
                 // The target holds nothing after this, so nothing is owed a release any more.
@@ -557,7 +469,7 @@ impl<'a> App<'a> {
             }
             Action::Forward(event) => {
                 // Recorded before the submit, and whatever the submit does: a refused press is
-                // followed by a release-all (§2.8), which clears the set again.
+                // followed by a release-all, which clears the set again.
                 match event {
                     crate::input::Event::Key { key, down } => self.outstanding.set_key(key, down),
                     crate::input::Event::Button { button, down } => {
@@ -566,8 +478,7 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 if let Err(e) = self.producer.submit(event) {
-                    // §2.8: an overflow is a failed session, not a dropped event. Surface it and
-                    // require deliberate recapture.
+                    // Overflow cancels the session; retaining the notice explains why recapture is needed.
                     log::warn!("input submission refused: {e}");
                     self.feed(el, Trigger::SubmitFailed(e));
                 }
@@ -576,19 +487,8 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Lock the pointer for relative mode.
-    ///
-    /// `Ok(())` from `set_cursor_grab` means the request was *sent*, not that the pointer is
-    /// locked: `zwp_locked_pointer_v1` only takes effect once the pointer is inside the surface
-    /// (q6b, measured — in a run with the cursor outside the window both modes returned `Ok(())`
-    /// and no relative motion was ever delivered). So `Ok` is recorded as "requested" and nothing
-    /// visible follows from it: the cursor is hidden only once the pointer is confirmed to be over
-    /// the surface, by `CursorEntered` or by relative motion actually arriving. Hiding on the `Ok`
-    /// alone makes the cursor vanish while it is still over another window.
-    ///
-    /// Absolute mode deliberately does not grab. The target's own cursor is in the video, the
-    /// host cursor is what points at it, and confining it would take the pointer away from the
-    /// user with no gain.
+    /// Request relative pointer lock. Success confirms the request was sent, not that
+    /// the compositor granted it. Capture state must still handle later deactivation.
     fn grab_pointer(&mut self) {
         if self.config.pointer != PointerMode::Relative {
             return;
@@ -613,7 +513,7 @@ impl<'a> App<'a> {
         );
     }
 
-    /// Hide the cursor if a grab is up **and** the pointer has been confirmed over the surface.
+    /// Hide the cursor if a grab is up and the pointer has been confirmed over the surface.
     /// Idempotent; called from every place that can supply the confirmation.
     fn hide_cursor_if_confirmed(&mut self) {
         // The chrome's "hide the host cursor" setting is the other reason to hide it, and both go
@@ -635,10 +535,10 @@ impl<'a> App<'a> {
         self.apply_cursor_policy();
     }
 
-    // ---- the chrome (§12 Stage 4b) --------------------------------------------------------
+    // ---- the chrome --------------------------------------------------------
 
     /// The routing rule's inputs, as of right now. Every field is read from this thread's own
-    /// state, synchronously — which is the whole reason the UI build is on this thread (§5.4).
+    /// state, synchronously — which is the whole reason the UI build is on this thread.
     fn route_inputs(&self) -> RouteInputs {
         RouteInputs {
             capture: self.session.capture(),
@@ -646,15 +546,15 @@ impl<'a> App<'a> {
             popover_open: self.chrome.popover_open(),
             modal_open: self.chrome.modal_open(),
             pointer_over_chrome: self.pointer_over_chrome,
-            // §12 Stage 4c. Active from the moment the user asks, not from the first typed key.
+            // Treat preparation as active paste so another request cannot overlap it.
             paste_running: self.paste.is_active(),
-            // The grab is a *request* until the compositor honours it (q6b), and a compositor that
+            // The grab is a *request* until the compositor honours it, and a compositor that
             // refused both modes leaves this false: the pointer is free, the pill is reachable and
             // a click on it must not be forwarded to the target as a real button press.
             pointer_locked: self.grab.is_some(),
             outstanding: self.outstanding,
             // What the *paste* is holding, so clause 2 does not mistake it for something the host
-            // pressed and forward a host key-up into the middle of a character (§12 Stage 4c).
+            // pressed and forward a host key-up into the middle of a character.
             paste_held: match &self.paste {
                 PasteState::Running(job) => job.held(),
                 _ => chrome::Outstanding::default(),
@@ -664,7 +564,7 @@ impl<'a> App<'a> {
 
     /// Hand one raw `WindowEvent` to `egui_winit`.
     ///
-    /// **The `EventResponse` is deliberately discarded.** Routing is decided before this is
+    /// The `EventResponse` is discarded. Routing is decided before this is
     /// called, by [`crate::viewer::chrome::route`], and `consumed` is wrong for a KVM in three
     /// measured ways — the module docs there list them, starting with Tab.
     fn give_to_egui(&mut self, event: &WindowEvent) {
@@ -674,15 +574,7 @@ impl<'a> App<'a> {
         let _ = state.on_window_event(&window, event);
     }
 
-    /// 4a's snapshot, read for the chrome (§12 Stage 4a, 4b).
-    ///
-    /// This is the seam `chrome::audio`'s module docs describe, and it is the only place
-    /// [`ChromeAudio`] is built: everything in `chrome::ui` reads plain numbers and a shared
-    /// flag, and knows nothing about where they came from. One [`AudioHandle::snapshot`] per
-    /// chrome build, copied out under 4a's own lock — the event loop never waits on an audio
-    /// thread, exactly as it never waits on the writer (§2.9).
-    ///
-    /// [`ChromeAudio::from_snapshot`] owns the mapping and is where it is tested.
+    /// Build UI audio facts from the current worker snapshot and mute flag.
     fn audio(&self) -> ChromeAudio {
         let Some(handle) = self.audio else {
             // `--no-audio`: nothing was started, and the user asked for that. Distinct from
@@ -699,7 +591,7 @@ impl<'a> App<'a> {
     /// whatever the user asked for.
     ///
     /// Runs on the event loop. That costs the handling latency the `--stats-interval` line
-    /// reports, and it is the number that makes the choice falsifiable (§5.4).
+    /// reports, and it is the number that makes the choice falsifiable.
     fn build_chrome(&mut self, el: &ActiveEventLoop) {
         let started = Instant::now();
         let Some(window) = self.window.clone() else {
@@ -715,9 +607,7 @@ impl<'a> App<'a> {
         let frame_size = self.render_shared.frame_size();
         let audio = self.audio();
         let negotiated = self.negotiated;
-        // The **live** pointer mode, not the persisted one: `--pointer rel` changes this without
-        // touching the settings file, and the popover has to show what the pointer is doing
-        // (review item 2).
+        // Show the live mode because a CLI override can differ from saved settings.
         let pointer = chrome::MouseMode::from(self.config.pointer);
         let paste = self.paste_facts();
         let modes = std::mem::take(&mut self.config.video_modes);
@@ -767,8 +657,8 @@ impl<'a> App<'a> {
             size_in_pixels: [self.window_size.0.max(1), self.window_size.1.max(1)],
         });
 
-        // Risk 4 of the 4b design: egui's own clock. `Duration::MAX` means "nothing pending";
-        // `ZERO` means "again immediately", which `about_to_wait` turns into a zero-length wait.
+        // Use egui’s repaint deadline even while video is idle. MAX means no deadline;
+        // ZERO requests an immediate event-loop wake.
         self.repaint_at = full
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -809,11 +699,7 @@ impl<'a> App<'a> {
             }
             ChromeCommand::SendShortcut(builtin) => self.send_shortcut(el, builtin),
             ChromeCommand::SetMouseMode(mode) => {
-                // **The live mode is the one truth** (review item 2). The popover renders from it
-                // through `ChromeFacts`, this changes it, and the persisted copy is written from
-                // it *here* — when the user chose it in the UI. A `--pointer` override on the
-                // command line changes the live mode only and is never written back: a flag for
-                // one run must not silently become the remembered setting.
+                // Persist UI choices only. A one-run CLI override must not become a saved preference.
                 self.config.pointer = mode.into();
                 self.chrome.config.mouse_mode = mode;
                 log::info!("chrome: pointer mode is now {:?}", self.config.pointer);
@@ -844,9 +730,7 @@ impl<'a> App<'a> {
             }
             ChromeCommand::SetMuted(muted) => {
                 log::info!("chrome: audio {}", if muted { "muted" } else { "unmuted" });
-                // Authoritative here rather than in the widget (review item 8): the checkbox
-                // asks, and this performs it on both the live flag the playback thread reads and
-                // the setting that will be remembered.
+                // Apply mute to both the playback flag and the saved setting.
                 self.chrome.config.audio_muted = muted;
                 if let Some(handle) = self.audio {
                     handle.set_muted(muted);
@@ -856,12 +740,8 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Submit a built-in shortcut's key transitions through the viewer's own producer.
-    ///
-    /// See `chrome::shortcut`'s module docs for why this is not `STAGE3_FINDINGS` D1's path. Each
-    /// transition goes through the reducer, exactly as a host keystroke does, so the §2.6 release
-    /// and the §2.8 overflow behaviour are the ones the rest of the viewer already has — and so
-    /// the chords' own key-ups cannot be skipped by a path that bypassed the state machine.
+    /// Submit built-in shortcut transitions through the ordinary producer and reducer,
+    /// preserving release and overflow handling.
     fn send_shortcut(&mut self, el: &ActiveEventLoop, builtin: chrome::Builtin) {
         let events = match chrome::shortcut::events(builtin) {
             Ok(e) => e,
@@ -885,7 +765,7 @@ impl<'a> App<'a> {
         }
     }
 
-    // ---- clipboard paste (§12 Stage 4c) -----------------------------------------------------
+    // ---- clipboard paste -----------------------------------------------------
 
     /// What the Keyboard popover's Paste item is, right now.
     ///
@@ -940,8 +820,8 @@ impl<'a> App<'a> {
 
     /// Ask for the clipboard and for a fresh `GET_INFO`, and join them in [`PasteState::Preparing`].
     ///
-    /// Both halves are started here and neither is waited for. **Nothing is compiled yet**, which
-    /// is what makes every refusal below a refusal before anything was sent (§2.8 item 3).
+    /// Both halves are started here and neither is waited for. Nothing is compiled yet, which
+    /// is what makes every refusal below a refusal before anything was sent.
     fn start_paste(&mut self) {
         if self.paste.is_active() {
             log::debug!("a paste is already in flight; the trigger is ignored");
@@ -966,15 +846,8 @@ impl<'a> App<'a> {
                 return;
             }
         };
-        // D2: the target's CapsLock decides whether the letters about to be typed arrive
-        // inverted, and the reading this must not decide from is the one the link happened to be
-        // commissioned with. The writer services this between frames (§2.6: it is the sole
-        // serialization point, for a read of the device as much as for a write).
-        //
-        // The baseline comes back from the request itself. Sampling it from a following `stats()`
-        // would lose the race against a writer that answered in the meantime — and the paste would
-        // then wait out the whole preparation deadline and refuse for a timeout that never
-        // happened (`Producer::refresh_device_info`).
+        // Read the baseline atomically with the refresh request. Sampling afterward could
+        // miss a completed refresh and wait for another generation unnecessarily.
         let info_generation = self.producer.refresh_device_info();
         log::info!("paste: reading the clipboard and refreshing the target's lock bits");
         self.paste = PasteState::Preparing {
@@ -992,7 +865,7 @@ impl<'a> App<'a> {
     fn advance_paste(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         // The `--paste-cancel-after-ms` development flag, taking the release key's own path so
-        // that what an unattended run exercises is the shipping cancel (§12 Stage 4c).
+        // that what an unattended run exercises is the shipping cancel.
         if self.paste_cancel_at.is_some_and(|at| now >= at) && self.paste.is_active() {
             self.paste_cancel_at = None;
             log::info!("--paste-cancel-after-ms elapsed; feeding the release key");
@@ -1069,10 +942,10 @@ impl<'a> App<'a> {
             return;
         }
         if let Some(text) = ready {
-            // **Stale is unknown, not off** (§12 Stage 4c, D2). A refresh that could not be served
+            // Stale is unknown, not off. A refresh that could not be served
             // — no link, a transaction that failed, a reply that did not parse — advances the
             // generation so this is not wedged, and says so; a reading from some earlier minute
-            // wearing a fresh number is exactly what must not decide whether letters are typed.
+            // wearing a fresh number is what must not decide whether letters are typed.
             let caps_lock = if stats.device_info_stale {
                 None
             } else {
@@ -1102,7 +975,7 @@ impl<'a> App<'a> {
 
     /// Compile the clipboard under the declared layout and the lock bits, and start the job.
     ///
-    /// The text reaches the log **only as a byte length** — never as itself and never as anything
+    /// The text reaches the log only as a byte length — never as itself and never as anything
     /// derived from it, a digest included (`chrome::clipboard`'s module docs).
     fn compile_and_start(&mut self, text: String, caps_lock: chrome::paste::CapsLockState) {
         let layout = crate::script::Layout::from(self.chrome.config.layout);
@@ -1136,18 +1009,8 @@ impl<'a> App<'a> {
         self.chrome_dirty = true;
     }
 
-    /// Submit at most one step, and finish the job when there are none left.
-    ///
-    /// One step per pass is what keeps the bounded queue at a depth of one (§2.8): the pace is
-    /// 40 ms and the writer acknowledges a keyboard report in about 4 ms (A11).
-    ///
-    /// **A submission that is refused ends the job from inside `feed`.** §2.8's path for a refusal
-    /// is `Trigger::SubmitFailed` → a release-all, and `Action::ReleaseAll` ends the paste with the
-    /// reason that release was raised for (`cancel_paste`) — as a *failure* for an overflow or a
-    /// dead link, never as a cancellation (§2.8 item 3: never a partially delivered sequence
-    /// reported as success). So there is nothing to test for here afterwards: either the job is
-    /// still running, which means the step was accepted, or it is already over and its outcome
-    /// names why.
+    /// Submit at most one due paste transition. Refusal enters the reducer's release
+    /// path, which ends the paste with partial progress and the corresponding reason.
     fn advance_running(&mut self, el: &ActiveEventLoop, now: Instant) {
         if self.session.capture() != CaptureState::Captured {
             self.fail_paste("input capture ended under the paste".to_string());
@@ -1210,7 +1073,7 @@ impl<'a> App<'a> {
         self.chrome_dirty = true;
     }
 
-    /// End a running paste as a failure (§2.8 item 3). A no-op when none is running.
+    /// End a running paste as a failure. A no-op when none is running.
     fn fail_paste(&mut self, reason: String) {
         if let PasteState::Running(job) = &mut self.paste {
             job.fail(reason);
@@ -1218,18 +1081,7 @@ impl<'a> App<'a> {
         self.finish_paste_if_over();
     }
 
-    /// End whatever the paste is doing, because a release-all is about to happen (§2.6).
-    ///
-    /// **The reason is carried in, and it decides the outcome**: `chrome::paste::ending_for` reads
-    /// the user's own triggers as a cancellation and a session failure — an overflow, a dead link,
-    /// a replaced link — as a *failure*, named. It has to be decided here, because the release-all
-    /// runs synchronously inside the reducer's action and there is nothing left to infer it from
-    /// by the time the job is next advanced.
-    ///
-    /// The keys and buttons the job reports still held are discharged by that release-all — this
-    /// is the one caller of [`chrome::paste::PasteJob::end`], and it is called from
-    /// `Action::ReleaseAll` for exactly that reason. A `Preparing` paste is abandoned instead:
-    /// nothing was compiled, so nothing was sent and nothing is held.
+    /// End paste before release-all, preserving progress and the cancellation or failure reason.
     fn cancel_paste(&mut self, reason: crate::input::ReleaseReason) {
         match std::mem::replace(&mut self.paste, PasteState::Idle) {
             PasteState::Idle => {}
@@ -1273,13 +1125,8 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Write the settings back, but only when they changed (§12 Stage 4b: "write on change, not
-    /// on every frame"), and remember them as written **only when the write succeeded**.
-    ///
-    /// A failed write is logged and is never fatal: losing the memory of which popover was open is
-    /// not a reason to take a window away from someone. It is retried on the next change — see
-    /// [`chrome::config::persist`], which owns that rule and is tested against a store whose first
-    /// save fails.
+    /// Persist changed settings, advancing saved state only on success. Save errors are
+    /// reported without closing the viewer.
     fn persist_chrome(&mut self) {
         chrome::config::persist(
             self.config.chrome_store.as_ref(),
@@ -1310,18 +1157,8 @@ impl<'a> App<'a> {
         self.latency_us.push_back(us);
     }
 
-    /// Absolute pointer position, mapped through the video rectangle (§3.4).
-    ///
-    /// The rectangle is computed here, from **this thread's** window size and the frame dimensions
-    /// the render thread published. Taking a ready-made rectangle from the render thread instead
-    /// made every cursor position wrong for as long as it took that thread to notice the resize
-    /// and present again — up to a frame wait plus a present, about 110 ms — and a cursor mapped
-    /// through the old rectangle lands on the wrong pixel of a live console. The window size is
-    /// known here the instant `Resized` arrives; the frame dimensions change only when the target's
-    /// resolution does (§6, A6), so they are safe to read across the seam.
-    ///
-    /// `None` before the first frame or while the window is degenerate — there is no coordinate to
-    /// send, and inventing one would move a pointer on a live console.
+    /// Map pointer coordinates through the event loop's current video rectangle.
+    /// Render-thread geometry can lag after a resize and would misplace target input.
     fn cursor_event(&self, position: winit::dpi::PhysicalPosition<f64>) -> Option<Trigger> {
         let frame = self.render_shared.frame_size()?;
         let (x, y) =
@@ -1331,8 +1168,8 @@ impl<'a> App<'a> {
 
     /// The 250 ms housekeeping pass: title, release outcome, deadlines, and the stats line.
     ///
-    /// The two exit paths feed `CloseRequested` on every tick until the loop actually stops, which
-    /// can take several. Only the first one releases: the reducer latches the close (§2.6), so the
+    /// The two exit paths feed `CloseRequested` on every tick until the loop stops, which
+    /// can take several. Only the first one releases: the reducer latches the close, so the
     /// epoch is bumped once rather than every 250 ms.
     fn tick(&mut self, el: &ActiveEventLoop) {
         if self.interrupted.load(Ordering::SeqCst) {
@@ -1351,7 +1188,7 @@ impl<'a> App<'a> {
                 return;
             }
         }
-        // `--capture-on-start`, the other development flag (§12 Stage 4c): the Enter edge a user's
+        // `--capture-on-start`, the other development flag: the Enter edge a user's
         // own keypress produces, fed to the reducer. `capturing_edge` consumes the press and eats
         // the up, so the target sees neither half — this captures, it does not type.
         if self.config.capture_on_start && !self.capture_on_start_done && self.window.is_some() {
@@ -1366,9 +1203,7 @@ impl<'a> App<'a> {
         if self.session.capture() == CaptureState::Engaging {
             self.feed(el, Trigger::Retry);
         } else if self.session.capture() == CaptureState::Captured {
-            // The producer can end the session by itself, with no event ever reaching this loop
-            // (see `state::self_release_trigger`). Ask, and run the §2.6 release for whatever it
-            // reports so the user is told to re-capture deliberately (§2.8).
+            // Detect producer-driven cancellation even when no host event was submitted.
             if let Some(trigger) = self_release_trigger(self.producer.is_engaged(), stats.link_down)
             {
                 log::warn!("the input path ended the session by itself ({trigger:?}); releasing");
@@ -1381,7 +1216,7 @@ impl<'a> App<'a> {
         let capture = self.pipeline.stats();
         // The Video popover's marker, from the one place that knows it: what the pipeline says it
         // negotiated with the device (`S_FMT`), not the size the last frame's header reported —
-        // the two legitimately disagree for a few frames after a change (§6, A6).
+        // the two legitimately disagree for a few frames after a change.
         self.negotiated = capture.negotiated_dimensions;
         self.check_release_outcome(&stats);
         self.report_reconnect(&stats);
@@ -1393,12 +1228,7 @@ impl<'a> App<'a> {
         }
     }
 
-    /// §2.7: say when the link came back, and what answered.
-    ///
-    /// One line per completed reconnect, at `info`, carrying the **new** link's `GET_INFO` —
-    /// which is re-queried on every commissioning precisely so that "the same device came back"
-    /// is a checked claim rather than an assumption. A user watching the log after a replug gets
-    /// the firmware version and the target's connected state from the device now in the socket.
+    /// Log each reconnect with the newly queried device information.
     fn report_reconnect(&mut self, stats: &Stats) {
         if stats.reconnects <= self.last_reconnects {
             return;
@@ -1423,8 +1253,7 @@ impl<'a> App<'a> {
         }
     }
 
-    /// §2.6.1: an `Unsent` release means the target may still be holding keys. Say so rather than
-    /// hiding it behind cleared local state.
+    /// An unsent release must remain visible because the target may still hold input.
     fn check_release_outcome(&mut self, stats: &Stats) {
         let was_raised = self.release_notice.raised();
         if let Some(record) = self.release_notice.observe(stats.last_release) {
@@ -1435,8 +1264,7 @@ impl<'a> App<'a> {
                     record.epoch,
                     record.reason
                 ),
-                // Including the one a §2.7 reconnect sends on the replacement link, which is what
-                // retires an earlier `Unsent` — see `ReleaseNotice`.
+                // A submitted reconnect release clears the earlier unsent warning.
                 ReleaseOutcome::Submitted => log::debug!(
                     "release-all for epoch {} ({:?}) submitted",
                     record.epoch,
@@ -1470,9 +1298,7 @@ impl<'a> App<'a> {
                         audio_reason = condition.to_string();
                         AudioTitle::Unavailable(&audio_reason)
                     }
-                    // D2: a side that is opening says so. "Has not started" and "working" used to
-                    // read identically here, which is how an open that never returned stayed
-                    // invisible for six seconds and would have stayed invisible for ever.
+                    // Keep unfinished opens distinct from working audio in diagnostics.
                     (None, Some(side)) => {
                         audio_opening = side.to_string();
                         AudioTitle::Opening(&audio_opening)
@@ -1504,27 +1330,16 @@ impl<'a> App<'a> {
             if let Some(w) = self.window.as_ref() {
                 w.set_title(&title);
             }
-            // The title is the §2.8 surface for outages; logging each change is what lets a
-            // recovery run be checked from the log instead of from someone watching the bar.
+            // Log title changes so recovery state can be checked without observing the window.
             log::info!("title: {title}");
             self.title = title;
         }
     }
 
-    /// The Stage 1 exit measurement for §5.4, and Stage 2's recovery counters beside it.
+    /// Report capture, presentation, input, and recovery measurements.
     ///
-    /// "Input latency must not correlate with render timing" is a behavioural claim, and this is
-    /// the number that supports it: the event loop's own handling latency printed **next to** the
-    /// render thread's present time. The render thread sits inside `present()` for a whole
-    /// refresh period; if that were on the event loop, the handling figures would be milliseconds
-    /// rather than microseconds.
-    ///
-    /// **Two lines, one per subsystem.** Stage 1's single line had grown past 400 characters,
-    /// which is past the point where a terminal wraps it and the eye stops finding anything in
-    /// it; Stage 2 adds the §2.7 and §6.1 recovery counters, which have to be visible without a
-    /// replug to read them by. The split is capture-and-display against input, because that is
-    /// the seam a reader is diagnosing across: "video is bad but input is fine" is one line's
-    /// worth of evidence and not the other's.
+    /// Handler duration and presentation duration are separate measurements; neither
+    /// is end-to-end input latency. Audio statistics are included when enabled.
     fn log_stats(&mut self, input: &Stats, p: &PipelineStats) {
         let elapsed = self
             .last_stats
@@ -1625,11 +1440,7 @@ impl<'a> App<'a> {
             build.len(),
         );
 
-        // A third line, and only when there is audio to describe. §12 Stage 4a requires the drift
-        // rate to be **measured over at least ten minutes**, and a counter that only appears in
-        // the title when it changes cannot be read off a long run — this is the line that makes
-        // that measurement a matter of reading the log rather than of watching a window. The
-        // depth is stated as *configured* here for the same reason it is in the title (§5.5).
+        // Report audio counters for drift measurements, labeling capacity as configured.
         if let Some(handle) = self.audio {
             let a = handle.snapshot();
             let ring = handle.config().ring;
@@ -1660,20 +1471,8 @@ impl<'a> App<'a> {
     }
 }
 
-/// Whether the host cursor should be hidden right now (§12 Stage 4b, review item 7).
-///
-/// Two independent reasons to hide it, and one reason not to:
-///
-/// - the user asked for it in the Mouse popover — but **only over the video**. "Hide the host
-///   cursor over the video" was hiding it over the chrome too, including over the very checkbox
-///   that undoes it, on a setting that persists: a user who ticked it by accident had no pointer
-///   with which to untick it.
-/// - a relative-mode grab is in force *and* the pointer is confirmed over the surface (q6b). That
-///   one is not suspended over the chrome, because under a lock the chrome cannot be reached at
-///   all (`chrome::route`) and `pointer_over_chrome` is stale by definition.
-///
-/// A pure function so the policy can be asserted without a compositor; `App::apply_cursor_policy`
-/// is the only caller and does nothing but push the answer at the window.
+/// Hide the host cursor for explicit hiding or relative lock, except where visible
+/// viewer controls need a pointer.
 fn cursor_should_hide(
     cursor_hidden: bool,
     pointer_over_chrome: bool,
@@ -1683,23 +1482,13 @@ fn cursor_should_hide(
     (cursor_hidden && !pointer_over_chrome) || (grabbed && pointer_inside)
 }
 
-/// Whether a key event must **also** be handed to `egui_winit`, on top of wherever it was routed
-/// (§12 Stage 4b, review item 14).
-///
-/// Every key **release** must, whichever way it was routed. egui maintains `keys_down` from the
-/// events it is given: a key pressed while a popover was open — so the press went to egui — and
-/// released after the popover closed leaves that key in egui's set for good, and egui goes on
-/// believing it is held. A release cannot open a menu, move focus or activate a widget, so there
-/// is nothing to lose by telling egui about one. **Presses are still routed to exactly one side**,
-/// which is the whole point of `chrome::route`.
-///
-/// [`Sink::Chrome`] is excluded only because that arm hands the same event over itself; giving it
-/// twice would be a duplicate event, not a fix.
+/// Whether egui also needs the key event to keep its own held-key state consistent.
+/// Target-owned releases must not leave a stale press in egui.
 fn key_also_goes_to_egui(sink: Sink, state: winit::event::ElementState) -> bool {
     sink != Sink::Chrome && state == winit::event::ElementState::Released
 }
 
-/// Whether a resolution the user chose is worth a renegotiation (§12 Stage 4b, review item 4).
+/// Whether a resolution the user chose is worth a renegotiation.
 ///
 /// `false` for the mode the device says it has already negotiated: reopening the node to arrive
 /// where the stream already is blanks the picture for a second and counts a format change that
@@ -1734,7 +1523,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
         };
 
-        // wgpu setup is the one and only time this thread touches the GPU (§5.4).
+        // wgpu setup is the one and only time this thread touches the GPU.
         let gpu = match Gpu::create(Arc::clone(&window)) {
             Ok(g) => g,
             Err(e) => {
@@ -1772,7 +1561,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         }
 
         // Shortcut inhibition is optional: without it the compositor keeps its own shortcuts and
-        // everything else still works (§1.5).
+        // everything else still works.
         let proxy = self.proxy.clone();
         match ShortcutInhibit::new(
             Arc::clone(&window),
@@ -1789,7 +1578,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         }
 
         // The first `Resized` usually arrives promptly, but the cursor mapping must not depend on
-        // that: seed the size from the window itself (§3.4).
+        // that: seed the size from the window itself.
         let size = window.inner_size();
         self.window_size = (size.width, size.height);
         self.window = Some(window);
@@ -1797,20 +1586,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         el.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
     }
 
-    /// # Routing (§12 Stage 4b)
-    ///
-    /// Three classes of event, and the difference matters:
-    ///
-    /// - **State**, not input — `Resized`, `ScaleFactorChanged`, `Focused`, `CursorEntered`,
-    ///   `CursorLeft`, `ModifiersChanged`, `ThemeChanged`: always handed to `egui_winit`, because
-    ///   egui's layout is simply wrong without them, and they are nothing the target can receive.
-    /// - **Pointer motion**: also always handed to `egui_winit`, so the pill's hover highlight
-    ///   clears when the pointer leaves it — egui never hears a motion it was not given — *and*
-    ///   routed, so the target still gets the motion when the pointer is over the video.
-    /// - **Keys, buttons and the wheel**: routed, and given to exactly one side.
-    ///
-    /// The `EventResponse` `egui_winit` returns is discarded everywhere. See
-    /// [`crate::viewer::chrome::route`] for the three measured reasons.
+    /// Route state notifications and input before egui processing. Release edges retain
+    /// the owner of their press; local controls must not strand target input.
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let entered = Instant::now();
         if matches!(
@@ -1831,22 +1608,20 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             WindowEvent::Resized(size) => {
                 // The render thread owns surface reconfiguration; this only posts the size. The
                 // size is also kept here, because the cursor mapping is computed on this thread
-                // from it and must be right on the very next `CursorMoved` (§3.4).
+                // from it and must be right on the very next `CursorMoved`.
                 self.window_size = (size.width, size.height);
                 self.render_shared.request_resize(size.width, size.height);
             }
-            // §5.4: while the compositor is not showing this surface it schedules no frame
-            // callbacks, so `present()` blocks for as long as it likes. The render thread stops
-            // presenting rather than parking in it, which is what lets teardown finish.
+            // Pause hidden-surface presentation because the compositor may withhold callbacks.
             WindowEvent::Occluded(occluded) => {
                 log::debug!("window occluded: {occluded}");
                 self.render_shared.set_occluded(occluded);
             }
-            // The one chord this client has reads this (§12 Stage 4c). Tracked here rather than
+            // The one chord this client has reads this. Tracked here rather than
             // from the key events themselves because winit's own state is the authority on what is
             // held, including modifiers pressed before the window had focus.
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            // q6b: `set_cursor_grab` returning `Ok` is not proof the pointer is over the surface;
+            // `set_cursor_grab` returning `Ok` is not proof the pointer is over the surface;
             // this is.
             WindowEvent::CursorEntered { .. } => {
                 self.pointer_inside = true;
@@ -1860,17 +1635,14 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.last_cursor = None;
                 self.apply_cursor_policy();
             }
-            // §2.6 and §12 Stage 1: niri will not deactivate the inhibitor for us, so release on
-            // focus loss is client-driven and hangs off exactly this event.
+            // Release explicitly on focus loss; compositor inhibitor deactivation is not guaranteed.
             WindowEvent::Focused(false) => self.feed(el, Trigger::FocusLost),
             // `event: ref key` rather than `ref event`, so the whole `WindowEvent` is still
             // nameable inside the arm: `Sink::Chrome` hands `egui_winit` the event as winit
             // delivered it, never a reconstruction — a rebuilt event would need a `DeviceId` this
             // code has no way to forge.
             WindowEvent::KeyboardInput { event: ref key, .. } => {
-                // §12 Stage 4c: `Shift+`the release key is the paste chord, and the same chord
-                // during a running paste is the release — `resolve_paste_chord` is where that is
-                // decided, once, so everything downstream is the release path that already exists.
+                // Resolve a repeated paste chord as cancellation before ordinary key routing.
                 let action = chrome::resolve_paste_chord(
                     input_map::map_key(key.physical_key, key.state, key.repeat, self.modifiers),
                     self.paste.is_active(),
@@ -1885,9 +1657,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         self.give_to_egui(&event);
                         self.chrome_dirty = true;
                     }
-                    // A key `input_map` swallowed, or one a running paste must not be interrupted
-                    // by (4c). `Unmapped` is still counted, because the count is what says a
-                    // keyboard has keys this client cannot send.
+                    // Count unmapped keys even while paste suppresses forwarding, so unsupported
+                    // hardware remains visible in diagnostics.
                     Sink::Dropped => {
                         if action == KeyAction::Unmapped {
                             self.unmapped_keys += 1;
@@ -1898,9 +1669,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                         KeyAction::Forward { key, down } => {
                             self.feed(el, Trigger::Key { key, down })
                         }
-                        // The release path, and the one that cancels a running paste: the
-                        // cancellation hangs off `Action::ReleaseAll`, which this produces, so
-                        // every §2.6 trigger cancels a paste and not just this one.
+                        // Use the common release action so every release trigger also cancels paste.
                         KeyAction::Release => self.feed(el, Trigger::ReleaseKey),
                         KeyAction::Paste => self.start_paste(),
                         // `route_key` sends these to `Dropped`; the arms are here so the match is
@@ -1954,14 +1723,14 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.last_cursor = Some((position.x, position.y));
                 let was_over = self.pointer_over_chrome;
                 self.pointer_over_chrome = self.hit.hits((position.x, position.y));
-                // egui hears **every** motion, whichever way the routing goes: a hover highlight
+                // egui hears every motion, whichever way the routing goes: a hover highlight
                 // it was never told to clear stays lit, and the pill would look pressed while the
                 // pointer is over the target. Only the rebuild is gated — on the pointer being
                 // over the chrome or having just left it — so motion over the video costs nothing.
                 self.give_to_egui(&event);
                 if was_over != self.pointer_over_chrome {
                     // The cursor is hidden over the video and shown over the pill, so crossing the
-                    // edge is exactly when that has to be re-decided (`cursor_should_hide`).
+                    // edge is when that has to be re-decided (`cursor_should_hide`).
                     self.apply_cursor_policy();
                 }
                 if was_over || self.pointer_over_chrome {
@@ -1969,7 +1738,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 }
                 if chrome::route_pointer(&self.route_inputs(), PointerKind::Motion) == Sink::Target
                     // Relative mode takes its motion from `DeviceEvent::MouseMotion`; under a
-                    // locked pointer winit delivers no `CursorMoved` at all (q6b).
+                    // locked pointer winit delivers no `CursorMoved` at all.
                     && self.config.pointer == PointerMode::Absolute
                 {
                     if let Some(t) = self.cursor_event(position) {
@@ -1987,7 +1756,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.config.pointer == PointerMode::Relative {
                 // Relative motion arriving is the other confirmation that the pointer is really
-                // over the surface and the lock is in force (q6b).
+                // over the surface and the lock is in force.
                 self.pointer_inside = true;
                 self.hide_cursor_if_confirmed();
                 if let Some(e) = self.rel.push(delta) {
@@ -2001,7 +1770,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             // `active` is not a focus signal and means nothing here; `inactive` is the user's
-            // Mod+Escape, a compositor-driven request to be let out (q6c).
+            // Mod+Escape, a compositor-driven request to be let out.
             UserEvent::Inhibit(InhibitEvent::Active) => {}
             UserEvent::Inhibit(InhibitEvent::Inactive) => {
                 log::info!("compositor deactivated the shortcut inhibitor; releasing capture");
@@ -2010,12 +1779,8 @@ impl ApplicationHandler<UserEvent> for App<'_> {
         }
     }
 
-    /// The loop's clock, and since 4b the chrome's too.
-    ///
-    /// egui asks to be run again through `viewport_output[ROOT].repaint_delay`, and that deadline
-    /// is folded into the same `WaitUntil` the 250 ms tick already uses rather than given a timer
-    /// of its own: every timer in this client stays on the event loop, and the render thread stays
-    /// purely reactive. `RedrawRequested` remains unused.
+    /// Schedule statistics and UI repaints on the event loop’s shared deadline.
+    /// The render thread stays reactive; `RedrawRequested` is unused.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         if now >= self.next_tick {
@@ -2037,7 +1802,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
                 self.feed(el, Trigger::CloseRequested);
             }
         }
-        // The paste's clock, folded into the same loop as everything else (§12 Stage 4c): a job
+        // The paste's clock, folded into the same loop as everything else: a job
         // is advanced by at most one key transition per pass, and the pass that runs it is this
         // one. Before the chrome build, so a step taken now is on screen in the same frame.
         self.advance_paste(el);
@@ -2056,7 +1821,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
-        // **This** is where teardown has to happen, not in `run` afterwards: winit calls `exiting`
+        // This is where teardown has to happen, not in `run` afterwards: winit calls `exiting`
         // while the event loop — and therefore its `wl_display` — is still alive, and the shortcut
         // inhibitor borrows that display (see `viewer::wayland`'s module docs). `run_app` consumes
         // the loop, so by the time `run` regains control there is nothing left to disarm against.
@@ -2068,9 +1833,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
 mod tests {
     use super::*;
 
-    /// **Review item 7.** "Hide the host cursor over the video" was hiding it over the chrome too,
-    /// including over the checkbox that undoes it — with the setting persisted, a user who ticked
-    /// it by accident had no pointer left to untick it with.
+    /// Hide the host cursor over video only; local controls still need a visible pointer.
     #[test]
     fn the_hidden_cursor_comes_back_over_the_chrome() {
         // The setting on, the pointer over the video: hidden, which is the point of the setting.
@@ -2086,16 +1849,15 @@ mod tests {
     fn a_confirmed_grab_hides_the_cursor_whatever_the_setting_says() {
         assert!(cursor_should_hide(false, false, true, true));
         assert!(cursor_should_hide(false, true, true, true));
-        // A grab that is only *requested* — the pointer is not over the surface yet (q6b) — hides
+        // A grab that is only *requested* — the pointer is not over the surface yet — hides
         // nothing: the cursor would vanish while it is still over another window.
         assert!(!cursor_should_hide(false, false, true, false));
         // And with neither reason, it stays visible.
         assert!(!cursor_should_hide(false, false, false, true));
     }
 
-    /// **Review item 14.** egui's `keys_down` goes stale when a key it was told about is released
-    /// without it. Every release is given to egui as well as being routed; every press is routed
-    /// to exactly one side and no more.
+    /// Clear egui’s held-key state when releases bypass it for the target.
+    /// Otherwise a later local event can inherit stale modifiers.
     #[test]
     fn every_key_release_is_also_given_to_egui() {
         use winit::event::ElementState::{Pressed, Released};
@@ -2114,10 +1876,7 @@ mod tests {
         assert!(!key_also_goes_to_egui(Sink::Chrome, Pressed));
     }
 
-    /// **Review item 4.** Clicking the mode the device has already negotiated must not reopen it:
-    /// the picture would blank for a second to arrive where it already is. This is also why
-    /// `negotiated` has to be *assigned* from `PipelineStats::negotiated_dimensions` — left at
-    /// `None`, as it was, every clause below takes the first branch and the guard can never fire.
+    /// Selecting the current mode must not interrupt an established stream.
     #[test]
     fn the_negotiated_mode_is_not_renegotiated() {
         assert!(

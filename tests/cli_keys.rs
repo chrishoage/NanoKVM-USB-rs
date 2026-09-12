@@ -1,20 +1,7 @@
-//! `nanokvm key`, `type` and `macro` as *process* behaviour (§2.6, §2.6.1, §2.8 item 3, §2.9,
-//! §10.2, §12 Stage 3).
+//! Keyboard commands exercised as child processes against a pseudo-terminal bridge.
 //!
-//! The compiler is pure and is tested in `src/script/` and `tests/script.rs`. What is left is
-//! everything that only means anything as a process: what did the device last see before this
-//! one died, what was on the wire before it refused to run, and what exit status did the caller
-//! get. None of that can be observed in-process, so every test here execs the built binary
-//! (`env!("CARGO_BIN_EXE_nanokvm")`) and points it at [`FakeCh9329`] — a scripted CH9329 on a pty
-//! (§9.3).
-//!
-//! **No hardware is touched.** The "serial port" is a pty, the video node named is a path that
-//! cannot exist, and `--dry-run` opens nothing at all. `/dev/video0`–`3` and `/dev/ttyACM0` are
-//! the user's hardware (CLAUDE.md) and are never named here, not even as a path expected to fail.
-//!
-//! These tests are the ones the `type-keys` instrument carried before Stage 3 replaced it; the
-//! properties they pin (the `GET_INFO` gate, the `Drop` guard, the three signals, the abort that
-//! still releases) came from the adversarial review of that instrument and are unchanged.
+//! Checks cover validation before device access, report order, partial delivery, and
+//! release on errors and signals. Source checks exclude mouse commands from CLI scripts.
 
 #[path = "support/child_guard.rs"]
 mod child_guard;
@@ -36,7 +23,7 @@ use child_guard::ChildGuard;
 
 /// A path that cannot exist, as in `tests/viewer_startup.rs`, which also guards that it does not.
 /// Given as `--video` so device selection is decided by `--serial` alone and never by what is
-/// plugged into this desk.
+/// plugged into the recorded test setup.
 const ABSENT: &str = "/dev/nanokvm-does-not-exist";
 
 /// Longest a command under test may take to exit. Generous: the slowest run here is twenty
@@ -57,7 +44,7 @@ const CAPS_LOCK_BIT: u8 = 0b010;
 /// The recorded desk these runs enumerate instead of the developer's own.
 ///
 /// Without it the binary walks the real `/sys` and `QUERYCAP`s whatever video nodes are plugged
-/// in — on this desk the dongle and the user's webcam (CLAUDE.md). `--sysfs-root` points discovery
+/// in — on the recorded test setup the dongle and the user's webcam (CLAUDE.md). `--sysfs-root` points discovery
 /// at the fixture and stops it opening any node (`cli::sources`).
 fn fixture_root() -> std::path::PathBuf {
     nanokvm::discovery::testing::fixture("usb2-desk")
@@ -94,8 +81,8 @@ fn spawn(fake: &FakeCh9329, args: &[&str]) -> ChildGuard {
 
 /// Wait out the child within [`EXIT_BOUND`] and collect everything it said, stderr first.
 ///
-/// The pipes are taken **before** the wait, because reaping the child takes them with it — and
-/// they are read only **after** it, because reading a live child's output to EOF would be an
+/// The pipes are taken before the wait, because reaping the child takes them with it — and
+/// they are read only after it, because reading a live child's output to EOF would be an
 /// unbounded wait. Everything these commands print is a handful of lines, well inside a pipe
 /// buffer, so nothing blocks in between.
 fn finish(guard: &mut ChildGuard) -> (ExitStatus, String) {
@@ -128,7 +115,7 @@ fn is_release_all(f: &Frame) -> bool {
 /// How many keyboard frames a script of `reports` reports puts on the wire: its own, plus the
 /// release-all the `Released` guard sends on the way out.
 ///
-/// The guard runs on *every* exit path including the successful one (§2.6), so a clean run always
+/// The guard runs on *every* exit path including the successful one, so a clean run always
 /// ends with one more release-all than the script itself contains. Spelled out here because a
 /// test that quietly expected one fewer would be asserting the guard away.
 fn with_the_guards_release(reports: usize) -> usize {
@@ -186,7 +173,7 @@ fn usage(key: KeyCode) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// SIGINT mid-script must leave no key held: the run aborts and the `Drop` guard's release-all is
-/// the last thing on the wire (§2.6, §2.6.1).
+/// the last thing on the wire.
 ///
 /// Fails if the guard never runs, if the interrupt is only noticed after the whole script, or if
 /// the last frame the device saw was a press.
@@ -308,13 +295,8 @@ fn the_get_info_gate_sends_no_keyboard_report() {
     );
 }
 
-/// A device error mid-script must abort, report how far it got, and still release (§2.8 item 3,
-/// §2.6).
-///
-/// The fake starts rejecting keyboard reports once the script is under way, so the failure lands
-/// in the middle rather than on the first report. The release-all is rejected too — which is
-/// exactly the §2.6.1 case — so what is checked is that the release was *attempted* and reached
-/// the device, and that the process said so rather than exiting quietly.
+/// Reject reports mid-script, including cleanup. The CLI must report partial
+/// progress and the failed release attempt; a sent release is not a successful one.
 #[test]
 fn a_midscript_failure_aborts_and_still_releases() {
     let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn fake");
@@ -349,12 +331,12 @@ fn a_midscript_failure_aborts_and_still_releases() {
     );
     assert!(
         output.contains("[release-all]"),
-        "the release-all's outcome must be reported, not swallowed (§2.6.1)\n{output}"
+        "the release-all's outcome must be reported, not swallowed \n{output}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Compile before opening (§2.8 item 3).
+// Compile before opening.
 // ---------------------------------------------------------------------------
 
 /// `--dry-run` prints the table and opens nothing: not one byte reaches the port.
@@ -414,8 +396,7 @@ fn a_dry_run_resolves_no_device_at_all() {
     assert!(output.contains("key a"), "{output}");
 }
 
-/// §10.2 and §2.8 item 3: a character the declared layout cannot reach is refused before the port
-/// is opened, so the pty sees nothing at all — not even the §5.1 resync preamble.
+/// Unsupported text must fail before opening the serial port or sending a preamble.
 #[test]
 fn an_unreachable_character_is_refused_before_anything_is_opened() {
     let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn fake");
@@ -457,9 +438,7 @@ fn a_macro_layout_directive_decides_when_the_flag_is_absent() {
     assert!(output.contains("dry run: 2 reports"), "{output}");
 }
 
-/// And the directive is still checked: an unknown layout is an unknown layout, and one that
-/// disagrees with a `--layout` that *was* given is still the conflict it always was (§10.2 — two
-/// claims about the target and only one of them can be true).
+/// A file layout and an explicitly supplied CLI layout must agree.
 #[test]
 fn a_macro_layout_directive_is_still_validated_and_still_conflicts() {
     let path = macro_file("layout-de.macro", "layout de\nkey a\n");
@@ -479,7 +458,7 @@ fn a_macro_layout_directive_is_still_validated_and_still_conflicts() {
 }
 
 // ---------------------------------------------------------------------------
-// CapsLock (§10.2).
+// CapsLock.
 // ---------------------------------------------------------------------------
 
 /// The default policy refuses, and refuses *before* the guard exists: a target whose CapsLock is
@@ -499,7 +478,7 @@ fn capslock_on_refuses_to_type_and_sends_no_keyboard_report() {
     assert!(output.contains("nanokvm key capslock"), "{output}");
     assert!(output.contains("--caps-lock ignore|compensate"), "{output}");
     // The port was opened, resynchronised and queried before this refusal, so what it promises is
-    // about keyboard reports and not about the wire (§3.4).
+    // about keyboard reports and not about the wire.
     assert!(output.contains("No keyboard report was sent."), "{output}");
     assert_eq!(
         keyboard_frames(&fake).len(),
@@ -508,7 +487,7 @@ fn capslock_on_refuses_to_type_and_sends_no_keyboard_report() {
     );
 }
 
-/// `compensate` inverts the shift bit on letters and says so; `ignore` sends exactly what an
+/// `compensate` inverts the shift bit on letters and says so; `ignore` sends what an
 /// unlocked target would have been sent. The two differ in one bit, which is the whole decision.
 #[test]
 fn capslock_compensate_shifts_a_letter_and_ignore_does_not() {
@@ -573,19 +552,19 @@ fn a_chord_is_unaffected_by_the_capslock_policy() {
 }
 
 // ---------------------------------------------------------------------------
-// What actually goes on the wire.
+// What goes on the wire.
 // ---------------------------------------------------------------------------
 
-/// The Stage 2 command, as a macro file, through the real binary: `ctrl+alt+t`, `sudo reboot`,
+/// The command, as a macro file, through the real binary: `ctrl+alt+t`, `sudo reboot`,
 /// Enter.
 ///
-/// Two things are pinned. **The frames, against the authority** (§9.1): every payload
+/// Two things are pinned. The frames, against the authority: every payload
 /// `fixtures/packets/ch9329.toml` describes must arrive as the bytes the file gives, and the
-/// bytes are read from it rather than retyped. **The US-QWERTY table**, as the modifier and usage
+/// bytes are read from it rather than retyped. The US-QWERTY table, as the modifier and usage
 /// of every character in `sudo reboot` (HID usage tables ch. 10), so a later edit to the table
 /// cannot quietly change what is typed at a root prompt.
 #[test]
-fn the_us_qwerty_path_types_the_stage2_command_in_order() {
+fn the_us_qwerty_path_types_the_reboot_command_in_order() {
     // (modifiers, usage) per character of "sudo reboot", US QWERTY.
     let text: &[(u8, u8)] = &[
         (0x00, 0x16), // s
@@ -608,8 +587,8 @@ fn the_us_qwerty_path_types_the_stage2_command_in_order() {
     want.push((0x00, usage(KeyCode::Enter)));
 
     let path = macro_file(
-        "stage2.macro",
-        "# the §6.1 S2-2 command\nkey ctrl+alt+t\ntype sudo reboot\nkey enter\n",
+        "reboot.macro",
+        "# Open a terminal and reboot the target\nkey ctrl+alt+t\ntype sudo reboot\nkey enter\n",
     );
     let fake = FakeCh9329::spawn(Behaviour::default()).expect("spawn fake");
     let mut child = spawn(
@@ -650,7 +629,7 @@ fn the_us_qwerty_path_types_the_stage2_command_in_order() {
         );
     }
 
-    // §9.1: where the authority describes a payload, the bytes on the wire are its bytes.
+    // Compare wire payloads with the independent packet fixtures.
     let fixtures = Fixtures::load().expect("fixtures/packets/ch9329.toml");
     let mut matched: Vec<String> = Vec::new();
     for frame in &frames {
@@ -719,14 +698,8 @@ fn type_dash_reads_the_text_from_stdin() {
     );
 }
 
-/// §2.9: a macro's `wait` paces the target, so the pause really happens at send time and is not
-/// merely a step in the compiled script.
-///
-/// Measured as wall time against the same macro without the wait, because the fake records what
-/// it received but not when: the difference between the two runs is the only place the pause can
-/// be. The bounds are deliberately loose — everything else the two runs do is identical, so the
-/// 300 ms has nowhere to hide, and a machine slow enough to lose 200 ms of it would have failed
-/// the whole suite already.
+/// Compare elapsed time with and without `wait` because the fake records bytes,
+/// not timestamps. Loose bounds tolerate scheduling noise while detecting a skipped wait.
 #[test]
 fn a_macro_wait_delays_the_reports_that_follow_it() {
     let with_wait = run_two_chord_macro("with-wait.macro", "key a\nwait 300\nkey b\n");
@@ -777,7 +750,7 @@ fn run_two_chord_macro(name: &str, body: &str) -> Duration {
 /// or destroy something (CLAUDE.md), and no command in `src/cli/` and nothing in the compiler has
 /// any business building one.
 ///
-/// **Every** file in both directories is read from disk and the count is asserted against the
+/// Every file in both directories is read from disk and the count is asserted against the
 /// directory listing, so a file added to either is searched too rather than quietly exempt. This
 /// is the one such test: the narrower one in `tests/script.rs` covered `src/script/` alone and
 /// left `shot.rs`, `devices.rs` and `out.rs` unchecked.

@@ -1,15 +1,4 @@
-//! §2.7 reconnect, against the in-memory fakes. The link is a `FakeLink`; the *source* of links is
-//! a `FakeSource` whose answers the test writes in advance.
-//!
-//! **Nothing here asserts that the device received anything** (§2.6.1). Every assertion is about
-//! what the writer submitted, in what order, and about the locally observable gating — which is
-//! the same boundary `tests/input_cancellation.rs` draws, and for the same reason.
-//!
-//! Determinism comes from the fakes' rendezvous points: `wait_for_attempts` on the source,
-//! `wait_for_stalled`/`wait_for_frames` on a link, `wait_for_reconnects` on the writer. The one
-//! place a test polls — `settle`, used to observe an epoch bump that has no rendezvous of its own —
-//! polls a *condition* with a bounded deadline and fails at it, exactly as the pty fake's
-//! `wait_for_received` does. No test sleeps for a fixed time and hopes.
+//! Reconnect commissioning and cancellation using controlled in-memory link sources.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -93,8 +82,7 @@ fn kill(producer: &Producer, link: &FakeControl, before: u64) {
 
 // -- the initial link -------------------------------------------------------
 
-/// The first link goes through the §2.7 sequence in full, and the `GET_INFO` at the end of it is
-/// what turns `link_down` off.
+/// Commissioning keeps the link down until device information is validated.
 #[test]
 fn the_first_link_is_commissioned_with_the_whole_sequence() {
     let (producer, writer, sctl, links) = rig(1);
@@ -118,7 +106,7 @@ fn the_first_link_is_commissioned_with_the_whole_sequence() {
     assert_eq!(release.outcome, ReleaseOutcome::Submitted);
     assert!(
         !producer.is_engaged(),
-        "§2.8: input resumes on deliberate recapture, not on a link coming up"
+        "input resumes on deliberate recapture, not on a link coming up"
     );
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
@@ -156,8 +144,7 @@ fn a_startup_with_no_device_reports_it_and_keeps_trying() {
 
 // -- a failure, and the link that replaces it -------------------------------
 
-/// §2.6.1 first, §2.7 second: the failure's own release is recorded `Unsent` and the ack advances
-/// before any replacement is sought, so a dead cable never wedges input.
+/// Acknowledge the failed release before attempting a replacement.
 #[test]
 fn a_transport_failure_is_released_unsent_before_anything_is_reopened() {
     // One link and then nothing: the writer will keep failing to reopen, which is what leaves the
@@ -190,8 +177,7 @@ fn a_transport_failure_is_released_unsent_before_anything_is_reopened() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Unsent);
 }
 
-/// The replacement link sees the §2.7 sequence and **nothing else**: preamble, keyboard
-/// release-all, mouse release-all, `GET_INFO`.
+/// A new link receives only commissioning reports before recapture.
 #[test]
 fn the_replacement_link_sees_exactly_the_reconnect_sequence() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -202,7 +188,7 @@ fn the_replacement_link_sees_exactly_the_reconnect_sequence() {
     assert_eq!(
         links[1].calls().first(),
         Some(&FakeCall::Resync),
-        "§5.1: the preamble goes first, or the release-all is eaten as the remainder of the torn \
+        "the preamble goes first, or the release-all is eaten as the remainder of the torn \
          frame it was meant to repair"
     );
 
@@ -220,19 +206,12 @@ fn the_replacement_link_sees_exactly_the_reconnect_sequence() {
     assert_eq!(release.outcome, ReleaseOutcome::Submitted);
     assert!(
         !producer.is_engaged(),
-        "§2.8: the producer stays disengaged until the user re-grabs"
+        "the producer stays disengaged until the user re-grabs"
     );
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-/// **Loss is not write-driven.** A link that hangs up while the queue is empty is discovered by
-/// asking it (`Link::is_down`, polled on the writer's idle wait), and the same §2.7 sequence runs
-/// — with **not one frame** written to the dead link to find out.
-///
-/// That last part is the assertion that matters. The device acknowledges anything (§3.4, A17), so
-/// a probe frame would prove nothing about the link and would put bytes on a live console's
-/// keyboard; and on hardware the writer that waits for a write of its own to fail waits for ever,
-/// holding the fd that stops the tty index from being freed (H-A4).
+/// Idle loss must be detected without writing to the dead link.
 #[test]
 fn an_idle_writer_discovers_a_hung_up_link_without_writing_to_it() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -275,8 +254,7 @@ fn an_idle_writer_discovers_a_hung_up_link_without_writing_to_it() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-/// §2.7 step 1, never replay. Input produced before the failure — including input the writer had
-/// already dequeued and was part-way through — never appears on the link that replaces it.
+/// Queued or partially consumed old-session input must never reach the replacement.
 #[test]
 fn nothing_from_before_the_failure_is_replayed_on_the_new_link() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -322,7 +300,7 @@ fn a_producer_that_re_engaged_while_down_reaches_the_new_link_with_nothing() {
     // `engage` checks only the ack, which the LinkDown release advanced — so this succeeds.
     producer
         .engage()
-        .expect("§2.6.1 advanced the ack, so re-engagement is allowed");
+        .expect(" advanced the ack, so re-engagement is allowed");
     assert_eq!(
         producer.submit(Event::Key {
             key: HidKey::Usage(B),
@@ -367,8 +345,7 @@ fn input_reaches_the_new_link_after_the_user_re_engages() {
 
 // -- rejecting a link that opened but is not a CH9329 -----------------------
 
-/// §2.7 step 3: `GET_INFO` is the proof. A link that opens but cannot answer it is dropped, the
-/// attempt is counted, and the next one is tried.
+/// A link that cannot answer GET_INFO is rejected and retried.
 #[test]
 fn a_link_whose_get_info_times_out_is_not_accepted() {
     let (producer, writer, _sctl, links) = rig(3);
@@ -392,8 +369,7 @@ fn a_link_whose_get_info_times_out_is_not_accepted() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-/// The same for a reply too short to be a `DeviceInfo` — §3.2's reminder that a device-supplied
-/// length is a claim, not a fact.
+/// A short information reply must also reject commissioning.
 #[test]
 fn a_link_whose_get_info_reply_is_too_short_is_not_accepted() {
     let (producer, writer, _sctl, links) = rig(3);
@@ -463,7 +439,7 @@ fn the_backoff_doubles_and_then_holds_at_the_cap() {
 }
 
 /// A shutdown during a backoff returns at once rather than after it, and reports the release it
-/// could not send (§2.6.1).
+/// could not send.
 #[test]
 fn a_shutdown_during_the_backoff_returns_immediately() {
     let (source, sctl) = fake_source();
@@ -500,9 +476,7 @@ fn a_shutdown_during_the_backoff_returns_immediately() {
     );
 }
 
-/// A cancellation that arrives while the writer is backing off is acknowledged there and then.
-/// Otherwise a reconnect that never succeeds leaves `requested_epoch` above `acked_epoch` for
-/// ever and `engage` can never succeed again — §2.6.1's wedge, arrived at the long way round.
+/// Cancellation during backoff must advance the epoch even if reconnect never succeeds.
 #[test]
 fn a_trigger_during_the_backoff_is_acknowledged_without_waiting_for_a_link() {
     let (source, sctl) = fake_source();
@@ -537,7 +511,7 @@ fn a_trigger_during_the_backoff_is_acknowledged_without_waiting_for_a_link() {
 // -- a shutdown landing inside the sequence ---------------------------------
 
 /// A shutdown that arrives between steps 3a and 3e does not truncate the sequence: it completes,
-/// and the shutdown then gets its **own** cancellation on the link that sequence just
+/// and the shutdown then gets its own cancellation on the link that sequence just
 /// commissioned — so its release is `Submitted`, not `Unsent`.
 #[test]
 fn a_shutdown_inside_the_reconnect_sequence_still_releases_on_the_new_link() {
@@ -582,7 +556,7 @@ fn a_shutdown_inside_the_reconnect_sequence_still_releases_on_the_new_link() {
     assert_ne!(calls.last(), Some(&FakeCall::Frame(get_info_frame())));
 }
 
-// -- Stage 1's entry point is unchanged -------------------------------------
+// -- entry point is unchanged -------------------------------------
 
 /// `spawn` never reconnects: after a failure the link stays down for good and no attempt is made.
 #[test]
@@ -606,7 +580,7 @@ fn spawn_never_reconnects() {
     assert!(stats.link_down, "and it stays down");
     assert_eq!(
         stats.reconnect_attempts, 0,
-        "Stage 1's entry point does not look for another link"
+        "The fixed-link entry point does not look for another link"
     );
     assert_eq!(stats.reconnects, 0);
     assert!(stats.device_info.is_none(), "`spawn` never sends GET_INFO");
@@ -664,8 +638,7 @@ fn a_second_failure_reconnects_again() {
 
 // -- the field path: opens that fail before one works ------------------------
 
-/// How many of the §2.7 sequence's calls are transacts, for `wait_for_frames`, which counts frames
-/// and not the preamble.
+/// Commissioning transactions excluding the raw preamble.
 fn commission_frames() -> usize {
     commission_calls()
         .iter()
@@ -673,7 +646,7 @@ fn commission_frames() -> usize {
         .count()
 }
 
-/// **The reconnect that actually happens in the field**: the cable comes back a few attempts after
+/// The reconnect that happens in the field: the cable comes back a few attempts after
 /// it went. Every refusal is counted, the link that finally opens is commissioned rather than
 /// discarded because earlier attempts failed, and input flows on it once the user re-grabs.
 #[test]
@@ -693,7 +666,7 @@ fn a_link_that_arrives_after_several_failed_opens_is_commissioned() {
     assert_eq!(
         eventual.calls(),
         commission_calls(),
-        "the link that finally opened saw the whole §2.7 sequence and nothing else"
+        "the link that finally opened saw the whole  sequence and nothing else"
     );
     let stats = producer.stats();
     assert_eq!(
@@ -751,7 +724,7 @@ fn an_initial_link_that_is_not_there_yet_is_picked_up_when_it_appears() {
 
 // -- a shutdown while a port is opening --------------------------------------
 
-/// Run `shutdown` on its own thread and report whether it came back within `bound`, **without**
+/// Run `shutdown` on its own thread and report whether it came back within `bound`, without
 /// failing there and then: the caller must be able to let the writer out of whatever it is parked
 /// in before it asserts, or a regression hangs the suite instead of failing it.
 fn shutdown_within(
@@ -838,7 +811,7 @@ fn a_link_that_arrives_after_the_shutdown_is_dropped_unused() {
 
 /// A cancellation raised while the writer is inside `open` has no sequence of its own left to run:
 /// the reconnect's sequence covers its epoch and then clears the flag. Its reason is therefore
-/// taken by that sequence, not left in the one-slot reason to mislabel the **next**, unrelated
+/// taken by that sequence, not left in the one-slot reason to mislabel the next, unrelated
 /// release.
 #[test]
 fn a_trigger_that_lands_during_an_open_is_not_stranded_on_the_next_release() {
@@ -886,15 +859,8 @@ fn a_trigger_that_lands_during_an_open_is_not_stranded_on_the_next_release() {
     assert_eq!(writer.shutdown(), ReleaseOutcome::Submitted);
 }
 
-// -- §2.7 step 1: the drain ---------------------------------------------------
-
-/// §2.7 step 1, "never replay", as a property of the sequence rather than of an interleaving.
-///
-/// Nothing a producer can do fills the queue while a link is being commissioned — `submit` refuses
-/// on `link_down`, which is cleared only at step 3e — so the state the drain defends against is
-/// built directly: the writer is held at step 3a and an entry carrying the reconnect's own epoch is
-/// pushed into the queue behind it. Without the drain that entry survives the writer's staleness
-/// check (it is not `< acked_epoch`) and is written on the new link.
+/// Seed stale queued input directly to verify the reconnect drain independently
+/// of admission checks that normally prevent it.
 #[test]
 fn the_reconnect_drain_discards_what_is_queued_while_it_runs() {
     let (producer, writer, _sctl, links) = rig(2);
@@ -928,7 +894,7 @@ fn the_reconnect_drain_discards_what_is_queued_while_it_runs() {
 
 /// `Stats`'s link fields come out of one critical section, so a reader that samples while the
 /// writer is flapping never sees a link that is down with no `down_since`, or one that is up and
-/// still timing an outage. Four hundred transitions with a reader spinning on `stats()` beside
+/// still timing an outage. Four hundred transitions with a reader spinning on `stats` beside
 /// them; the reader's complaints are the assertion.
 #[test]
 fn a_stats_snapshot_never_straddles_a_link_transition() {

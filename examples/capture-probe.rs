@@ -1,51 +1,13 @@
-//! `capture-probe` — the measuring instrument for §11 q12 and q13 (plan §6.1 S2-2, S2-3).
+//! Capture diagnostic timeline using the production pipeline.
 //!
-//! ```text
-//! cargo run --example capture-probe -- --video /dev/video4 [--seconds N] [--width --height --fps]
-//! ```
+//! Run `cargo run --example capture-probe -- --help` for options. Verify the selected
+//! node belongs to capture device 345f:2133; `/dev/video4` is only a recorded example.
+//! Never open the user's unrelated bus-5 devices or change the target's HDMI setup.
 //!
-//! Two questions blocked Stage 2's exit and neither could be answered by reasoning. Both were
-//! measured with this instrument on 2026-09-11; the write-up is `docs/STAGE2_FINDINGS.md` §6
-//! items 2 and 3 (amendment C12).
-//!
-//! - **q12, capture failure shape.** Which of §6.1's conditions does this unit actually produce
-//!   when the target reboots or the HDMI cable is pulled? Run this across the event and read the
-//!   timeline. **Answer: none of them.** Across a full target reboot the dongle never stopped
-//!   emitting — 60 fps throughout, no stall, no restart, no reopen, no capture error — it just
-//!   sent a fixed no-signal picture and then the rescaled boot console. The only damage was four
-//!   truncated JPEGs at the signal transitions.
-//! - **q13, mode-change effect.** Does a target resolution change alter the *negotiated UVC
-//!   format*, or does the dongle rescale internally and keep it fixed? §6.1 S2-3 says measure
-//!   before writing any renegotiation logic, because rebuilding a stream that did not need
-//!   rebuilding is a self-inflicted glitch. So this logs the SOF dimensions (A6's authority) and
-//!   a **fresh `G_FMT`** (the driver's own opinion) side by side, once a second, and lets them
-//!   disagree in public. **Answer: they did not disagree.** Through a 1280x720 window on the
-//!   target both stayed `MJPG 1920x1080`, so the dongle rescales internally and no renegotiation
-//!   logic is needed.
-//!
-//! Neither answer retires the instrument: it is one unit on a USB 2.0 link, and the next unit,
-//! or this one on SuperSpeed, is entitled to behave differently.
-//!
-//! It is an instrument, so it is held to an instrument's rules:
-//!
-//! - **Nothing is inferred from pixels.** A5 and §6.1: this hardware cannot report signal loss,
-//!   and a black frame is not evidence of anything.
-//! - **No error is hidden.** A failing `G_FMT` prints as a failing `G_FMT`; a device that is not
-//!   there prints `no device`. Neither ends the run — while the pipeline is reconnecting, "the
-//!   ioctl failed" *is* the measurement.
-//! - **Nothing is missed for want of looking.** `stats()` is polled at 40 Hz, above the 20 Hz
-//!   floor the contract sets, so a state that lasts one frame period still shows up. Where
-//!   sampling *cannot* be enough — a resolution flap shorter than one sample, which is exactly
-//!   what A6 predicts after an idle period — the number comes from the pipeline's per-frame
-//!   counter instead, and the timeline says when it has seen fewer changes than were counted.
-//! - **Durations mean what they say.** The per-resolution times count only samples in which a
-//!   frame arrived, so an outage is never billed to the mode that preceded it.
-//! - **The pipeline under test is the one that ships.** `V4l2Opener` plus
-//!   `Pipeline::start_with_opener` with the production defaults, so the restart and reopen paths
-//!   being measured are the ones the viewer uses.
-//!
-//! The device node is released on every exit path: SIGINT sets a flag the loop polls, and the
-//! pipeline is stopped before returning.
+//! Reports JPEG dimensions, negotiated format, errors, and recovery over time.
+//! Polling occurs at 40 Hz; per-frame counters detect changes between samples.
+//! Frame pixels do not establish HDMI signal state. Historical observations are
+//! in `docs/hardware.md`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +18,7 @@ use clap::Parser;
 use nanokvm::capture::v4l2::query_format;
 use nanokvm::capture::{BytesUsedStats, Pipeline, PipelineConfig, V4l2Opener};
 
-/// Set by the `SIGINT` handler and polled by the sampling loop, exactly as `main.rs` does: a
+/// Set by the `SIGINT` handler and polled by the sampling loop, as `main.rs` does: a
 /// signal handler may only do async-signal-safe things, and an atomic store is one of them.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -75,10 +37,10 @@ const GAP: Duration = Duration::from_secs(1);
 #[derive(Parser, Debug)]
 #[command(
     name = "capture-probe",
-    about = "Stream from the capture node and log every state, dimension and format change (q12/q13)"
+    about = "Stream from the capture node and log every state, dimension and format change"
 )]
 struct Args {
-    /// Video node of the capture device. /dev/video4 is the dongle on this desk; /dev/video0-3
+    /// Video node of the capture device. /dev/video4 is the dongle on the recorded test setup; /dev/video0-3
     /// belong to unrelated hardware and must never be opened (CLAUDE.md).
     #[arg(long, value_name = "PATH", default_value = "/dev/video4")]
     video: PathBuf,
@@ -95,7 +57,7 @@ struct Args {
     #[arg(long, default_value_t = 1080)]
     height: u32,
 
-    /// Capture frame rate, passed to S_PARM explicitly (§6, A7).
+    /// Capture frame rate, passed to S_PARM explicitly.
     #[arg(long, default_value_t = 60)]
     fps: u32,
 }
@@ -109,9 +71,9 @@ struct Gap {
 
 /// How long frames were arriving at one SOF resolution, in first-seen order.
 ///
-/// Time with **no frames** is not in here: not the outage while the pipeline reconnects, and not
+/// Time with no frames is not in here: not the outage while the pipeline reconnects, and not
 /// a stall. A run that spanned a 40 s replug would otherwise report the resolution as having been
-/// "seen" for 40 s in which nothing was seen at all, and the q12 timeline is the one place that
+/// "seen" for 40 s in which nothing was seen at all, and the recovery timeline is the one place that
 /// distinction is the entire point.
 struct ModeTime {
     dims: (u32, u32),
@@ -127,7 +89,7 @@ fn main() {
 
     // SAFETY: `on_interrupt` is an `extern "C"` function whose entire body is one atomic store,
     // which is async-signal-safe. `libc::signal` is handed a valid function pointer and the
-    // previous disposition is deliberately discarded, as `main.rs` does.
+    // previous disposition is discarded, as `main.rs` does.
     unsafe {
         libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t);
     }
@@ -165,7 +127,7 @@ fn main() {
     let mut last_error: Option<String> = None;
     let mut dims: Option<(u32, u32)> = None;
     // The pipeline's own count of resolution changes, mirrored so the timeline can tell a change
-    // it *saw* from one it only heard about (A6's flap — see the dimension block below).
+    // it *saw* from one it only heard about (flap — see the dimension block below).
     let mut changes: u64 = 0;
     let mut transitions_printed: u64 = 0;
     let mut mode_time: Vec<ModeTime> = Vec::new();
@@ -227,11 +189,11 @@ fn main() {
             }
         }
 
-        // SOF dimensions: A6 says this is the only authority on a frame's size, so a target-side
+        // SOF dimensions: this is the only authority on a frame's size, so a target-side
         // mode change appears here first, whatever G_FMT goes on saying.
         //
         // The *count* comes from `PipelineStats::resolution_changes`, which the capture thread
-        // increments per frame, not from comparing `last_resolution` between samples. A6 says the
+        // increments per frame, not from comparing `last_resolution` between samples. the
         // device emits up to eight frames at the previous resolution after an idle period, so a
         // target mode change arrives as a flap — and an excursion shorter than one 25 ms sample
         // (1.5 frames at 60 fps) is invisible to a sampler. Counting the pipeline's number means
@@ -390,7 +352,7 @@ fn main() {
         if st.format_mismatch_accepted > 0 {
             format!(
                 "\n    ACCEPTED {} time(s): the negotiated format could not be established and \
-                 the SOF dimensions were taken as the truth (A6)",
+                 the SOF dimensions were taken as the truth",
                 st.format_mismatch_accepted
             )
         } else {
@@ -401,7 +363,7 @@ fn main() {
     // The cross-check, printed rather than computed and thrown away: the pipeline counts a change
     // per frame and cannot miss one; this timeline samples at 40 Hz and can. When they disagree,
     // the difference is the number of changes that came and went inside one sample — which is
-    // exactly the shape A6 predicts for the q13 event this probe exists to measure.
+    // a mode change that leaves the negotiated format unchanged.
     println!(
         "  resolution changes: {} counted by the pipeline (per frame), {} printed above",
         st.resolution_changes, transitions_printed
@@ -457,7 +419,7 @@ impl Counters {
     ///
     /// `disconnected_at` carries the disconnection's start across the reopen, because
     /// `PipelineStats::disconnected_since` is cleared the instant the reopen succeeds — which is
-    /// exactly the moment the duration becomes interesting.
+    /// the moment the duration becomes interesting.
     fn report(
         &mut self,
         st: &nanokvm::capture::PipelineStats,
@@ -524,7 +486,7 @@ impl Counters {
         if st.format_mismatch_accepted > self.format_mismatch_accepted {
             println!(
                 "{now_ms:>10.1}  format mismatch ACCEPTED #{}: the negotiated mode could not be \
-                 established; the SOF dimensions are the truth from here (A6)",
+                 established; the SOF dimensions are the truth from here",
                 st.format_mismatch_accepted
             );
             self.format_mismatch_accepted = st.format_mismatch_accepted;

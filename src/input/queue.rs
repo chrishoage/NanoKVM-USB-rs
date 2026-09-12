@@ -1,23 +1,7 @@
-//! The one queue, in one order (§2.1), with the coalescing rules of §2.2/§2.3 applied at
-//! submission time and the bound of §2.8 enforced on barrier entries.
+//! Input queue with motion coalescing and transition barriers.
 //!
-//! Do not split keyboard and mouse into separate queues — that loses ordering between a modifier
-//! press and a click, and shift-click breaks (§2.1).
-//!
-//! # Shape
-//!
-//! A `VecDeque<Entry>` that alternates, by construction, between at most one coalesced motion run
-//! and any number of barriers:
-//!
-//! ```text
-//!   [motion run][barrier][motion run][barrier][barrier][motion run]
-//! ```
-//!
-//! A motion event folds into the tail entry when that entry is a motion run of the same epoch;
-//! otherwise it starts a new run. A barrier always pushes a new entry, which is what makes it a
-//! barrier: everything ahead of it flushes before it and a fresh accumulation starts after it
-//! (§2.3). Since a run can only follow a barrier or the head, the number of entries is bounded by
-//! `2 * max_barriers + 1`, so bounding barriers bounds the whole queue.
+//! Motion can be replaced or accumulated only within its current run. Key, button, and
+//! wheel transitions preserve order so a click cannot move across the motion around it.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -25,16 +9,14 @@ use std::time::Instant;
 use crate::input::stats::Counters;
 use crate::proto::report::HidKey;
 
-/// One coalesced run of motion between two barriers (§2.2, §2.3).
-///
-/// Absolute state may be **replaced** by a newer value; accumulating deltas must be **summed**,
-/// never replaced. Rev 1's "keep the newest, drop the rest" was wrong (§2.2).
+/// Coalesced motion between transition barriers. Absolute positions replace earlier
+/// positions; relative deltas accumulate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct MotionRun {
     /// The newest absolute position submitted in this run, already in `0..=4095`.
     pub(crate) abs: Option<(u16, u16)>,
     /// Summed relative motion. `i32` with saturating addition: the split at flush time is what
-    /// keeps the remainder (§2.3), so the accumulator must not wrap.
+    /// keeps the remainder, so the accumulator must not wrap.
     pub(crate) dx: i32,
     pub(crate) dy: i32,
     /// Summed wheel delta.
@@ -52,8 +34,8 @@ impl MotionRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntryKind {
     Motion(MotionRun),
-    /// A key transition. Never dropped, never merged, never reordered (§2.2). Keyboard reports
-    /// are never coalesced: merging drops a fast press-release pair entirely (§2.3).
+    /// A key transition. Never dropped, never merged, never reordered. Keyboard reports
+    /// are never coalesced: merging drops a fast press-release pair entirely.
     Key {
         key: HidKey,
         down: bool,
@@ -71,8 +53,7 @@ impl EntryKind {
     }
 }
 
-/// A queue entry with the epoch it was produced under (§2.6) and its submission instant (§2.8
-/// time-in-queue instrumentation).
+/// Queued input with its session epoch and submission time.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Entry {
     pub(crate) kind: EntryKind,
@@ -87,13 +68,13 @@ pub(crate) struct QueueState {
     barriers: usize,
     max_barriers: usize,
     /// The reason of the trigger that set the cancellation flag; taken by the writer when it
-    /// latches the epoch. Concurrent triggers coalesce into one sequence (§2.6) and so must
+    /// latches the epoch. Concurrent triggers coalesce into one sequence and so must
     /// coalesce into one reason: see [`QueueState::note_reason`].
     pub(crate) pending_reason: Option<super::ReleaseReason>,
 }
 
 /// A barrier could not be admitted: the queue is full of transitions and coalescing cannot
-/// reclaim anything (§2.8).
+/// reclaim anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Overflow;
 
@@ -123,7 +104,7 @@ impl QueueState {
         counters.set_depth(self.entries.len(), self.barriers);
     }
 
-    /// Fold an absolute position into the tail run, or start a new run (§2.2: replaced).
+    /// Fold an absolute position into the tail run, or start a new run.
     pub(crate) fn push_abs(
         &mut self,
         x: u16,
@@ -150,7 +131,7 @@ impl QueueState {
         self.publish_depth(counters);
     }
 
-    /// Sum a relative delta into the tail run, or start a new run (§2.2: summed, never replaced).
+    /// Sum a relative delta into the tail run, or start a new run.
     pub(crate) fn push_rel(
         &mut self,
         dx: i32,
@@ -177,7 +158,7 @@ impl QueueState {
         self.publish_depth(counters);
     }
 
-    /// Sum a wheel delta into the tail run, or start a new run (§2.2: summed).
+    /// Sum a wheel delta into the tail run, or start a new run.
     pub(crate) fn push_wheel(&mut self, delta: i32, epoch: u64, now: Instant, counters: &Counters) {
         if let Some(run) = self.tail_run(epoch) {
             run.wheel = run.wheel.saturating_add(delta);
@@ -195,9 +176,8 @@ impl QueueState {
         self.publish_depth(counters);
     }
 
-    /// Enqueue a barrier. Coalescing has already reclaimed everything it can — motion is folded
-    /// on submission — so a full barrier count is §2.8's "coalescing cannot make room" and the
-    /// session has failed. Nothing is dropped here; the caller triggers cancellation.
+    /// Enqueue a transition barrier. Returns failure if the barrier limit is reached;
+    /// the caller must cancel the session rather than discard one transition.
     pub(crate) fn push_barrier(
         &mut self,
         kind: EntryKind,
@@ -219,13 +199,10 @@ impl QueueState {
         Ok(())
     }
 
-    /// Record the reason of a trigger that is coalescing into the pending sequence.
+    /// Merge a cancellation reason by severity.
     ///
-    /// **The most severe reason wins**, by [`ReleaseReason::severity`]: `Shutdown` > `LinkDown` >
-    /// `Overflow` > the ordinary triggers. Ties keep the first, so among equals the recorded
-    /// reason is still the cause rather than a later coincidence. Keeping the *first* reason
-    /// unconditionally — the previous rule — reported a focus loss as the cause of a sequence that
-    /// was actually a shutdown or a dead cable, which is the fact §2.6.1 asks to be surfaced.
+    /// Shutdown outranks link loss, then overflow, then ordinary releases. Equal severity
+    /// keeps the first cause.
     pub(crate) fn note_reason(&mut self, reason: super::ReleaseReason) {
         let replace = match self.pending_reason {
             None => true,
@@ -236,9 +213,7 @@ impl QueueState {
         }
     }
 
-    /// The tail entry as a motion run, if it is one and belongs to `epoch`. A run never spans
-    /// epochs: submission is refused between a cancellation trigger and the matching `engage`
-    /// (§2.6), so this is belt and braces.
+    /// Return the tail motion run only when it belongs to the current epoch.
     fn tail_run(&mut self, epoch: u64) -> Option<&mut MotionRun> {
         match self.entries.back_mut() {
             Some(Entry {
@@ -268,9 +243,7 @@ impl QueueState {
         Some(entry)
     }
 
-    /// Drain and discard every queued entry whose epoch is `<= epoch`, writing none of them
-    /// (§2.6 step 2). Entries produced under a later epoch cannot exist while a cancellation is
-    /// pending, but the filter is written as specified rather than as "clear".
+    /// Discard entries through `epoch` without writing them.
     pub(crate) fn drain_upto(&mut self, epoch: u64, counters: &Counters) -> usize {
         let before = self.entries.len();
         self.entries.retain(|e| e.epoch > epoch);

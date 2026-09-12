@@ -1,10 +1,4 @@
-//! §9.2 item 5 — **overflow failure** (§2.8): saturation invalidates pending input, releases, and
-//! requires recapture rather than degrading. The saturation cause here is a **stalled writer**,
-//! which is what the plan insists on: "a blocked port write, a device that stopped draining, or a
-//! serial link wedged mid-frame all saturate a queue while the user types normally".
-//!
-//! Assertions are on the recorded frame sequence, except where a counter *is* the observable
-//! (`stats().overflows`).
+//! Queue overflow cancels the session and requires recapture without losing a transition.
 
 use std::time::Duration;
 
@@ -24,7 +18,7 @@ fn config() -> Config {
 }
 
 /// A stream of alternating button transitions — which cannot coalesce — past `max_barriers`.
-/// `submit` fails, the session is cancelled, and the stale transitions are never written (§2.8).
+/// `submit` fails, the session is cancelled, and the stale transitions are never written.
 #[test]
 fn transitions_beyond_the_bound_fail_the_session() {
     let (link, ctl) = fake_link();
@@ -49,7 +43,7 @@ fn transitions_beyond_the_bound_fail_the_session() {
         "coalescing cannot make room for a transition, so the session has failed"
     );
 
-    // §2.8: do not silently resume. Input stays disengaged until deliberate recapture.
+    // Overflow requires explicit recapture.
     assert!(!producer.is_engaged());
     assert_eq!(
         producer.submit(Event::Button {
@@ -91,7 +85,7 @@ fn transitions_beyond_the_bound_fail_the_session() {
 }
 
 /// The normal path: the queue is dominated by redundant absolute positions, coalescing reclaims
-/// them, and ten thousand of them fit behind a stalled writer without overflowing (§2.8 step 1).
+/// them, and ten thousand of them fit behind a stalled writer without overflowing.
 #[test]
 fn ten_thousand_absolute_positions_coalesce_and_never_overflow() {
     let (link, ctl) = fake_link();
@@ -120,8 +114,7 @@ fn ten_thousand_absolute_positions_coalesce_and_never_overflow() {
     ctl.release_stalls();
     ctl.wait_for_frames(2);
 
-    // Exactly one report, at the newest position (§2.4: the drag becomes a straight line, which
-    // is the accepted degradation, not a bug).
+    // Coalesced absolute motion retains the newest position.
     let last = 9_999u16;
     assert_eq!(
         ctl.frames()[1],
@@ -131,7 +124,7 @@ fn ten_thousand_absolute_positions_coalesce_and_never_overflow() {
 }
 
 /// Relative motion behind a stalled writer coalesces too, and the accumulation is preserved in
-/// full when it finally flushes (§2.2, §2.3) — no overflow, nothing lost.
+/// full when it finally flushes — no overflow, nothing lost.
 #[test]
 fn a_flood_of_relative_motion_never_overflows_and_is_never_lost() {
     let (link, ctl) = fake_link();

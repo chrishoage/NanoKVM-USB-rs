@@ -1,36 +1,8 @@
-//! The per-user chrome settings, in `$XDG_CONFIG_HOME/nanokvm/config.toml` (plan §12 Stage 4b).
+//! Persistent viewer settings.
 //!
-//! §12 Stage 4b: *"Persist the reference's per-user choices (menu open, mouse mode, cursor, wheel
-//! direction, mute, layout)… Missing file means the defaults; a malformed file is an error naming
-//! the key, not a silent reset."* Both halves are enforced here:
-//!
-//! - **Missing file → defaults.** [`Store::load`] answers `Ok(Config::default())` for `ENOENT`
-//!   and for nothing else. A file that is there but unreadable is an error, because "we could not
-//!   read your settings" and "you have no settings" are different facts.
-//! - **Malformed → an error naming the key.** `toml` 0.9's own `Display` already prints the file
-//!   position, the offending source line, a caret and the key name; [`ConfigError`] prefixes the
-//!   path and nothing else, because rewording it would lose the caret.
-//!
-//! # Two deliberate choices about strictness
-//!
-//! `#[serde(deny_unknown_fields)]` — a typo'd key is refused by name (`unknown field
-//! 'wheel_direciton', expected one of …`) rather than silently ignored, which is the failure the
-//! plan's sentence is about. The price is that the config is **not forward compatible**: a config
-//! written by a newer build is refused by an older one, naming the key it does not know. That is
-//! the right trade here — the alternative is the silent reset the plan forbids — but it is a real
-//! constraint on adding keys, and it is why every key below has a default.
-//!
-//! `#[serde(default)]` — a *missing* key takes its default rather than being an error. A
-//! hand-written file containing one line is a legitimate thing to write, and nothing is being
-//! reset: the key was never there. Only `deny_unknown_fields` is load-bearing for the plan's
-//! sentence, and the two are independent.
-//!
-//! # Nothing here reads the real config directory in a test
-//!
-//! [`Store::at`] takes the configuration root explicitly and every test uses it against a
-//! temporary directory. [`Store::discover`] is the only thing that consults the environment, it is
-//! called exactly once from `main`, and it has no test of its own that could write to a real
-//! `~/.config`.
+//! Missing files and fields use defaults; malformed files and unknown keys are errors.
+//! Writes use a temporary file and rename, and occur only when settings change.
+//! Serialized enum names are separate from runtime types to keep the file format stable.
 
 use std::path::{Path, PathBuf};
 
@@ -47,7 +19,7 @@ const RELATIVE_PATH: &str = "nanokvm/config.toml";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MouseMode {
-    /// [`crate::viewer::PointerMode::Absolute`], the default (§3.4).
+    /// [`crate::viewer::PointerMode::Absolute`], the default.
     #[default]
     Absolute,
     /// [`crate::viewer::PointerMode::Relative`].
@@ -95,18 +67,8 @@ impl WheelDirection {
     }
 }
 
-/// The declared **target** keyboard layout, as the config file spells it (§10.2, §12 Stage 4c).
-///
-/// A separate enum from [`crate::script::Layout`] for the same reason [`MouseMode`] is separate
-/// from [`crate::viewer::PointerMode`]: this one is a file format and has to keep its spelling
-/// across versions, while the other is free to be refactored. The conversion below is the only
-/// place the two meet, and it is total — adding a layout to `script` is a compile error here until
-/// this file is told about it, which is the point.
-///
-/// Only US QWERTY exists, in `script` and therefore here. It is a *setting* rather than a
-/// constant because §10.2's rule is that the layout is **declared and stated, never assumed**:
-/// the tooltip on the Paste item names it, the refusal names it, and the file is where a user
-/// would look to change it once there is a second one.
+/// Serialized target layout. Keep its file-format spelling stable independently
+/// of runtime layout types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PasteLayout {
@@ -137,29 +99,20 @@ pub struct Config {
     pub cursor_hidden: bool,
     /// Wheel direction.
     pub wheel_direction: WheelDirection,
-    /// Audio output muted (4a's `mute` flag; the chrome owns the toggle).
+    /// Saved audio mute preference.
     pub audio_muted: bool,
-    /// The pill's top-left corner in egui points — the "layout" the plan's list asks for. Stored
+    /// The pill's top-left corner in egui points — the "layout" list asks for. Stored
     /// in points rather than pixels so the pill lands in the same visual place on a differently
     /// scaled output.
     pub pill_x: f32,
     /// See [`Config::pill_x`].
     pub pill_y: f32,
-    /// The declared target keyboard layout a clipboard paste is compiled against (§10.2, §12
-    /// Stage 4c).
-    ///
-    /// §12 Stage 4b read the plan's *"persist … (menu open, mouse mode, cursor, wheel direction,
-    /// mute, layout)"* as the pill's position, which is what the two `pill_*` fields above are.
-    /// §12 Stage 4c needs the other reading of the same word — the keyboard layout — so both are
-    /// here under names that say which is which.
+    /// Target keyboard layout used to compile clipboard text.
     pub layout: PasteLayout,
 }
 
 impl Default for Config {
-    /// The reference's defaults where it has one, and this client's where it does not: the pill
-    /// open (the reference shows its bar), absolute pointer (§3.4 — relative cannot reach a
-    /// specific pixel), cursor shown, natural wheel, audio on (4a: "default on, like the
-    /// reference"), and the pill in the top-left inset by a comfortable margin.
+    /// Initial viewer settings when no persisted value exists.
     fn default() -> Self {
         Config {
             menu_open: true,
@@ -210,7 +163,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// A store under an explicit configuration **root** — the directory `$XDG_CONFIG_HOME` names,
+    /// A store under an explicit configuration root — the directory `$XDG_CONFIG_HOME` names,
     /// not the file. The file is `<root>/nanokvm/config.toml`.
     ///
     /// This is the constructor every test uses, against a temporary directory.
@@ -248,7 +201,7 @@ impl Store {
 
     /// Read the settings.
     ///
-    /// A file that is not there is [`Config::default`] — that is the plan's "missing file means
+    /// A file that is not there is [`Config::default`] — that is "missing file means
     /// the defaults" and it is the only error kind treated that way.
     pub fn load(&self) -> Result<Config, ConfigError> {
         let text = match std::fs::read_to_string(&self.path) {
@@ -280,10 +233,10 @@ impl Store {
     /// key it did not know about — `deny_unknown_fields` has already refused any such file at
     /// load time rather than letting it reach here.
     ///
-    /// **Written to `config.toml.tmp` and renamed over the target**, never truncated in place. A
+    /// Written to `config.toml.tmp` and renamed over the target, never truncated in place. A
     /// `write` that is interrupted — the process is killed, the filesystem is full — leaves a
     /// half-written file, and a half-written file is precisely the *malformed* file this module is
-    /// required to refuse loudly on the next run (§12 Stage 4b). A `rename` within one directory
+    /// required to refuse loudly on the next run. A `rename` within one directory
     /// is atomic, so the file a reader sees is always one whole config or the previous one. The
     /// temporary is removed on a failed write rather than left beside the settings.
     pub fn save(&self, config: &Config) -> Result<(), ConfigError> {
@@ -311,8 +264,8 @@ impl Store {
     }
 }
 
-/// Write `config` when it differs from `saved`, and advance `saved` **only if the write worked**
-/// (§12 Stage 4b: "write on change, not on every frame"; review item 3).
+/// Write `config` when it differs from `saved`, and advance `saved` only if the write worked
+/// .
 ///
 /// Advancing first made a transient failure permanent: the settings were marked as written, the
 /// write had failed, and nothing retried until the user changed something else. Now a failure
@@ -402,11 +355,11 @@ mod tests {
         };
         store.save(&config).expect("save");
         assert_eq!(store.load().expect("load"), config);
-        // And the file is the one the plan names, under the root it was given.
+        // The store resolves its fixed relative filename under the supplied root.
         assert!(store.path().ends_with("nanokvm/config.toml"));
     }
 
-    /// The plan's sentence: a malformed file is an error naming the key, not a silent reset.
+    /// Malformed settings must name the offending key rather than silently reset.
     #[test]
     fn a_typod_key_is_refused_by_name() {
         let root = TempRoot::new("typo");
@@ -442,8 +395,7 @@ mod tests {
         assert!(text.contains("osk_layout"), "{text}");
     }
 
-    /// The §12 Stage 4c key: the declared target layout, spelt as the file spells it, and
-    /// defaulting to the one §10.2 states rather than assumes.
+    /// Persist the declared target layout and default it when absent.
     #[test]
     fn the_paste_layout_is_a_setting_with_a_stated_default() {
         assert_eq!(Config::default().layout, PasteLayout::Us);
@@ -458,8 +410,7 @@ mod tests {
             root.store().load().expect("us is a layout").layout,
             PasteLayout::Us
         );
-        // A layout this build does not have is refused by name rather than silently defaulted —
-        // typing text against the wrong layout is the failure §10.2 exists to prevent.
+        // An unknown layout must fail instead of silently typing with another mapping.
         let root = TempRoot::new("layout-unknown");
         root.write("layout = \"de\"\n");
         let text = root
@@ -513,9 +464,7 @@ mod tests {
         assert_eq!(WheelDirection::Inverted.sign(), -1);
     }
 
-    /// **Review item 11.** The write goes through a temporary and a rename: after a save the
-    /// temporary is gone and the file parses. A reader never sees a partial file, because the
-    /// file it reads was never partially written — it was renamed over, whole.
+    /// Saving must atomically replace the complete settings file.
     #[test]
     fn a_save_leaves_no_temporary_behind_and_the_file_parses() {
         let root = TempRoot::new("atomic");
@@ -534,10 +483,7 @@ mod tests {
         assert_eq!(store.load().expect("load"), config);
     }
 
-    /// The half of item 11 that is the point of it: a save that cannot complete leaves the
-    /// **previous** settings whole. The interruption is simulated by making the temporary path a
-    /// directory, so creating the temporary file fails; an in-place `write` would have truncated
-    /// the real file before discovering the same failure.
+    /// An incomplete save must preserve the previous settings file.
     #[test]
     fn an_interrupted_save_leaves_the_previous_file_intact() {
         let root = TempRoot::new("interrupted");
@@ -563,9 +509,7 @@ mod tests {
         );
     }
 
-    /// **Review item 3.** A failed write must be retried, so `saved` advances only on success.
-    /// The store is unusable to begin with — the configuration root is a *file* — and starts
-    /// working once that is fixed; the second `persist` call, with the same config, must write.
+    /// Advance the saved snapshot only after a successful write so failure is retryable.
     #[test]
     fn a_failed_save_is_retried_rather_than_remembered_as_written() {
         let root = TempRoot::new("retry");

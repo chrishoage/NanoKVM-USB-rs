@@ -1,31 +1,15 @@
-# CH9329 packet examples -- hand-derived from the documented frame format.
+# CH9329 packet fixtures, derived independently of the Rust encoder.
 #
-# FORMAT CHOICE: TOML, not Markdown or JSON.
-#   - These are the AUTHORITY for the §9.1 packet tests, so the test should read
-#     THIS FILE rather than have a human retype the bytes into Rust source --
-#     retyping is exactly where a transcription bug would enter and silently
-#     bless a wrong encoder.
-#   - TOML has comments, so the derivation reasoning lives next to the data
-#     (JSON cannot carry it); it has a schema-ish shape, so a test can
-#     deserialize it (Markdown cannot without a parser).
+# Frame: 57 AB ADDR CMD LEN DATA[LEN] SUM
+# SUM = (0x57 + 0xAB + ADDR + CMD + LEN + sum(DATA)) & 0xFF
+# ADDR is zero throughout, giving a constant checksum contribution of 0x102.
 #
-# DERIVED, NOT CAPTURED. Every `frame` below was worked out from:
-#
-#     HEAD1(0x57) HEAD2(0xAB) ADDR CMD LEN DATA[LEN] SUM
-#     SUM = (HEAD1 + HEAD2 + ADDR + CMD + LEN + sum(DATA)) & 0xFF
-#
-# with ADDR = 0x00 throughout, so the constant part of every checksum is
-#     0x57 + 0xAB + 0x00 = 0x102
-# and therefore
-#     SUM = (0x102 + CMD + LEN + sum(DATA)) & 0xFF
-#
-# `observed = true` means a byte-identical frame was also seen on the wire
-# during the Stage 0 spike (see fixtures/traffic/). That is CORROBORATION.
-# Where a frame was observed on a later run instead, `observed_on` names that
-# run -- the GET_USB_STRING requests and their three replies were pinned by the
-# Stage 3 `nanokvm devices --probe` run of 2026-09-11, which logged the raw
-# reply payloads A16 had measured only as strings.
-# Where derivation and observation disagree, see [[disagreement]] at the end.
+# Tests read these bytes directly to avoid copying encoder mistakes into expectations.
+# `observed = true` records a matching hardware observation. Unless `observed_on`
+# says otherwise, observations came from the 2026-09-09 protocol investigation.
+# USB-string frames were recorded by `nanokvm devices --probe` on 2026-09-11.
+# See docs/protocol.md and docs/hardware.md for interpretation and evidence limits.
+# Disagreements below preserve malformed replies and target-effect observations.
 
 [meta]
 device = "NanoKVM-USB (Sipeed) / CH9329 over CH343 CDC-ACM bridge"
@@ -33,7 +17,7 @@ addr = 0x00
 head = [0x57, 0xAB]
 checksum_formula = "SUM = (HEAD1 + HEAD2 + ADDR + CMD + LEN + sum(DATA)) & 0xFF"
 checksum_constant = "0x57 + 0xAB + 0x00 = 0x102"
-serial = "57600 baud, 8N1 -- confirmed on hardware, see docs/stage0/serial.md"
+serial = "57600 baud, 8N1; hardware-verified (docs/protocol.md)"
 
 # --------------------------------------------------------------------------
 # Requests
@@ -91,7 +75,7 @@ observed = true
 name = "mouse_rel_move"
 cmd = 0x05
 cmd_name = "SEND_MS_REL_DATA"
-payload_meaning = "MODE BYTE 0x01 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 5-byte relative mouse payload [0x01, buttons, dx, dy, wheel]: no buttons, dx=+10 (right), dy=-5 (up, two's complement 0xFB), wheel=0. dx/dy are signed -127..127."
+payload_meaning = "Required mode byte 0x01. 5-byte relative mouse payload [0x01, buttons, dx, dy, wheel]: no buttons, dx=+10 (right), dy=-5 (up, two's complement 0xFB), wheel=0. dx/dy are signed -127..127."
 data = [0x01, 0x00, 0x0A, 0xFB, 0x00]
 len = 0x05
 frame = "57 AB 00 05 05 01 00 0A FB 00 12"
@@ -103,7 +87,7 @@ observed = false
 name = "mouse_rel_idle"
 cmd = 0x05
 cmd_name = "SEND_MS_REL_DATA"
-payload_meaning = "MODE BYTE 0x01 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 5-byte relative mouse payload, no buttons, no motion, no wheel. The mouse half of a release-all."
+payload_meaning = "Required mode byte 0x01. 5-byte relative mouse payload, no buttons, no motion, no wheel. The mouse half of a release-all."
 data = [0x01, 0x00, 0x00, 0x00, 0x00]
 len = 0x05
 frame = "57 AB 00 05 05 01 00 00 00 00 0D"
@@ -115,7 +99,7 @@ observed = true
 name = "mouse_rel_left_button_down"
 cmd = 0x05
 cmd_name = "SEND_MS_REL_DATA"
-payload_meaning = "MODE BYTE 0x01 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 5-byte relative mouse payload: left button held (bit 0), no motion, no wheel."
+payload_meaning = "Required mode byte 0x01. 5-byte relative mouse payload: left button held (bit 0), no motion, no wheel."
 data = [0x01, 0x01, 0x00, 0x00, 0x00]
 len = 0x05
 frame = "57 AB 00 05 05 01 01 00 00 00 0E"
@@ -127,7 +111,7 @@ observed = false
 name = "mouse_abs_origin"
 cmd = 0x04
 cmd_name = "SEND_MS_ABS_DATA"
-payload_meaning = "MODE BYTE 0x02 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 7-byte absolute mouse payload [0x02, buttons, xLo, xHi, yLo, yHi, wheel]: no buttons, x=0, y=0, no wheel. Coordinates are little-endian u16. MEASURED: lands on target pixel (0,0)."
+payload_meaning = "Required mode byte 0x02. 7-byte absolute mouse payload [0x02, buttons, xLo, xHi, yLo, yHi, wheel]: no buttons, x=0, y=0, no wheel. Coordinates are little-endian u16. Observed: lands on target pixel (0,0)."
 data = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 len = 0x07
 frame = "57 AB 00 04 07 02 00 00 00 00 00 00 0F"
@@ -139,7 +123,7 @@ observed = true
 name = "mouse_abs_centre_4096"
 cmd = 0x04
 cmd_name = "SEND_MS_ABS_DATA"
-payload_meaning = "MODE BYTE 0x02 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 7-byte absolute mouse payload: no buttons, x=2048, y=2048, no wheel. MEASURED on a 1920x1080 target: lands on pixel (960,540), i.e. exactly the centre -- the full-scale divisor is 4096."
+payload_meaning = "Required mode byte 0x02. 7-byte absolute mouse payload: no buttons, x=2048, y=2048, no wheel. Observed on a 1920x1080 target: lands near pixel (960,540), at half scale; the committed frame analysis reports (960,539) -- the full-scale divisor is 4096."
 data = [0x02, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00]
 len = 0x07
 frame = "57 AB 00 04 07 02 00 00 08 00 08 00 1F"
@@ -151,7 +135,7 @@ observed = true
 name = "mouse_abs_max_12bit"
 cmd = 0x04
 cmd_name = "SEND_MS_ABS_DATA"
-payload_meaning = "MODE BYTE 0x02 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 7-byte absolute mouse payload: no buttons, x=4095, y=0, no wheel. MEASURED: x=4095 lands on the LAST pixel column (1919 of 1920). 4095 is the true full-scale value."
+payload_meaning = "Required mode byte 0x02. 7-byte absolute mouse payload: no buttons, x=4095, y=0, no wheel. Observed: x=4095 lands on the last pixel column (1919 of 1920). 4095 is the true full-scale value."
 data = [0x02, 0x00, 0xFF, 0x0F, 0x00, 0x00, 0x00]
 len = 0x07
 frame = "57 AB 00 04 07 02 00 FF 0F 00 00 00 1D"
@@ -163,7 +147,7 @@ observed = true
 name = "mouse_abs_max_15bit"
 cmd = 0x04
 cmd_name = "SEND_MS_ABS_DATA"
-payload_meaning = "MODE BYTE 0x02 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 7-byte absolute mouse payload: no buttons, x=32767, y=0, no wheel. MEASURED: 32767 & 0x1FFF = 8191, which is above 4095, so this pins at the right edge. Upstream's 0-to-32767 comment is REFUTED; see docs/stage0/absrange.md."
+payload_meaning = "Required mode byte 0x02. 7-byte absolute mouse payload: no buttons, x=32767, y=0, no wheel. Observed: 32767 & 0x1FFF = 8191, which is above 4095, so this pins at the right edge. This contradicts the upstream 0-to-32767 range comment; see docs/protocol.md."
 data = [0x02, 0x00, 0xFF, 0x7F, 0x00, 0x00, 0x00]
 len = 0x07
 frame = "57 AB 00 04 07 02 00 FF 7F 00 00 00 8D"
@@ -175,7 +159,7 @@ observed = true
 name = "wheel_up_rel"
 cmd = 0x05
 cmd_name = "SEND_MS_REL_DATA"
-payload_meaning = "MODE BYTE 0x01 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 5-byte relative mouse payload used as a wheel event: no buttons, no motion, wheel=+1 (one detent away from the user)."
+payload_meaning = "Required mode byte 0x01. 5-byte relative mouse payload used as a wheel event: no buttons, no motion, wheel=+1 (one detent away from the user)."
 data = [0x01, 0x00, 0x00, 0x00, 0x01]
 len = 0x05
 frame = "57 AB 00 05 05 01 00 00 00 01 0E"
@@ -187,7 +171,7 @@ observed = false
 name = "wheel_down_rel"
 cmd = 0x05
 cmd_name = "SEND_MS_REL_DATA"
-payload_meaning = "MODE BYTE 0x01 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 5-byte relative mouse payload used as a wheel event: wheel=-1 (0xFF two's complement, one detent toward the user)."
+payload_meaning = "Required mode byte 0x01. 5-byte relative mouse payload used as a wheel event: wheel=-1 (0xFF two's complement, one detent toward the user)."
 data = [0x01, 0x00, 0x00, 0x00, 0xFF]
 len = 0x05
 frame = "57 AB 00 05 05 01 00 00 00 FF 0C"
@@ -199,7 +183,7 @@ observed = false
 name = "wheel_up_abs"
 cmd = 0x04
 cmd_name = "SEND_MS_ABS_DATA"
-payload_meaning = "MODE BYTE 0x02 IS MANDATORY -- see [[disagreement]] mouse_reports_need_a_leading_mode_byte and docs/stage0/absrange.md. 7-byte absolute mouse payload used as a wheel event: position held at origin, wheel=+1. The absolute report carries its own wheel byte, so a wheel event does not have to be sent as a relative report."
+payload_meaning = "Required mode byte 0x02. 7-byte absolute mouse payload used as a wheel event: position held at origin, wheel=+1. The absolute report carries its own wheel byte, so a wheel event does not have to be sent as a relative report."
 data = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
 len = 0x07
 frame = "57 AB 00 04 07 02 00 00 00 00 00 01 10"
@@ -211,7 +195,7 @@ observed = false
 name = "get_usb_string_manufacturer"
 cmd = 0x0A
 cmd_name = "GET_USB_STRING"
-payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the manufacturer string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the manufacturer string. Replies were recorded on 2026-09-11; see get_usb_string_*_reply. An empty request payload produces err_param_on_get_usb_string."
 data = [0x00]
 len = 0x01
 frame = "57 AB 00 0A 01 00 0D"
@@ -224,7 +208,7 @@ observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
 name = "get_usb_string_product"
 cmd = 0x0A
 cmd_name = "GET_USB_STRING"
-payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the product string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the product string. Replies were recorded on 2026-09-11; see get_usb_string_*_reply. An empty request payload produces err_param_on_get_usb_string."
 data = [0x01]
 len = 0x01
 frame = "57 AB 00 0A 01 01 0E"
@@ -237,7 +221,7 @@ observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
 name = "get_usb_string_serial"
 cmd = 0x0A
 cmd_name = "GET_USB_STRING"
-payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the unit serial string. STAGE0_FINDINGS A16 read the three strings back (Sipeed / NanoKVM-USB / BA1612624UJPW2RUJ) without recording the reply bytes; the 2026-09-11 run logged the raw payloads, so the reply is pinned too -- see the [[response]] get_usb_string_*_reply entries. An EMPTY payload is a parameter error instead -- see [[response]] err_param_on_get_usb_string."
+payload_meaning = "One-byte payload naming the string wanted: 0x00 manufacturer, 0x01 product, 0x02 serial. This one asks for the unit serial string. Replies were recorded on 2026-09-11; see get_usb_string_*_reply. An empty request payload produces err_param_on_get_usb_string."
 data = [0x02]
 len = 0x01
 frame = "57 AB 00 0A 01 02 0F"
@@ -309,7 +293,7 @@ observed = true
 [[response]]
 name = "err_checksum_on_get_info"
 cmd = 0xC1
-payload_meaning = "Error reply to GET_INFO (0x01 | 0xC0). Status byte 0xE4 = checksum error. NOTE the last payload byte is NOT 0x00, which is why upstream's off-by-one decode() rejects every error frame -- see docs/stage0/serial.md §3.1."
+payload_meaning = "Error reply to GET_INFO (0x01 | 0xC0). Status byte 0xE4 = checksum error. The nonzero final payload byte exposes the upstream decoder's checksum-boundary error; see docs/protocol.md."
 data = [0xE4]
 len = 0x01
 frame = "57 AB 00 C1 01 E4 A8"
@@ -355,7 +339,7 @@ observed_on = "2026-09-11, nanokvm devices --probe, USB 2.0 link"
 [[response]]
 name = "get_usb_string_serial_reply"
 cmd = 0x8A
-payload_meaning = "GET_USB_STRING reply for type 0x02: 0x02 serial, 17 bytes, \"BA1612624UJPW2RUJ\". A16: this is unit-unique and unrelated to either USB iSerial, which makes it the one identifier sysfs cannot see (§8's last paragraph)."
+payload_meaning = "GET_USB_STRING reply for type 0x02: 0x02 serial, 17 bytes, \"BA1612624UJPW2RUJ\". This unit identifier differs from both USB iSerial values and is unavailable through sysfs."
 data = [0x02, 0x11, 0x42, 0x41, 0x31, 0x36, 0x31, 0x32, 0x36, 0x32, 0x34, 0x55, 0x4A, 0x50, 0x57, 0x32, 0x52, 0x55, 0x4A]
 len = 0x13
 frame = "57 AB 00 8A 13 02 11 42 41 31 36 31 32 36 32 34 55 4A 50 57 32 52 55 4A 04"
@@ -377,7 +361,7 @@ observed = true
 
 # --------------------------------------------------------------------------
 # Where the wire disagreed with the documented frame format.
-# Per §9.1 a disagreement is a finding, not a test to make pass.
+# Preserve the observation even when it violates the nominal frame format.
 # --------------------------------------------------------------------------
 
 [[disagreement]]
@@ -386,67 +370,45 @@ trigger = "57 AB 00 7E 00 80   (well-formed frame, undefined command 0x7E)"
 derived_reply = "57 AB 00 FE 00 00   (6 bytes: CMD 0x7E|0x80, LEN 0x00, SUM = 0x102 + 0xFE + 0x00 = 0x200 -> & 0xFF = 0x00)"
 observed_reply = "57 AB 00 FE 00      (5 bytes -- no SUM byte at all)"
 note = """
-The device replies to an undefined command with a FIVE byte frame: header,
-addr, CMD 0xFE, LEN 0x00, and then nothing. The frame format requires a
-checksum byte even when LEN is 0, so a strict host parser that waits for
-6 + LEN bytes will block forever on this reply. Reproduced with a 2 s and a
-10 s read window; the sixth byte never arrives, and the next GET_INFO gets
-its own correct reply, so the byte is not merely late.
-IMPLICATION: the host frame reader needs a read timeout and a resync path,
-it cannot be a pure byte counter. It is also a reason never to send an
-undefined command speculatively.
+The undefined command returned five bytes, omitting the checksum despite LEN=0.
+No sixth byte arrived within either a 2 s or 10 s read window. A subsequent
+GET_INFO received its own complete reply, excluding a merely late checksum.
+
+The reader therefore needs a timeout and resynchronization path. Waiting only
+for 6 + LEN bytes can block indefinitely on this response.
 """
 
 [[disagreement]]
 name = "device_receive_parser_has_no_inter_byte_timeout"
 trigger = "57 AB 00 02 08 00 00   (header claims LEN=8, only 2 payload bytes sent)"
 note = """
-The CH9329 keeps counting. After gaps of 0, 100, 200, 300, 500, 1000, 2000 and
-10000 ms it was still waiting for the remaining 6 payload bytes plus checksum,
-and it consumed the next GET_INFO request's bytes as that payload. It then
-emitted 57 AB 00 C2 01 E4 A9 (checksum error against CMD 0x02) and only
-resynchronised on the request AFTER that.
-IMPLICATION: the host must never emit a partial frame. One truncated write
-costs the next command as well, and the reply the host then reads belongs to
-the wrong request -- so the read path must match replies by CMD, not assume
-strict request/response pairing.
+The chip kept waiting for six payload bytes and a checksum after gaps of
+0, 100, 200, 300, 500, 1000, 2000, and 10000 ms. It consumed the next GET_INFO
+as the unfinished payload, returned 57 AB 00 C2 01 E4 A9 (checksum error),
+and resynchronized on the following request.
+
+Complete-frame writes prevent this failure during normal operation. Reconnect
+pads a potentially torn frame before commissioning; replies must still be
+matched by command rather than assumed to belong to the latest request.
 """
 
 [[disagreement]]
 name = "mouse_reports_need_a_leading_mode_byte"
-trigger = "57 AB 00 04 06 00 <xLo> <xHi> <yLo> <yHi> 00   (6-byte absolute payload, as this file and docs/NATIVE_CLIENT_PLAN.md's appendix originally derived it)"
+trigger = "57 AB 00 04 06 00 <xLo> <xHi> <yLo> <yHi> 00   (6-byte absolute payload without the required mode byte)"
 derived_reply = "cursor moves to the requested position"
-observed_reply = "57 AB 00 84 01 00 87  (ACK) and the cursor does not move AT ALL"
+observed_reply = "57 AB 00 84 01 00 87  (ACK) with no cursor movement"
 note = """
-MEASURED ON HARDWARE, docs/stage0/absrange.md. The plan's appendix and the
-first version of this file both derived the mouse payloads straight from the
-HID report shapes: 4 bytes relative [buttons, dx, dy, wheel] and 6 bytes
-absolute [buttons, xLo, xHi, yLo, yHi, wheel]. Both are WRONG on the wire.
+Hardware measurements confirmed a required leading mode byte:
+    SEND_MS_ABS_DATA (0x04), LEN=7: [0x02, buttons, xLo, xHi, yLo, yHi, wheel]
+    SEND_MS_REL_DATA (0x05), LEN=5: [0x01, buttons, dx, dy, wheel]
 
-The CH9329 mouse commands take a leading MODE byte:
-    SEND_MS_ABS_DATA (0x04)  LEN=7  [0x02, buttons, xLo, xHi, yLo, yHi, wheel]
-    SEND_MS_REL_DATA (0x05)  LEN=5  [0x01, buttons, dx,  dy,   wheel]
+The upstream mouse helpers describe HID-shaped payloads without that byte;
+the absolute.tsx and relative.tsx send sites prepend it. Omitting it from an
+absolute report still receives 57 AB 00 84 01 00 87, but the cursor does not
+move. A short relative report shifts interpretation: host dy becomes target
+dx, and host wheel becomes target dy. Both effects were observed on hardware.
 
-Upstream does this at the SEND SITE, which is why it is invisible in
-libs/mouse/index.ts (whose comments this file trusted):
-    reference/browser/src/components/mouse/absolute.tsx:166
-        await device.sendMouseData([0x02, ...report])
-    reference/browser/src/components/mouse/relative.tsx:136
-        await device.sendMouseData([0x01, ...report])
-    reference/browser/src/libs/device/index.ts:30
-        const cmdEvent = report[0] === 0x01 ? SEND_MS_REL_DATA : SEND_MS_ABS_DATA
-
-WHY THIS IS DANGEROUS: the device ACKs the short form. `57 AB 00 84 01 00 87`
-comes back for a 6-byte absolute payload exactly as it does for the correct
-7-byte one, and the cursor simply never moves. The 4-byte relative payload is
-worse: it is silently interpreted one byte to the left, so the target reads
-dx from the host's dy byte and dy from the host's wheel byte -- the pointer
-moves horizontally when the host asked for vertical motion, and never moves
-vertically at all. Both were reproduced on hardware and then fixed by adding
-the mode byte.
-
-IMPLICATION: LEN is the only signal that distinguishes the two forms, and the
-device does not check it. A byte-count assertion in the encoder (7 and 5) is
-the cheap guard, and the §9.1 packet tests must assert against the frames in
-this file, which are now the corrected ones.
+Acknowledgement alone cannot verify input. Assert payload lengths and mode
+bytes against these fixtures, and use captured target effects for hardware
+validation. See fixtures/frames/absrange/MANIFEST.md.
 """

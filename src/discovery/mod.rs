@@ -1,107 +1,16 @@
-//! Pairing the dongle's two device nodes by USB topology (plan §8).
+//! Video, serial, and audio pairing from USB topology.
 //!
-//! The dongle presents itself as **two unrelated-looking Linux devices**: a UVC video node and a
-//! CDC-ACM serial node. Nothing in either node says which dongle it belongs to — §8 measured
-//! that even the `iSerial` strings are unrelated (`20210621`, a firmware date, against
-//! `5C37176280`, a bridge serial). So the pairing has to come from where the two devices *sit*,
-//! and §8's policy is blunt about the consequence: **exactly one candidate pair is used, anything
-//! else fails with the candidates listed. Never silently pick one.**
+//! Video and serial may be separate USB devices on different buses. Pairing prefers a
+//! shared USB device, then the kernel's SuperSpeed/HighSpeed port peer link. The fallback
+//! requires direct children of a 1a40:0101 hub with video 345f:2133 and serial 1a86:55d3.
+//! That fallback is reported as degraded evidence because these identifiers are not unique.
+//! Multiple candidate pairs require explicit selection.
 //!
-//! ## The two physical shapes, and why both are supported
+//! Candidate video nodes receive a read-only capability query to exclude metadata nodes.
+//! Product strings and node numbers do not identify a dongle: both can change on reconnect.
 //!
-//! ```text
-//! SuperSpeed link (Stage 0, docs/stage0/topology.md)
-//!   usb4 ── 4-2 (USB3 hub) ── 4-2.2   345f:2133  video     <- /dev/video4
-//!                              └ port 4-2-port2  --peer--> 3-2-port2
-//!   usb3 ── 3-2 (USB2 hub) ── 3-2.2   1a40:0101  internal hub
-//!                              └────── 3-2.2.4  1a86:55d3  serial  <- /dev/ttyACM1
-//!
-//! USB 2.0-only link (Stage 1, this desk)
-//!   usb3 ── 3-2 (USB2 hub) ── 3-2.2   1a40:0101  internal hub
-//!                              ├────── 3-2.2.2  345f:2133  video   <- /dev/video4, /dev/video5
-//!                              └────── 3-2.2.4  1a86:55d3  serial  <- /dev/ttyACM1
-//! ```
-//!
-//! At SuperSpeed the video device enumerates on a bus the kernel presents as entirely separate
-//! from the serial device's, and the only thing joining them is the kernel's port `peer` symlink
-//! — which asserts *these two ports are one physical connector*. On a USB 2.0-only port the video
-//! device cannot reach SuperSpeed, falls back behind the dongle's own internal hub, and there is
-//! no `peer` link at all. §8 listed the second shape as **untested**; STAGE1_FINDINGS recorded it
-//! happening for real. Both are implemented here and both are pinned by a fixture (§9.1: the
-//! recording is the authority, not a retyped description of it).
-//!
-//! ## Evidence, strongest first (§8, as revised by `topology.md`)
-//!
-//! 1. [`Evidence::SameDevice`] — one USB device, two interfaces. Proof. Not available on this
-//!    unit, and quite possibly on no unit; kept because §8 keeps it and it costs two comparisons.
-//! 2. [`Evidence::PortPeer`] — the kernel's `peer` assertion. Proof, and no vendor id is
-//!    required: the kernel is stating a fact about the connector, not a guess about the device.
-//! 3. [`Evidence::InternalHub`] — containment under the dongle's own hub. **Not proof.** §8 is
-//!    explicit that on a USB 2.0-only port "the check degrades to a common-ancestor test, which
-//!    is sound *because the shared ancestor is inside the dongle*" — so its soundness rests
-//!    entirely on the claim that the shared hub *is* the dongle's, and nothing asserts that. Its
-//!    messages say "degraded" for that reason: a user about to let this program write CH9329
-//!    frames into a serial port should be told which of the two kinds of answer they got.
-//!
-//! **Item 3 here is deliberately narrower than §8's wording, and that is a correction, not an
-//! omission.** The id §8 would have to check, `1a40:0101`, is an unbranded generic hub chip with
-//! no manufacturer string and no serial. Checking only the hub id makes the rule say "any two USB
-//! devices behind any cheap hub are a NanoKVM". This desk is the counter-example that forces the
-//! point: the user's webcam (`5-1.4.4.4.2`, `046d:086b`) and an unrelated CDC-ACM device
-//! (`5-1.4.4.4.3`, `043e:9a8a`) are **direct children of one generic hub** (`5-1.4.4.4`,
-//! `0bda:5411`) and would pair under the loose rule. So item 3 additionally requires the video
-//! device to be [`VIDEO_ID`] and the serial device to be [`SERIAL_ID`]. Item 2 needs no such
-//! guard because the kernel supplies the proof; item 3 has no proof to lean on, so it leans on
-//! identity instead. The cost is that a hypothetical future dongle revision with different ids
-//! stops auto-pairing on a USB 2.0 port — it still lists, and `--video`/`--serial` still work,
-//! which §8 guarantees permanently.
-//!
-//! All three of those ids are commodity part numbers (Terminus hub, MacroSilicon capture, QinHeng
-//! bridge), so the containment rule can in principle be satisfied by a capture stick and a serial
-//! adapter sharing a cheap hub. It still pairs — this desk depends on it, and refusing would
-//! leave the USB 2.0 shape with no automatic answer at all — but the caller logs it at `warn` and
-//! names `--video`/`--serial`, because that is the one case where the automatic answer can be
-//! wrong with nothing looking wrong.
-//!
-//! ## The third node: the sound card (§12 Stage 4a)
-//!
-//! The dongle's `345f:2133` carries **five** interfaces: two UVC (`1.0`, `1.1`), a USB Audio
-//! Class control and streaming pair (`1.2`, `1.3`, bound to `snd-usb-audio`) and a HID interface
-//! (`1.4`) nothing here uses. So `/sys/class/sound/cardN/device` resolves to an interface of the
-//! *same USB device* as the capture node's — which is [`Evidence::SameDevice`], §8's item 1, the
-//! proof the video-and-serial pairing cannot have on this hardware and does not need to fall back
-//! from here. [`audio_for`] therefore implements **only** that rule.
-//!
-//! It is emphatically not the containment rule. Anything else plugged into the dongle's own
-//! internal hub is contained by that hub exactly as the capture device is, and a USB sound card
-//! on a free port of it — `fixtures/sysfs/two-dongles` carries one — is a card that containment
-//! would pair and same-device rejects.
-//!
-//! The card is named to ALSA as `hw:<N>`, with `<N>` parsed back out of the `card<N>` directory
-//! name **at open time, never remembered** ([`SoundCard::number`]): card numbers renumber on
-//! replug exactly as `/dev` names do (C13). No ALSA call happens here; this module still reads
-//! `/sys` and runs one `QUERYCAP`, and nothing else.
-//!
-//! A missing, unpaired or ambiguous card is never an error. §4.1 rev 5 makes audio a side channel
-//! that must change nothing about video or input, so [`AudioPairing`] has a variant for each and
-//! all of them are printed rather than raised.
-//!
-//! ## Explicit overrides are not discovery's to veto
-//!
-//! §8: "Always honour explicit `--serial` and `--video` overrides, which also make the tool
-//! usable when discovery is wrong." [`discover`] therefore never consults the inventory to
-//! *select* when both are given: the two paths are used as handed over, whether or not the class
-//! walk enumerated them (a `ttyUSB` node bound by `ch343` rather than `cdc_acm`, a
-//! `/dev/serial/by-id/…` path, a `/sys` that could not be read at all). Discovery still runs
-//! there, but only to attach the evidence — or the absence of it — for the caller to log, and it
-//! cannot fail that selection.
-//!
-//! ## What opens what
-//!
-//! Nothing in this module opens the serial node, and it opens a video node only when the answer
-//! could change the outcome (see [`inventory`]). Reading `/sys` is free of side effects; opening
-//! `/dev` is not, and a device-listing command that disturbs the user's hardware to produce a
-//! nicer table is a bad trade.
+//! Audio pairs only with the capture node's own USB device. Missing or ambiguous audio
+//! is reported independently and never invalidates a video/serial pair.
 
 pub mod probe;
 pub mod reopen;
@@ -127,25 +36,22 @@ const TTY_CLASS: &str = "/class/tty";
 const TTY_PREFIX: &str = "ttyACM";
 /// Video nodes are `video*`; `v4l-subdev*` and `media*` live in other classes.
 const VIDEO_PREFIX: &str = "video";
-/// The class directory ALSA cards register under (§12 Stage 4a).
+/// The class directory ALSA cards register under.
 const SOUND_CLASS: &str = "/class/sound";
 /// `/sys/class/sound` also holds `controlC8`, `pcmC8D0c`, `seq` and `timer`. Only `card<N>` is a
 /// card, and the `<N>` is the card number — which is why it is parsed back out of the name rather
 /// than remembered from anywhere (see [`SoundCard::number`]).
 const CARD_PREFIX: &str = "card";
 
-/// MACROSILICON "USB2 Video" / "USB3 Video" — the dongle's capture function (§8, `topology.md`).
+/// MACROSILICON "USB2 Video" / "USB3 Video" — the dongle's capture function.
 pub const VIDEO_ID: (u16, u16) = (0x345f, 0x2133);
-/// QinHeng CH9329 "USB Single Serial" — the dongle's HID bridge (§8).
+/// QinHeng CH9329 "USB Single Serial" — the dongle's HID bridge.
 pub const SERIAL_ID: (u16, u16) = (0x1a86, 0x55d3);
 /// The unbranded 4-port hub inside the dongle. Generic, hence the extra id checks on evidence 3.
 pub const INTERNAL_HUB_ID: (u16, u16) = (0x1a40, 0x0101);
 
-/// One USB device, resolved up from a class node.
-///
-/// §8: "resolve up to the USB device, not to an arbitrary shared ancestor". `sysfs` is the
-/// device directory itself (`/devices/.../3-2.2.2`), never one of its interface children
-/// (`3-2.2.2:1.0`) and never the hub above it.
+/// USB device resolved from a class node. `sysfs` names the device directory itself,
+/// not an interface below it or a hub above it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsbDevice {
     /// sysfs-absolute path of the device directory.
@@ -204,29 +110,20 @@ pub struct ProbeFailure {
 pub struct VideoNode {
     /// e.g. `/dev/video4`.
     pub dev: PathBuf,
-    /// The USB device the class walk resolved this node to.
-    ///
-    /// `None` only for a node named by `--video` that discovery never enumerated — an override
-    /// is obeyed without discovery's agreement (§8), and "I do not know what this is" is the
-    /// honest thing to record rather than a fabricated device.
+    /// USB identity, or `None` for an explicit path absent from the inventory.
     pub usb: Option<UsbDevice>,
     /// `Some(true)`/`Some(false)` from [`NodeProbe`]; `None` when the probe was not run or
     /// failed. See [`inventory`] for when it is run.
     pub is_capture: Option<bool>,
-    /// Set when the probe was run and returned an error. `EACCES` and `EBUSY` both land here,
-    /// and both are things the user can act on, so §8's listing shows them.
+    /// Capability-query error retained for the device listing.
     pub probe_error: Option<ProbeFailure>,
     /// Whether the probe was consulted at all. Distinguishes "metadata node" from "not asked".
     pub probed: bool,
 }
 
 impl VideoNode {
-    /// Whether this node may be selected as the capture node.
-    ///
-    /// A node the probe called a capture node always may. A node with no probe answer may only
-    /// if no sibling on the same USB device gave a definite `true` — that is what keeps
-    /// `/dev/video5` out of the running while still surviving an `EACCES` on `/dev/video4`
-    /// rather than declaring the dongle absent.
+    /// Whether this node is eligible for selection. An inconclusive probe stays eligible
+    /// unless a sibling on the same USB device is confirmed as the capture node.
     fn eligible(&self, siblings: &[VideoNode]) -> bool {
         match self.is_capture {
             Some(v) => v,
@@ -261,18 +158,12 @@ pub struct SerialNode {
     pub usb: Option<UsbDevice>,
 }
 
-/// An ALSA card and the USB device it belongs to (§12 Stage 4a).
-///
-/// The dongle's `345f:2133` carries a USB Audio Class control/streaming pair on interfaces `1.2`
-/// and `1.3` alongside its two UVC interfaces, so `/sys/class/sound/cardN/device` resolves to an
-/// interface of the **same USB device** as the capture node's. That is §8's evidence 1 — the
-/// strongest kind, the one the video-and-serial pairing cannot have on this hardware — and it is
-/// the only rule [`audio_for`] implements. See the module docs.
+/// ALSA card and its USB identity, when it has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SoundCard {
     /// sysfs-absolute path of the card directory, e.g. `/devices/.../3-2.2.2:1.2/sound/card8`.
     pub sysfs: PathBuf,
-    /// The kernel's name for it, e.g. `card8`. **This is where the card number comes from.**
+    /// The kernel's name for it, e.g. `card8`. This is where the card number comes from.
     pub name: String,
     /// The card's ALSA id (`/sys/class/sound/cardN/id`), e.g. `Video`. Used only for the
     /// `hw:CARD=` spelling and for the listing; nothing pairs on it.
@@ -284,22 +175,13 @@ pub struct SoundCard {
 }
 
 impl SoundCard {
-    /// The card number, parsed back out of [`SoundCard::name`].
-    ///
-    /// **Derived at every call, never remembered.** Card numbers renumber on replug exactly as
-    /// `/dev/video*` and `/dev/ttyACM*` names do (C13): the kernel hands out the lowest free
-    /// index, so a card that was 8 comes back as 9 while something still holds 8. Anything that
-    /// stored the number would open a stranger's card after a replug, which is the whole point of
-    /// §8's "a node that was discovered is rediscovered on every attempt".
+    /// Parse the card number from the current name. Resolve the card again before opening
+    /// after replug; a stored number can refer to another device.
     pub fn number(&self) -> Option<u32> {
         self.name.strip_prefix(CARD_PREFIX)?.parse().ok()
     }
 
-    /// The ALSA device string to open this card's first PCM with, e.g. `hw:8`.
-    ///
-    /// `None` for a card whose name is not `card<N>`, which cannot happen for a card the class
-    /// walk enumerated and is reported rather than asserted anyway: nothing here may panic on a
-    /// device path.
+    /// ALSA name for the first PCM, such as `hw:8`, or `None` for an invalid card name.
     pub fn alsa_device(&self) -> Option<String> {
         Some(format!("hw:{}", self.number()?))
     }
@@ -332,11 +214,7 @@ impl fmt::Display for SoundCard {
     }
 }
 
-/// Which sound card, if any, belongs to a pair's capture device (§12 Stage 4a).
-///
-/// Audio is a side channel: §4.1 rev 5 requires a missing or ambiguous card to change nothing
-/// about video or input, so none of these variants is an error. They are all things
-/// `nanokvm devices` prints and the viewer's title surfaces.
+/// Audio pairing result. Missing or ambiguous audio does not invalidate video or input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AudioPairing {
     /// Exactly one card is on the capture node's own USB device.
@@ -344,8 +222,7 @@ pub enum AudioPairing {
     /// No card is. An ordinary outcome: a dongle whose audio interface is unbound, a kernel
     /// without `snd-usb-audio`, or a capture device that simply has no audio function.
     NoCard,
-    /// More than one card is on that USB device. §8's policy — never silently pick one — applies
-    /// here too, so nothing is selected and the candidates are listed.
+    /// Multiple cards share the USB device; list them without selecting one.
     Ambiguous(Vec<SoundCard>),
     /// The video node was named explicitly and discovery never enumerated it, so there is no USB
     /// device to compare a card against. Not "no audio": "not asked".
@@ -353,7 +230,7 @@ pub enum AudioPairing {
 }
 
 impl AudioPairing {
-    /// The card to open, if there is exactly one.
+    /// The card to open, if there is one.
     pub fn card(&self) -> Option<&SoundCard> {
         match self {
             AudioPairing::Paired(c) => Some(c),
@@ -394,14 +271,8 @@ impl fmt::Display for AudioPairing {
     }
 }
 
-/// The card on `video`'s own USB device, by §8's evidence 1 and nothing weaker.
-///
-/// **Deliberately not the containment rule.** The video-and-serial pairing has to fall back to
-/// "both are direct children of the dongle's own hub" because on a USB 2.0 link those really are
-/// two USB devices (§8). Audio needs no fallback: the sound card is an interface of the capture
-/// device itself, so the strongest rule is also the only one available — and the weaker one would
-/// be wrong, because anything else plugged into the dongle's internal hub is contained by it too
-/// (`fixtures/sysfs/two-dongles` carries exactly that case).
+/// Find the card on the video node's own USB device. Shared-hub containment is
+/// insufficient because another sound card could occupy a different port on that hub.
 fn audio_for(video: Option<&UsbDevice>, cards: &[SoundCard]) -> AudioPairing {
     let Some(video) = video else {
         return AudioPairing::Unknown;
@@ -418,7 +289,7 @@ fn audio_for(video: Option<&UsbDevice>, cards: &[SoundCard]) -> AudioPairing {
     }
 }
 
-/// Why two nodes are believed to be one dongle (§8, strongest first).
+/// Why two nodes are believed to be one dongle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evidence {
     /// Identical `busnum:devnum`: two interfaces of one USB device.
@@ -430,9 +301,8 @@ pub enum Evidence {
         /// Its `peer`, e.g. `3-2-port2`.
         peer_port: String,
     },
-    /// Both are direct children of the dongle's own internal hub, and all three vendor ids match.
-    ///
-    /// §8's *degraded* case, not proof: see the module docs.
+    /// Matching video and serial devices are direct children of the expected internal hub.
+    /// This is degraded evidence: the three device identifiers are commodity part numbers.
     InternalHub {
         /// The hub itself, for the listing.
         hub: UsbDevice,
@@ -450,8 +320,7 @@ impl Evidence {
         }
     }
 
-    /// Whether this is one of §8's two *proofs* (items 1 and 2) rather than its degraded
-    /// common-ancestor test (item 3). The caller logs the degraded case at `warn`.
+    /// Whether pairing uses shared-device or kernel port-peer evidence.
     pub fn is_proof(&self) -> bool {
         !matches!(self, Evidence::InternalHub { .. })
     }
@@ -469,31 +338,27 @@ impl fmt::Display for Evidence {
                 "port peer: the serial device sits under {peer_port}, which the kernel declares \
                  the peer of the video device's port {video_port} — proof"
             ),
-            // Deliberately never says "proof", and never the word on its own either: this is
-            // §8's degraded test, contained by a hub whose id — like the other two — is a
-            // commodity part number. `scripts/device-health.py` prints this string verbatim.
+            // Label the hub heuristic as degraded so it cannot be mistaken for unique identity.
             Evidence::InternalHub { hub } => write!(
                 f,
                 "internal hub (degraded): both are direct children of the dongle's own hub {hub} \
-                 — §8's common-ancestor test, contained by that hub and by all three vendor ids, \
+                 — an internal-hub containment test, contained by that hub and by all three vendor ids, \
                  which are commodity part numbers rather than a kernel assertion"
             ),
         }
     }
 }
 
-/// One video node and one serial node believed to be the same dongle.
+/// Selected video and serial nodes with optional pairing evidence.
 ///
-/// `evidence` is `None` only when the user supplied **both** `--video` and `--serial`: §8 says
-/// explicit selection is honoured permanently and makes the tool "usable when discovery is
-/// wrong", so an override is obeyed even when no rule connects the two. The caller logs a warning
-/// in that case; it is not an error.
+/// Explicit paths are honored even when no topology rule connects them; in that case
+/// `evidence` is `None` and the caller reports the missing evidence.
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub video: VideoNode,
     pub serial: SerialNode,
     pub evidence: Option<Evidence>,
-    /// The sound card on the capture node's own USB device (§12 Stage 4a). Never an error: audio
+    /// The sound card on the capture node's own USB device. Never an error: audio
     /// is a side channel and its absence changes nothing about this pair.
     pub audio: AudioPairing,
 }
@@ -514,17 +379,12 @@ impl fmt::Display for Pair {
     }
 }
 
-/// Everything discovery found, whether or not it paired.
-///
-/// This is the message a user reads when told to pass `--video`/`--serial` (§8), and it is also
-/// what `nanokvm devices` prints (§12 Stage 3), because §8's error path needs it anyway.
+/// Device inventory, including unpaired nodes and selection evidence.
 #[derive(Clone, Debug, Default)]
 pub struct Inventory {
     pub videos: Vec<VideoNode>,
     pub serials: Vec<SerialNode>,
-    /// Every `/sys/class/sound/card*` on the machine, including the ones that resolve to no USB
-    /// device at all. They are listed rather than filtered because a card the user expected to
-    /// pair and which did not is exactly what this listing exists to explain.
+    /// All enumerated sound cards, including non-USB cards, for explaining failed pairing.
     pub cards: Vec<SoundCard>,
     pub pairs: Vec<Pair>,
 }
@@ -549,12 +409,7 @@ impl Inventory {
         }
     }
 
-    /// The same listing, with the nodes `--video`/`--serial` name marked and the selection those
-    /// flags produce spelled out.
-    ///
-    /// `nanokvm devices` uses this rather than plain [`Display`](fmt::Display): a listing that
-    /// silently ignored the flags on its own command line would be answering a question the user
-    /// did not ask (finding 7 of the Stage 2 review).
+    /// List devices with explicit paths marked and their resulting selection shown.
     pub fn listing<'a>(&'a self, constraints: &'a Constraints) -> Listing<'a> {
         Listing {
             inventory: self,
@@ -583,8 +438,7 @@ impl fmt::Display for Inventory {
     }
 }
 
-/// No `--video`/`--serial`, so nothing in a listing is marked. A constant rather than a
-/// temporary because [`Listing`] borrows what it is given.
+/// Static empty constraints because [`Listing`] borrows its selection.
 static NO_CONSTRAINTS: Constraints = Constraints {
     video: None,
     serial: None,
@@ -672,8 +526,7 @@ impl fmt::Display for Listing<'_> {
             writeln!(f, "{mark} {p}")?;
         }
 
-        // A path the flags name that the class walk never enumerated is not an error — §8 obeys
-        // it anyway — but a listing that did not mention it would look like it had been ignored.
+        // Include explicit paths absent from sysfs so the listing still reflects the request.
         for (kind, chosen) in [(NodeKind::Video, cv), (NodeKind::Serial, cs)] {
             let Some(path) = chosen else { continue };
             let known = match kind {
@@ -684,7 +537,7 @@ impl fmt::Display for Listing<'_> {
                 writeln!(
                     f,
                     "note: {} {} is not a node discovery enumerated; it will still be used as \
-                     given (§8).",
+                     given.",
                     kind.flag(),
                     path.display()
                 )?;
@@ -710,7 +563,7 @@ fn describe(usb: Option<&UsbDevice>) -> String {
     }
 }
 
-/// Explicit `--video`/`--serial` selection (§8: honoured permanently).
+/// Explicit `--video`/`--serial` selection.
 #[derive(Clone, Debug, Default)]
 pub struct Constraints {
     pub video: Option<PathBuf>,
@@ -726,7 +579,7 @@ pub enum NodeKind {
 
 impl NodeKind {
     /// The command-line flag that supplies this node, for error messages that tell the user
-    /// exactly what to type.
+    /// what to type.
     pub fn flag(self) -> &'static str {
         match self {
             NodeKind::Video => "--video",
@@ -751,10 +604,10 @@ impl fmt::Display for NodeKind {
     }
 }
 
-/// Why discovery could not name exactly one pair.
+/// Why discovery could not name one pair.
 ///
 /// Every variant's `Display` names every node and every `vid:pid` found, because the action the
-/// user has to take is to pick two of them and pass them on the command line (§8).
+/// user has to take is to pick two of them and pass them on the command line.
 #[derive(Clone, Debug)]
 pub enum DiscoveryError {
     NoVideoNodes,
@@ -849,23 +702,16 @@ impl fmt::Display for DiscoveryError {
     }
 }
 
-/// Everything discovery can see, with the pairing rules already applied.
+/// Build the inventory and apply pairing rules.
 ///
-/// ## Probe policy
-///
-/// [`NodeProbe::is_capture_node`] opens a `/dev/video*` node, so it is called only for nodes
-/// whose USB device takes part in at least one *topological* candidate pair. Topology is decided
-/// first, entirely from `/sys`; the probe then only ever breaks a tie between sibling nodes on a
-/// device that could genuinely be selected — which is exactly the `/dev/video4` versus
-/// `/dev/video5` question it exists for. Nodes that no rule could ever choose (the user's webcam
-/// on an unrelated hub) are listed as `not probed` and never opened. A node with no probe answer
-/// stays eligible unless a sibling answered `true`, so an `EACCES` degrades to "try it and see"
-/// rather than to "the dongle is not here".
+/// Topology is resolved before probing. Only video nodes in a candidate pair receive
+/// a read-only capability query; unrelated nodes remain unprobed. An inconclusive
+/// probe stays eligible unless a sibling is confirmed as the capture node.
 pub fn inventory(sysfs: &dyn Sysfs, probe: &dyn NodeProbe) -> Inventory {
     let mut videos = collect_video_nodes(sysfs);
     let serials = collect_serial_nodes(sysfs);
     // Read-only, and no ALSA: discovery's rule is `/sys` plus one `QUERYCAP` and nothing else
-    // (§8, module docs). Opening the card is `audio`'s business, at the moment it wants samples.
+    // . Opening the card is `audio`'s business, at the moment it wants samples.
     let cards = collect_sound_cards(sysfs);
 
     // Topology first, with no probe answers at all: a pair that no rule accepts can never be
@@ -926,20 +772,12 @@ pub fn inventory(sysfs: &dyn Sysfs, probe: &dyn NodeProbe) -> Inventory {
     }
 }
 
-/// The one pair to use, or why there is not exactly one (§8).
+/// Select a pair or return a diagnostic inventory.
 ///
-/// **Both constraints given: this cannot fail.** The two paths are used exactly as handed over
-/// and discovery is not consulted for the selection at all — not for whether the nodes exist, not
-/// for whether the class walk saw them, not for whether anything joins them. §8 makes the
-/// override the thing that rescues a wrong discovery, and an override a wrong discovery can veto
-/// rescues nothing. The inventory is still built, but only to attach the evidence (or record its
-/// absence) for the caller to log.
-///
-/// One given: the other half is inferred from the pairs involving it, and anything other than
-/// exactly one pair is an error naming the candidates — inferring genuinely does need the named
-/// node to be in the inventory, so [`DiscoveryError::ConstraintNotFound`] stays for that case.
-/// Neither given: exactly one pair is used, zero is [`DiscoveryError::NoPair`], more is
-/// [`DiscoveryError::Ambiguous`]. Nothing here ever picks one of several.
+/// Two explicit paths are accepted even without inventory evidence. One explicit path
+/// constrains candidate pairs and requires a unique match. With neither path, zero
+/// pairs returns [`DiscoveryError::NoPair`] and multiple pairs returns
+/// [`DiscoveryError::Ambiguous`]. Inventory is still collected for diagnostics.
 pub fn discover(
     sysfs: &dyn Sysfs,
     probe: &dyn NodeProbe,
@@ -979,14 +817,8 @@ pub fn discover(
     }
 }
 
-/// The pair a user asked for by naming both halves (§8), with whatever evidence happens to
-/// support it.
-///
-/// A node the class walk enumerated is reused as it stands, so the listing keeps its USB device
-/// and probe answer; one it did not is carried as just the path the user typed. Evidence is
-/// recomputed from the two USB devices rather than looked up in `inv.pairs`, because the pair
-/// list holds only *selectable* combinations — an explicit `--video` naming the metadata node is
-/// still worth telling the user is on the right dongle.
+/// Construct an explicitly selected pair. Reuse available node metadata and compute
+/// evidence directly, even if the pair would not be automatically selectable.
 fn explicit_pair(sysfs: &dyn Sysfs, inv: &Inventory, video: &Path, serial: &Path) -> Pair {
     let video = inv.video(video).cloned().unwrap_or_else(|| VideoNode {
         dev: video.to_path_buf(),
@@ -1085,7 +917,7 @@ fn collect_serial_nodes(sysfs: &dyn Sysfs) -> Vec<SerialNode> {
 
 /// Every `/sys/class/sound/card<N>`, USB or not.
 ///
-/// Unlike the video and tty walks this keeps the entries that do **not** resolve to a USB device.
+/// Unlike the video and tty walks this keeps the entries that do not resolve to a USB device.
 /// A desk has several — the HDMI codec, the motherboard's analogue output — and they are the
 /// negative control the pairing rule is checked against, as well as the answer to a user asking
 /// why their card did not pair. `controlC8`, `pcmC8D0c`, `seq` and `timer` share this directory
@@ -1129,10 +961,8 @@ fn class_nodes(sysfs: &dyn Sysfs, class: &str, prefix: &str) -> Vec<(PathBuf, Us
         .collect()
 }
 
-/// §8: resolve a class node's `device` link **up to the USB device**, not to an arbitrary
-/// ancestor. The link lands on a USB *interface* (`3-2.2.2:1.0`), which has no `idVendor`; the
-/// first ancestor that does is the device. Stopping anywhere higher would make every device
-/// behind a hub look like the same device.
+/// Stop at the USB device, identified by `idVendor`; walking farther would collapse
+/// distinct devices under their shared hub.
 fn usb_device_of(sysfs: &dyn Sysfs, class_dir: &Path) -> Option<UsbDevice> {
     let mut dir = sysfs.read_link(&class_dir.join("device"))?;
     loop {
@@ -1186,20 +1016,15 @@ fn evidence_for(sysfs: &dyn Sysfs, video: &UsbDevice, serial: &UsbDevice) -> Opt
     internal_hub(sysfs, video, serial)
 }
 
-/// §8 evidence 1. `busnum:devnum` is the kernel's identity for a USB device, but both attributes
-/// can be missing from a partial snapshot, and `0:0` is not a device — so the sysfs paths are
-/// compared as well and either one being equal is enough.
+/// Compare non-missing bus/device identity or canonical device paths. Missing numeric
+/// attributes must not make unrelated snapshot nodes equal.
 fn same_device(video: &UsbDevice, serial: &UsbDevice) -> bool {
     video.sysfs == serial.sysfs
         || (video.busnum == serial.busnum && video.devnum == serial.devnum && video.devnum != 0)
 }
 
-/// §8 evidence 2, the kernel's own assertion.
-///
-/// Find the hub port the video device is plugged into, follow its `peer` symlink to the port on
-/// the companion bus, resolve that port's `device`, and require the serial device to be it or to
-/// sit underneath it. Two peered ports are the same physical connector, so nothing about the
-/// devices themselves needs checking.
+/// Follow the video port's kernel peer link to its companion bus and require serial
+/// to be that device or descend from it. The peer link identifies one physical connector.
 fn port_peer(sysfs: &dyn Sysfs, video: &UsbDevice, serial: &UsbDevice) -> Option<Evidence> {
     let video_port = port_dir_of(&video.sysfs)?;
     let peer = sysfs.read_link(&video_port.join("peer"))?;
@@ -1213,14 +1038,13 @@ fn port_peer(sysfs: &dyn Sysfs, video: &UsbDevice, serial: &UsbDevice) -> Option
     })
 }
 
-/// §8 evidence 3, narrowed. See the module docs for why all three ids are required.
+/// Require the known hub, video, and serial identifiers for the fallback heuristic.
 fn internal_hub(sysfs: &dyn Sysfs, video: &UsbDevice, serial: &UsbDevice) -> Option<Evidence> {
     if video.id() != VIDEO_ID || serial.id() != SERIAL_ID {
         return None;
     }
     let hub_dir = nearest_common_usb_ancestor(sysfs, &video.sysfs, &serial.sysfs)?;
-    // Direct children only. A device two hops down is behind a further hub, which is a different
-    // physical arrangement than the one §8 measured and is not covered by this rule.
+    // Nested hubs are a different topology and do not satisfy the direct-child rule.
     if video.parent() != Some(hub_dir.as_path()) || serial.parent() != Some(hub_dir.as_path()) {
         return None;
     }
@@ -1337,8 +1161,7 @@ mod tests {
             if evidence.is_proof() {
                 assert!(text.ends_with("proof"), "{text:?}");
             } else {
-                // §8 calls item 3 a degraded common-ancestor test. The word "proof" must not
-                // appear at all — not even as "not proof", which is what a user skims past.
+                // The hub heuristic must be labeled degraded in diagnostics.
                 assert!(!text.contains("proof"), "{text:?}");
                 assert!(text.contains("degraded"), "{text:?}");
             }

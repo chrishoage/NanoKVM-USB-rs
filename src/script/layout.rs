@@ -1,24 +1,17 @@
-//! The declared **target** keyboard layout: which physical key, with or without shift, produces a
-//! given character on the far side of the HID cable.
+//! Target keyboard layouts for text injection.
 //!
-//! §10.2 is the whole reason this type exists. Forwarding a key is layout-independent; turning
-//! text into keystrokes is not, because the character a key produces is decided by the *target's*
-//! layout, which this host cannot observe. So the layout is declared, never guessed, it is named
-//! in help output and in every error, and a character it cannot reach is an error rather than an
-//! approximation.
-//!
-//! Only US QWERTY is implemented. Adding one is adding a variant, its table and its names; nothing
-//! else in the crate knows what a layout is.
+//! US QWERTY is the supported layout. Character mapping is independent of the host layout
+//! because the bridge sends physical HID usages to the target.
 
 use std::fmt;
 use std::str::FromStr;
 
 use winit::keyboard::KeyCode;
 
-/// A declared target keyboard layout (§10.2).
+/// A declared target keyboard layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// US QWERTY, the default stated in help output rather than assumed silently (§10.2).
+    /// US QWERTY, the default stated in help output rather than assumed silently.
     #[default]
     Us,
 }
@@ -31,7 +24,7 @@ impl Layout {
     ///
     /// `'\n'` and `'\t'` are the two control characters with a key of their own, so a macro can
     /// carry a newline in its text; every other control character and everything outside ASCII is
-    /// `None`, and the caller must refuse rather than approximate (§10.2).
+    /// `None`, and the caller must refuse rather than approximate.
     pub fn key_for_char(self, c: char) -> Option<(KeyCode, bool)> {
         match self {
             Layout::Us => us_key_for_char(c),
@@ -161,8 +154,7 @@ mod tests {
         assert_eq!(Layout::ALL, [Layout::Us].as_slice());
     }
 
-    /// The §10.2 promise for `type`: every character a user can type on an ASCII keyboard is
-    /// reachable, so an unreachable character really is exotic.
+    /// Every printable ASCII character must map under the US layout.
     #[test]
     fn every_printable_ascii_character_is_reachable() {
         for byte in 0x20u8..=0x7e {
@@ -208,7 +200,7 @@ mod tests {
             prop_assert_eq!(reachable, expected, "{:?}", c);
         }
 
-        /// Shift is held for exactly the characters a US board needs it for.
+        /// Shift is held for the characters a US board needs it for.
         #[test]
         fn the_shift_bit_matches_the_board(c in 0x20u8..=0x7e) {
             let c = c as char;

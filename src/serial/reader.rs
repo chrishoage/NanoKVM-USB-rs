@@ -1,19 +1,8 @@
-//! The reader thread and the reply matcher (§4.1, A12).
+//! Incremental serial reader and reply matcher.
 //!
-//! One thread owns the read half of the port for the life of the link. It does three things and
-//! no more: it feeds bytes to [`Parser`], it routes each resulting frame either to the waiting
-//! `transact` or to the unsolicited channel, and it counts everything it discards.
-//!
-//! **Matching is by command byte.** The device pushes an unsolicited `0x81` lock-state frame
-//! after any lock-key change and it can arrive between a request and its reply (A12, Appendix),
-//! so "the next frame answers the last request" is wrong on this hardware. A frame is this
-//! request's reply only if [`Reply::answers`] says so.
-//!
-//! **And a command byte alone is not enough after a timeout.** A reply that arrives once its
-//! `transact` has given up is byte-identical to the reply the next `transact` of the same command
-//! is waiting for, so [`route`] consults [`Inner::timed_out`] before [`Inner::inflight`], and
-//! `transact` holds the next request back until the link is quiet (§3.1,
-//! [`super::OpenOptions::quiet_after_timeout`]). The reasoning for both is on those items.
+//! Unsolicited device-info frames update lock state. Timed-out replies must not satisfy a
+//! later transaction of the same command, so the matcher tracks a late-reply window.
+//! Dropping an unsolicited receiver does not stop transport reads.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -23,8 +12,7 @@ use std::time::{Duration, Instant};
 use crate::link::Reply;
 use crate::proto::frame::{Event, Parser};
 
-/// A snapshot of the link's counters (§2.8: "overflow is observable rather than mysterious";
-/// §5.1: overload on this device corrupts silently, so the corruption must be countable).
+/// Serial framing, matching, and transport counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SerialStats {
     /// Well-formed frames the parser produced, matched and unsolicited together.
@@ -34,28 +22,24 @@ pub struct SerialStats {
     pub unsolicited: u64,
     /// The subset of `unsolicited` that answered a request which had already timed out.
     pub late_replies: u64,
-    /// The subset of `unsolicited` that had nowhere to go because the receiver had been dropped.
-    ///
-    /// Nobody listening is not a reason to stop listening: the reader keeps reading and the link
-    /// keeps working, so this counter is the only trace such a frame leaves. A rising value means
-    /// an owner took the receiver with [`super::SerialLink::take_unsolicited`] and dropped it,
-    /// which is allowed but throws away the A12 lock-state evidence.
+    /// Unsolicited frames whose receiver was dropped. Reading continues so transaction
+    /// replies remain usable even when nobody consumes notifications.
     pub unsolicited_dropped: u64,
     /// Resynchronisation windows entered: `transact` calls held back after a preceding timeout
-    /// until the link went quiet (§3.1, [`super::OpenOptions::quiet_after_timeout`]). One per
+    /// until the link went quiet. One per
     /// timeout that was followed by another `transact`.
     ///
     /// This is the *receive*-side window and has nothing to do with
     /// [`SerialStats::resyncs_sent`], which counts writes aimed at the chip's own parser.
     pub resyncs: u64,
-    /// Zero-byte preambles written by [`super::SerialLink::resync`] to finish a frame the chip's
-    /// receive parser may still be waiting on (§5.1). One per call; the bytes themselves are also
+    /// Zero-byte preambles written by [`crate::link::Link::resync`] to finish a frame the chip's
+    /// receive parser may still be waiting on. One per call; the bytes themselves are also
     /// counted in [`SerialStats::bytes_tx`].
     pub resyncs_sent: u64,
-    /// Candidate frames whose checksum did not verify (§3.1). On this device a burst of these
-    /// means the link was overloaded (§5.1, A11).
+    /// Candidate frames whose checksum did not verify. On this device a burst of these
+    /// means the link was overloaded.
     pub bad_checksum: u64,
-    /// Incomplete frames retired after a silence, i.e. the §3.2 five-byte no-checksum reply (A13).
+    /// Incomplete frames expired after the silence interval.
     pub truncated: u64,
     /// Bytes discarded while hunting for a frame header. Bytes already reported inside a
     /// bad-checksum candidate are not counted twice — see [`Parser`].
@@ -64,7 +48,7 @@ pub struct SerialStats {
     pub transacts: u64,
     /// `transact` calls that got no matching reply in time.
     pub timeouts: u64,
-    /// Error frames (`cmd | 0xC0`) surfaced as `LinkError::Device` (§3.1: upstream drops these).
+    /// Error frames (`cmd | 0xC0`) surfaced as `LinkError::Device`.
     pub device_errors: u64,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
@@ -125,24 +109,24 @@ pub(crate) struct Inner {
     pub inflight: Option<u8>,
     /// The reply the reader matched, waiting to be collected by the waiter.
     pub reply: Option<Reply>,
-    /// Why the link is unusable, once it is. Set once and never cleared: reconnect is Stage 2 and
-    /// builds a *new* link rather than reviving this one (§2.7, §12).
+    /// Why the link is unusable, once it is. Set once and never cleared: reconnect is and
+    /// builds a *new* link rather than reviving this one.
     pub down: Option<String>,
     /// Command byte of the most recent `transact` that timed out and may still be answered. A
     /// frame answering it is that request's late reply rather than this request's, and
-    /// [`route`] checks this slot **before** [`Inner::inflight`] for exactly that reason.
+    /// [`route`] checks this slot before [`Inner::inflight`] for that reason.
     ///
     /// One slot is enough because `transact` takes `&mut self`, so timeouts cannot overlap; a
     /// second timeout simply replaces the first, and a very late reply to the first is then
     /// counted as an ordinary device push.
     ///
     /// It is cleared by the first frame that answers it, inside the resynchronisation window or
-    /// after it: the device answers each request exactly once (Appendix), so one diversion settles
+    /// after it: the device answers each request once, so one diversion settles
     /// the account. Inside the window that arrival also restarts the window; after it, the
     /// diversion is what keeps the stale reply out of the request now in flight.
     pub timed_out: Option<u8>,
     /// When the resynchronisation window last restarted: the moment of the timeout, or the
-    /// arrival of a late reply during the window (§3.1). `None` once `transact` has waited it out.
+    /// arrival of a late reply during the window. `None` once `transact` has waited it out.
     ///
     /// The reader only ever pushes this forward; `transact` owns opening and closing it. That
     /// split is deliberate — the reader must never decide how long the writer waits.
@@ -156,7 +140,7 @@ pub(crate) struct Inner {
     /// later request of that command. With it, the transact that had its own answer taken away
     /// declines to arm the slot: the device has now answered as many times as it was asked, the
     /// accounts balance, and the next request matches normally. The cost of a lost reply is
-    /// therefore one extra `Timeout`, which the writer treats as degraded and survives (§2.6.1),
+    /// therefore one extra `Timeout`, which the writer treats as degraded and survives,
     /// rather than an endless run of them.
     pub answered_inflight_late: bool,
     /// Set as the reader thread leaves, from a `Drop` guard so that a panic sets it too.
@@ -191,11 +175,11 @@ impl Shared {
 
     /// Take the matcher lock.
     ///
-    /// **Lock-poisoning policy for the whole `serial` module.** A poisoned mutex means some thread
+    /// Lock-poisoning policy for the whole `serial` module. A poisoned mutex means some thread
     /// panicked while holding it. Every field of [`Inner`] is plain data written in one statement
     /// under the lock; there is no multi-step invariant a panic can leave half-applied, so there
     /// is nothing to protect the next caller from. Propagating the panic instead would take down
-    /// the input writer and leave the target holding whatever keys it holds (§2.6.1), which is
+    /// the input writer and leave the target holding whatever keys it holds, which is
     /// strictly worse. So the guard is recovered with `into_inner`, and this is the only place in
     /// non-test code in this module that decides that.
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -221,23 +205,17 @@ impl Shared {
     }
 }
 
-/// Route one well-formed frame: to the waiter if it answers the in-flight request, otherwise to
-/// the unsolicited channel (A12).
+/// Route a valid frame, checking timed-out requests before the current waiter.
 ///
-/// **A frame answering a request that already timed out is checked for first**, ahead of the
-/// in-flight slot. The ambiguity is inherent — a stale reply and a fresh one for the same command
-/// are the same bytes — and the input writer sends one command byte over and over (§2.6, A11), so
-/// the two orders differ in what they get wrong. In-flight first hands the stale ACK to the new
-/// request and reports success for a frame the device may never have parsed, which is the §3.4/A17
-/// trap written into the transport. Timed-out first can only turn a fresh reply into a `Timeout`,
-/// and only in the window the writer already treats as degraded (§2.6.1). A false timeout is
-/// recoverable; a false acknowledgement is not.
+/// Replies have no sequence ID. This ordering may sacrifice a fresh reply as late,
+/// but prevents an old acknowledgement from falsely completing a new transaction.
+/// Unmatched frames go to the unsolicited channel.
 fn route(shared: &Shared, unsolicited: &Sender<Reply>, reply: Reply) {
     let mut inner = shared.lock();
 
     let late = inner.timed_out.is_some_and(|cmd| reply.answers(cmd));
     if late {
-        // One frame retires the slot: the device answers each request exactly once (Appendix), so
+        // One frame retires the slot: the device answers each request once, so
         // once the stale reply is accounted for the next frame of that command really is the next
         // request's.
         inner.timed_out = None;
@@ -279,7 +257,7 @@ fn route(shared: &Shared, unsolicited: &Sender<Reply>, reply: Reply) {
         // Nobody is listening. That is not a reason to stop listening: the reader is also the only
         // thing that can match a reply or notice a hang-up, so stopping here would leave every
         // later `transact` to burn its whole timeout against a link still claiming to be healthy.
-        // Count the frame and carry on (§4.1).
+        // Count the frame and carry on.
         bump(&shared.counters.unsolicited_dropped, 1);
         log::debug!("no unsolicited receiver; frame counted and dropped, reader continues");
     }
@@ -303,7 +281,7 @@ fn handle(shared: &Shared, unsolicited: &Sender<Reply>, event: Event) {
         Event::Truncated { raw } => {
             bump(&c.truncated, 1);
             log::debug!(
-                "abandoning {} buffered bytes after a silence; the rest of this frame is not coming (§3.2)",
+                "abandoning {} buffered bytes after a silence; the rest of this frame is not coming",
                 raw.len()
             );
         }
@@ -317,7 +295,7 @@ fn handle(shared: &Shared, unsolicited: &Sender<Reply>, event: Event) {
 /// The reader thread body. Returns when stopped, or when the port fails with anything other than a
 /// timeout.
 ///
-/// It does **not** return because the unsolicited receiver went away: see [`route`]. The reader is
+/// It does not return because the unsolicited receiver went away: see [`route`]. The reader is
 /// the only thing that can match a reply, retire a partial frame or notice a hang-up, so its life
 /// is tied to the port's, never to who happens to be listening.
 ///
@@ -374,9 +352,8 @@ pub(crate) fn run(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // A read timeout with bytes still buffered, sustained past the silence window, is
-                // the parser's only way to learn that the rest of the frame is never coming — the
-                // §3.2 five-byte reply, confirmed over a ten-second wait (A13).
+                // Expire incomplete bytes only after sustained silence, allowing split valid frames
+                // to finish while retiring the malformed five-byte reply.
                 if parser.pending_len() > 0 && last_byte_at.elapsed() >= silence_before_expire {
                     if let Some(event) = parser.expire_partial() {
                         handle(&shared, &unsolicited, event);
@@ -451,7 +428,7 @@ mod tests {
         }
     }
 
-    /// **`reader_finished` means "the thread has gone", not "the thread returned".**
+    /// `reader_finished` means "the thread has gone", not "the thread returned".
     ///
     /// It is set from a `Drop` guard for this case: a reader that unwinds records no `down`
     /// reason, so if the flag were set at the bottom of `run` a panicking reader would leave both

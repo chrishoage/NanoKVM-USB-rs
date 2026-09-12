@@ -42,7 +42,7 @@ def _fake_usb_device(parent, name, ids, product, devnum, ifaces=(), busnum=3):
 
     bInterfaceNumber is written the way the kernel writes it, `%02x` — interface 16 reads back
     as "10". The old fakes wrote decimal, which agrees with hex only up to 9, so the self-test
-    could not tell a correct base from a wrong one (review R8).
+    could not tell a correct base from a wrong one.
     """
     dev = os.path.join(parent, name)
     os.makedirs(dev, exist_ok=True)
@@ -143,7 +143,7 @@ def _descriptor(ids):
 
 
 class FakeKernel:
-    """A usbfs that lives in a dict: no fd is ever a real file descriptor (review R9).
+    """A usbfs that lives in a dict: no fd is ever a real file descriptor.
 
     Models just enough kernel to be worth testing against — a descriptor per usbfs path, a
     virtual /dev whose nodes DISCONNECT removes and CONNECT restores, an optional delay before
@@ -360,7 +360,7 @@ def run(ur):
             return detail
 
     def dongle_owning_video0():
-        """review R5: the replug can hand the dongle /dev/video0, and it is still the dongle."""
+        """the replug can hand the dongle /dev/video0, and it is still the dongle."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             iface = os.path.join(root, "devices", "pci0000:00", "usb3", "3-2", "3-2.2",
@@ -374,7 +374,7 @@ def run(ur):
             return "every spelling of /dev/video0 resolves to 3-2.2.2 and is acted on"
 
     def missing_node_via_hub():
-        """review R7: a missing node is the thing to fix, not a reason to refuse."""
+        """a missing node is the thing to fix, not a reason to refuse."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             _drop_class_node(root, "video4linux", "video4")
@@ -404,7 +404,7 @@ def run(ur):
                 "--port naming another device")
 
     def hex_interface_numbers():
-        """review R8: the kernel writes bInterfaceNumber as %02x; so must the fakes."""
+        """the kernel writes bInterfaceNumber as %02x; so must the fakes."""
         with tempfile.TemporaryDirectory() as td:
             dev = _fake_usb_device(td, "3-2.2.2", "345f:2133", "USB2 Video", 34,
                                    [(16, None, [])])
@@ -425,7 +425,7 @@ def run(ur):
         return v, s, h, devices
 
     def sysfs_root_cannot_aim_an_ioctl():
-        """review R1: a fake tree must not be able to name a bus and devnum to reset."""
+        """a fake tree must not be able to name a bus and devnum to reset."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             base = os.path.join(root, "devices", "pci0000:00", "usb3", "3-2")
@@ -449,7 +449,7 @@ def run(ur):
             return detail
 
     def descriptor_must_match():
-        """review R1: sysfs says which node to open; the descriptor says what answered."""
+        """sysfs says which node to open; the descriptor says what answered."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -479,7 +479,7 @@ def run(ur):
             return "descriptor matches, reset issued, both nodes seen gone and back"
 
     def sigint_in_the_gap_still_reconnects():
-        """review R2: Ctrl-C between DISCONNECT and CONNECT must not leave the drivers unbound."""
+        """Ctrl-C between DISCONNECT and CONNECT must not leave the drivers unbound."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -508,7 +508,7 @@ def run(ur):
             return "3 DISCONNECT, 3 CONNECT, nodes back, signals blocked then restored"
 
     def failed_ioctls_are_a_failure():
-        """review R6: a rebind whose ioctls all failed must not report success."""
+        """a rebind whose ioctls all failed must not report success."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -526,7 +526,7 @@ def run(ur):
             return "6 EPERM ioctls -> FAIL and a non-zero exit"
 
     def late_disconnect_is_seen():
-        """review R3: the disconnect may only begin after the ioctl returns."""
+        """the disconnect may only begin after the ioctl returns."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -550,7 +550,7 @@ def run(ur):
             return "a disconnect 60 ms after the ioctl returned is still seen and timed"
 
     def survived_in_place_is_stated():
-        """The honest other half of review R3 — and it must not cost 20 s of wall time."""
+        """A reset that preserves its nodes must not consume the full return timeout."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -568,7 +568,7 @@ def run(ur):
                     f"{wall * 1000:.0f} ms on the injected clock")
 
     def new_names_are_a_success():
-        """review R4/R5: the dongle can come back as /dev/video0, and that is not a failure."""
+        """the dongle can come back as /dev/video0, and that is not a failure."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, _s, _h, devices = dongle_devices(root)
@@ -602,7 +602,7 @@ def run(ur):
             return "back as /dev/video0 + /dev/video1 -> success, with a loud rename warning"
 
     def run_end_to_end():
-        """review R9: run() itself, both operations, through the fakes."""
+        """run() itself, both operations, through the fakes."""
         with tempfile.TemporaryDirectory() as td:
             root = _build_tree(td)
             v, s, _h, devices = dongle_devices(root)
