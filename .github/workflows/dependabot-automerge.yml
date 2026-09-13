@@ -1,0 +1,27 @@
+name: Dependabot auto-merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout: this workflow only reads PR metadata and calls the API, so
+      # it never runs code from the pull request it is acting on.
+      - uses: dependabot/fetch-metadata@v3
+        id: meta
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # graphics and wayland are excluded on purpose: they can compile clean and
+      # still break rendering at runtime, which no CI job here can see.
+      - if: contains(fromJSON('["minor-and-patch","actions"]'), steps.meta.outputs.dependency-group)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

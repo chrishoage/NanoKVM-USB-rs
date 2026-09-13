@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  checks:
+    name: checks
+    # 22.04 pins the glibc floor for anything built here to 2.35; ubuntu-latest
+    # would raise it to 2.39 and silently drop older distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libasound2-dev pkg-config
+
+      # The seven checks from docs/development.md, in that order.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features hardware -- -D warnings
+      - run: cargo test --locked
+      - run: cargo doc --no-deps
+      - run: python3 scripts/check-fixtures.py
+      - run: python3 scripts/usb-replug.py --self-test
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libasound2-dev pkg-config
+      - run: cargo check --locked --all-targets

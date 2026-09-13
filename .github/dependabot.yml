@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Group order is load-bearing: Dependabot assigns each update to the FIRST
+    # matching group, so the coupled groups must precede the catch-all.
+    groups:
+      # Cargo.toml pins wgpu to egui-wgpu's line and holds the egui crates
+      # together, so these only ever move as a set.
+      graphics:
+        patterns: ["egui", "egui-*", "egui_*", "wgpu"]
+      wayland:
+        patterns: ["wayland-*", "wl-clipboard-rs"]
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
