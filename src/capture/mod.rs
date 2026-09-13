@@ -251,6 +251,28 @@ pub(crate) mod testsupport {
         std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// Top-level `mjpeg-*` frames whose name contains `needle`, or `None` when the recording is
+    /// absent, saying so.
+    ///
+    /// Only `absrange/` is committed; the bulk `mjpeg-<W>x<H>-*.jpg` corpus is local recording
+    /// output, so a fresh checkout has none of it. Tests that need those frames open with
+    /// `let Some(paths) = recorded_frames("...") else { return };`, the same way the tests in
+    /// `tests/capture_format.rs` open with their corpus guard.
+    pub fn recorded_frames(needle: &str) -> Option<Vec<PathBuf>> {
+        let paths: Vec<PathBuf> = fixture_paths("")
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(needle))
+            .collect();
+        if paths.is_empty() {
+            eprintln!(
+                "skipping: no {needle} frames under fixtures/frames — the corpus is gitignored \
+                 build output; see fixtures/frames/MANIFEST.md for how to record it"
+            );
+            return None;
+        }
+        Some(paths)
+    }
+
     /// Change only the JPEG header dimensions to exercise allocation bounds against
     /// a structurally valid frame with a corrupt size.
     pub fn patch_sof(bytes: &mut [u8], height: u16, width: u16) {
