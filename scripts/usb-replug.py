@@ -384,7 +384,9 @@ class Watcher(threading.Thread):
         self.gone = {}
         self.back = {}
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        # Not `_stop`: threading.Thread uses that name for a private method, and join()
+        # calls it while reaping a finished thread.
+        self._stopping = threading.Event()
         self._present = {n: kernel.exists(n) for n in self.nodes}
 
     def add(self, nodes):
@@ -399,7 +401,7 @@ class Watcher(threading.Thread):
         # Signals are the main thread's business; this one must never take the process down
         # while a rebind has the interfaces unbound.
         _hold_signals()
-        while not self._stop.is_set():
+        while not self._stopping.is_set():
             with self._lock:
                 nodes = list(self.nodes)
             for node in nodes:
@@ -426,7 +428,7 @@ class Watcher(threading.Thread):
             return ""
 
     def stop(self):
-        self._stop.set()
+        self._stopping.set()
         self.join(timeout=2.0)
 
     def any_gone(self):
