@@ -2,7 +2,15 @@
 
 Recorded on 2026-09-09 from a NanoKVM-USB capture interface (`345f:2133`).
 The 120 JPEGs, about 32 MB, are local files excluded from Git. Capture tests
-that read this corpus need those files; a fresh clone contains this manifest only.
+that read this corpus need those files; a fresh clone contains this manifest,
+the curated `absrange/` evidence, and three frames.
+
+Those three are `mjpeg-1920x1080-01.jpg`, `mjpeg-1280x720-01.jpg`, and
+`mjpeg-640x480-01.jpg`, committed so `tests/capture_recovery.rs` can run on a
+fresh clone: its stall-restart, disconnect-recovery, and format-watchdog tests
+all need a real frame in each of those three modes. Every file within a
+resolution group is byte-identical, so `-01` stands for its whole group. Tests
+that need any other frame skip themselves when the corpus is absent.
 
 ## Recording conditions
 
