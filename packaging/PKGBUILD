@@ -1,0 +1,52 @@
+# Maintainer: Chris Hoage <christopher.e.hoage@gmail.com>
+pkgname=nanokvm-usb-git
+_pkgname=nanokvm-usb
+pkgver=0.1.0.r0.g25c166d
+pkgrel=1
+pkgdesc="Native Linux client for the Sipeed NanoKVM-USB (CH9329 serial + UVC MJPEG)"
+arch=('x86_64')
+url="https://github.com/chrishoage/NanoKVM-USB-rs"
+license=('MIT OR Apache-2.0')
+# wayland and vulkan-icd-loader are dlopened, so ldd does not show them.
+depends=('alsa-lib' 'gcc-libs' 'glibc' 'wayland' 'vulkan-icd-loader')
+makedepends=('rust' 'clang' 'pkgconf' 'git')
+checkdepends=('python')
+provides=("$_pkgname=${pkgver%%.r*}")
+conflicts=("$_pkgname")
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  git describe --long --tags --abbrev=7 2>/dev/null \
+    | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' \
+    || printf "0.0.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Not --all-features: that enables the hardware feature, which needs a real device.
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm0755 target/release/nanokvm "$pkgdir/usr/bin/nanokvm"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm0644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm0644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

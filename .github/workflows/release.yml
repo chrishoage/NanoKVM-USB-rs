@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild and re-upload binaries for"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    # Opens or updates the release PR: version bump + CHANGELOG.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # A GITHUB_TOKEN-authored PR gets no check runs, so with `checks` and `msrv`
+      # required the release PR could never merge. Hence an App token.
+      # Swap-out point: delete this step and set RELEASE_PLZ_TOKEN instead.
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token || secrets.RELEASE_PLZ_TOKEN }}
+
+  release:
+    # Tags and creates the GitHub Release once a release PR has landed.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        id: release-plz
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token || secrets.RELEASE_PLZ_TOKEN }}
+
+  binaries:
+    needs: [release]
+    # always(), so the skipped release job on a manual dispatch does not cascade.
+    if: ${{ always() && (needs.release.outputs.releases_created == 'true' || github.event_name == 'workflow_dispatch') }}
+    # 22.04 is what sets the binary's glibc floor at 2.35.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || fromJSON(needs.release.outputs.releases)[0].tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libasound2-dev pkg-config
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: nanokvm
+          target: x86_64-unknown-linux-gnu
+          archive: $bin-$tag-$target
+          include: README.md,LICENSE-MIT,LICENSE-APACHE
+          checksum: sha256
+          locked: true
+          ref: refs/tags/${{ env.TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}

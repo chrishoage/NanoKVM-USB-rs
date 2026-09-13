@@ -1,5 +1,9 @@
 # NanoKVM-USB-rs
 
+[![CI](https://github.com/chrishoage/NanoKVM-USB-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/chrishoage/NanoKVM-USB-rs/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/chrishoage/NanoKVM-USB-rs)](https://github.com/chrishoage/NanoKVM-USB-rs/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 A native Linux client for the Sipeed NanoKVM-USB. View and control a connected
 computer through the dongle, play its HDMI audio, and type clipboard text without
 running the vendor's browser client. The target computer needs no network connection.
@@ -7,6 +11,34 @@ running the vendor's browser client. The target computer needs no network connec
 The client includes a Wayland viewer and commands for device discovery, screenshots,
 key chords, text entry, and keyboard macros. It has been tested with a NanoKVM-USB
 Pro 4K60 and niri on Arch Linux. Other models and compositors have not been verified.
+
+## Install
+
+Download the binary for the latest release, verify it, and unpack it:
+
+```sh
+tag=$(curl -fsSL https://api.github.com/repos/chrishoage/NanoKVM-USB-rs/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+base=nanokvm-$tag-x86_64-unknown-linux-gnu
+curl -fLO "https://github.com/chrishoage/NanoKVM-USB-rs/releases/download/$tag/$base.tar.gz"
+curl -fLO "https://github.com/chrishoage/NanoKVM-USB-rs/releases/download/$tag/$base.tar.gz.sha256"
+sha256sum -c "$base.tar.gz.sha256"
+tar xzf "$base.tar.gz"
+```
+
+The binary is built on Ubuntu 22.04, so it needs glibc 2.35 or newer. It links
+against alsa-lib, and loads Wayland and a Vulkan driver at runtime, so it needs a
+Wayland session and a working GPU driver. Build from source for anything older.
+
+On Arch, build the package from the PKGBUILD in this repository:
+
+```sh
+git clone https://github.com/chrishoage/NanoKVM-USB-rs.git
+cd NanoKVM-USB-rs/packaging
+makepkg -si
+```
+
+That tracks the default branch rather than a release, and installs the same
+`nanokvm` binary to `/usr/bin`.
 
 ## Build and run
 
@@ -85,3 +117,8 @@ any devices. Run `nanokvm --help` or `nanokvm <command> --help` for options.
 
 The viewer is Linux/Wayland only. Text injection currently supports US QWERTY;
 macros cannot send mouse input. Remote access and session recording are not implemented.
+
+## License
+
+Dual-licensed under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.

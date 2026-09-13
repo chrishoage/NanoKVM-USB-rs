@@ -1,0 +1,21 @@
+[workspace]
+# The crate was never published, so versions come from git tags, not the registry.
+git_only = true
+git_release_enable = true
+changelog_update = true
+
+[changelog]
+protect_breaking_commits = true
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^revert", group = "Reverted" },
+  # Dependency traffic would otherwise outnumber real changes in every release.
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^(chore|ci|test|refactor|style|build)", skip = true },
+  # Anything unmatched, including a mistyped type, would otherwise get a section
+  # of its own named after whatever the prefix happened to be.
+  { message = "^.*", skip = true },
+]
