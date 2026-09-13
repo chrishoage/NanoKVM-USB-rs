@@ -91,7 +91,10 @@ fn main() {
     // which is async-signal-safe. `libc::signal` is handed a valid function pointer and the
     // previous disposition is discarded, as `main.rs` does.
     unsafe {
-        libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_interrupt as *const () as libc::sighandler_t,
+        );
     }
 
     let started = Instant::now();
