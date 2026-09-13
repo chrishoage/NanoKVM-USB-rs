@@ -3,7 +3,6 @@ name = "nanokvm-usb"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-publish = false
 description = "Native Linux client for the Sipeed NanoKVM-USB (CH9329 serial + UVC MJPEG)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/chrishoage/NanoKVM-USB-rs"

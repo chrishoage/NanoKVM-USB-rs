@@ -1,6 +1,10 @@
 [workspace]
 # The crate was never published, so versions come from git tags, not the registry.
 git_only = true
+# Skips `cargo publish` while still tagging and creating the GitHub release.
+# This has to live here rather than in Cargo.toml: `publish = false` there makes
+# release-plz drop the package entirely and report "nothing to release".
+publish = false
 git_release_enable = true
 changelog_update = true
 
