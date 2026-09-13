@@ -32,7 +32,7 @@ libc = "0.2"
 
 # Dry-run output names frames from the embedded TOML packet fixtures.
 serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+toml = "1.1"
 
 # Discovery uses sysfs directly, so libudev enumeration is unnecessary.
 serialport = { version = "4", default-features = false }
