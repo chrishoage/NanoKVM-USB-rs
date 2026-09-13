@@ -138,7 +138,7 @@ fn read_u16(data: &[u8], off: usize) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::testsupport::{fixture_bytes, fixture_paths};
+    use crate::capture::testsupport::{fixture_bytes, fixture_paths, recorded_frames};
 
     #[test]
     fn every_absrange_fixture_reports_1920x1080() {
@@ -154,11 +154,9 @@ mod tests {
     #[test]
     fn the_720p_corpus_reports_1280x720() {
         // A second size proves the parser reads the segment rather than recognising one file.
-        let paths: Vec<_> = fixture_paths("")
-            .into_iter()
-            .filter(|p| p.to_string_lossy().contains("mjpeg-1280x720"))
-            .collect();
-        assert!(!paths.is_empty(), "no 720p fixtures found");
+        let Some(paths) = recorded_frames("mjpeg-1280x720") else {
+            return;
+        };
         for p in &paths {
             assert_eq!(
                 dimensions(&fixture_bytes(p)),

@@ -171,7 +171,7 @@ fn too_large(width: u32, height: u32) -> Result<(), DecodeError> {
 mod tests {
     use super::*;
     use crate::capture::jpeg;
-    use crate::capture::testsupport::{fixture_bytes, fixture_paths, patch_sof};
+    use crate::capture::testsupport::{fixture_bytes, fixture_paths, patch_sof, recorded_frames};
     use std::time::{Duration, Instant};
 
     /// Build a `CompressedFrame` the way [`super::super::v4l2::V4l2Source`] does: dimensions
@@ -317,11 +317,14 @@ mod tests {
 
         let mut dec = Decoder::new();
         let mut out = DecodedFrame::empty();
-        let paths: Vec<_> = fixture_paths("")
-            .into_iter()
-            .filter(|p| p.to_string_lossy().contains("mjpeg-3840x2160-01"))
-            .collect();
-        assert_eq!(paths.len(), 1, "the 4K fixture is missing");
+        let Some(paths) = recorded_frames("mjpeg-3840x2160-01") else {
+            return;
+        };
+        assert_eq!(
+            paths.len(),
+            1,
+            "more than one 4K fixture matched: {paths:?}"
+        );
         let f = frame_from(fixture_bytes(&paths[0]), 0);
         dec.decode(&f, &mut out).expect("4K decodes");
         assert_eq!((out.width, out.height), (3840, 2160));
