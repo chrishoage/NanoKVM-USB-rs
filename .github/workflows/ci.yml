@@ -21,6 +21,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # scripts/check-fixtures.py reads the packet fixtures with tomllib, which is
+      # stdlib only from 3.11; the 22.04 image ships 3.10.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - name: Install system dependencies
         run: |
           sudo apt-get update
