@@ -22,6 +22,11 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # The @rev of this action is the Rust toolchain it installs, so a version
+      # bump here does not update an action, it changes what the msrv job tests.
+      # The MSRV moves when Cargo.toml's rust-version moves, and not before.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions:
         patterns: ["*"]
