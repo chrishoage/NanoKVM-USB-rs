@@ -6,6 +6,12 @@ Cargo.lock
 # Bulk decode corpora are local recordings. Curated cursor evidence in absrange/
 # is committed because resampling or recapturing would change the measurements.
 /fixtures/frames/*.jpg
+# One frame per mode used by tests/capture_recovery.rs. Files within a resolution
+# group are byte-identical, so -01 stands for its group and CI can run the
+# recovery, reconnect, and format-watchdog tests on a fresh clone.
+!/fixtures/frames/mjpeg-1920x1080-01.jpg
+!/fixtures/frames/mjpeg-1280x720-01.jpg
+!/fixtures/frames/mjpeg-640x480-01.jpg
 /fixtures/frames/*.jpeg
 /fixtures/frames/*.raw
 /fixtures/frames/*.yuv
