@@ -554,8 +554,10 @@ fn read_wav(path: &Path) -> Vec<i16> {
     assert_eq!(rate, SAMPLE_RATE, "{}: not 48 kHz", path.display());
 
     let samples: Vec<i16> = bytes[start..start + len]
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect();
     println!(
         "[wav] {}: {} samples, {:.2} s",

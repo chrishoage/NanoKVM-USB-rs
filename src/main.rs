@@ -418,7 +418,10 @@ fn run_viewer(args: &Args, constraints: &Constraints) -> Result<()> {
     // the previous disposition is discarded — there is none worth restoring in a
     // program that installs this once at startup.
     unsafe {
-        libc::signal(libc::SIGINT, on_interrupt as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_interrupt as *const () as libc::sighandler_t,
+        );
     }
 
     // ---- which two nodes --------------------------------------------------------------

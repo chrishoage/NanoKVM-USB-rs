@@ -37,7 +37,7 @@ pub fn install_signal_handlers() {
         // which is async-signal-safe. The previous disposition is discarded; these
         // commands install the handler once and never restore it.
         unsafe {
-            libc::signal(signal, on_interrupt as libc::sighandler_t);
+            libc::signal(signal, on_interrupt as *const () as libc::sighandler_t);
         }
     }
 }

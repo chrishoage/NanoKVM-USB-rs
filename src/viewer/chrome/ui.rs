@@ -227,7 +227,7 @@ impl ChromeUi {
                 .corner_radius(egui::CornerRadius::same(10))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
                 ))
                 .show(ui, |ui| {

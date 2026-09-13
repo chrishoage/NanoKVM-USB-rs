@@ -24,7 +24,9 @@ pub fn channel_of(interleaved: &[i16], channels: usize, channel: usize) -> Vec<f
 /// Both channels averaged, which is what a mono tone played to both speakers looks like.
 pub fn mono(interleaved: &[i16]) -> Vec<f32> {
     interleaved
-        .chunks_exact(CHANNELS)
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
         .map(|frame| {
             frame
                 .iter()
