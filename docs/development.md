@@ -3,7 +3,8 @@
 Build with `cargo build --locked`. The package declares Rust 1.89 as its minimum
 version. Keep dependency changes compatible with that version and the committed lockfile.
 The host needs Linux headers, a C toolchain, libclang for V4L2 bindings, `pkg-config`,
-and ALSA development files. Tests also need Python 3 for sysfs fixture generation.
+and ALSA development files. Tests also need Python 3.11 or newer for sysfs fixture
+generation and the fixture checks, which read the packet fixtures with `tomllib`.
 
 The executable uses the host's dynamic libraries and GPU/Wayland stack. A static musl
 prototype could build but could not load the GPU and window-system libraries it needed.
