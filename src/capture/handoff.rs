@@ -309,6 +309,7 @@ mod tests {
         let s = Arc::new(Slot::<u32>::new());
         let s2 = Arc::clone(&s);
         let (armed_tx, armed_rx) = mpsc::channel();
+        let (saw_tx, saw_rx) = mpsc::channel();
         let consumer = thread::spawn(move || {
             armed_tx.send(()).expect("armed");
             let mut last = 0u32;
@@ -318,6 +319,9 @@ mod tests {
                     assert!(v > last, "slot handed back {v} after {last}");
                     last = v;
                     seen += 1;
+                    if seen == 1 {
+                        saw_tx.send(()).expect("saw one");
+                    }
                 }
             }
             seen
@@ -326,6 +330,11 @@ mod tests {
         for v in 1..=2_000u32 {
             s.put(v);
         }
+        // Being armed only says the thread started, not that it read anything, and `close`
+        // drops whatever is pending. Closing here would race the consumer to the last value
+        // and leave it with nothing to see. The last `put` stays pending until it is taken,
+        // so this wait always ends.
+        saw_rx.recv().expect("consumer saw a value");
         s.close();
         let seen = consumer.join().expect("consumer");
         assert!(seen > 0, "consumer saw nothing at all");
