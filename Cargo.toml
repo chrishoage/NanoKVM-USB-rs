@@ -51,7 +51,7 @@ alsa = "0.12"
 
 winit = "0.30.13"
 # Keep wgpu compatible with egui-wgpu.
-wgpu = "27.0"
+wgpu = "30.0"
 raw-window-handle = "0.6.2"
 pollster = "1.0"
 bytemuck = { version = "1", features = ["derive"] }
